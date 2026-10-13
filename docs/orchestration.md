@@ -21,9 +21,9 @@ human merges ◄── ready_for_human_merge ◄── review-record (Claude Cod
 | `prepare` | Worktree per side at `base_revision` on `agent/<id>-<side>` under `~/orch-worktrees`; FE `pnpm install --frozen-lockfile --prefer-offline` | Already prepared; worktree path or branch exists |
 | `implement` | `codex exec` with the generated sandbox profile, model, effort, allowlisted environment and private `TMPDIR`; prompt from `prompt.md` + task fields | Step 0 not READY; task file edited since prepare; secret-like text in the prompt |
 | `check` | Changed paths ⊆ `allowed_paths`, no protected paths, secret scan of diff and new files | — (fails with exit 1) |
-| `verify` | The repository gate in the worktree (`verify.sh`, FE `--change` + `task.mjs status`); preserves evidence; binds it to the tree hash | `check` did not pass |
+| `verify` | The repository's own gate in a verification container (`verify-container/run-gate.mjs`), FE `task.mjs status`; preserves evidence and the container record; binds both to the tree hash | `check` did not pass |
 | `commit` | Local commit with `Verified-Tree` / `Verification-Evidence` trailers | Gate not passed; evidence missing; tree changed since verification |
-| `contract` | Disposable backend from the BE worktree + FE contract-read check | Either side not committed; task has no `contract_check` |
+| `contract` | Disabled: the contract-read check would build and serve agent code on the host. A task with `contract_check: true` cannot reach `ready_for_human_merge`; run [pilot.md](pilot.md) manually after review | Always |
 | `review-record` | Stores Claude Code's `review.json` with execution provenance | Not run from a Claude Code process; a Codex process in the ancestry; commits differ from the verified commits |
 | `status` | `in_progress`, `blocked`, `rework_required` or `ready_for_human_merge` | — |
 | `cleanup` | Removes worktrees, keeps branches and evidence | Uncommitted changes; unpreserved evidence (unless `--preserve`) |
@@ -66,11 +66,37 @@ supported efforts. The task file's digest is bound at `prepare`: editing it requ
   account can forge it. Blocking findings (or verdict `rework_required`) set
   `rework_required`, and the findings are fed into the next `implement` prompt.
 
-**Residual risk:** the gate runs agent-written code (tests, build targets) *outside* the
-sandbox with the user's permissions — verifying code means executing it. `check` blocks harness
-and build-configuration edits, but a malicious test could still read local secrets during
-`verify`. Review the diff (`git -C <worktree> diff <base>`) before `verify` when a run looks
-unusual; a containerized gate is the stronger, later option.
+## Containerized verification
+
+Agent-written code (tests, build targets, scripts) is executed only inside verification
+containers, never with host permissions. `run-gate.mjs` runs the repository's unmodified
+`harness/verify.sh`:
+
+| | BE | FE |
+|---|---|---|
+| Image | `verify-container/Dockerfile`: digest-pinned .NET SDK 8 + Node 24.16.0 + pnpm 11.5.3, git, python3, flock; no SSH, Docker or cloud CLIs; built locally with the host uid (`run-gate.mjs build-image`); refused when stale or root | same |
+| User / privileges | host uid, `--cap-drop ALL`, `no-new-privileges`, read-only root, private tmpfs `/tmp` and `HOME`, `--init`, pids 4096, memory 8g, 4 CPUs (`ORCH_VERIFY_*`) | same |
+| Mounts | worktree (rw), main repo `.git` (ro), `~/.nuget/packages` (ro fallback), per-run package dir | worktree (rw, `node_modules` from `prepare`), main repo `.git` (ro) |
+| Network | 1) restore + NuGet vulnerability audit with egress, **only when restore inputs are unchanged from `base_revision`**; 2) gate on an `--internal` network whose only peer is a disposable MySQL 8.0 sidecar (tmpfs data, generated credentials passed by variable name) | `--network none` |
+| Never present | Docker socket, host home, SSH agent, Codex/Claude/cloud credentials, host environment, `.env` files, dev/LAN databases | same |
+
+The MySQL integration fixture uses `MYSQL_INTEGRATION_CONNECTION_STRING` when set (the sidecar)
+and Testcontainers otherwise, so host gates are unchanged. The gate's own restore step is an
+offline no-op after step 1. Restore inputs (`*.csproj`, `*.props`, `*.targets`, `*.sln`, `*.rsp`,
+`nuget.config`, `global.json`, lock files) are protected paths: changing them needs
+`protected_paths_override` **and** `allow_restore_input_changes: true` in the approved task, which
+deliberately lets agent build logic run during the networked restore. `run-gate.mjs probe`
+checks the isolation claims inside a real container.
+
+Exit codes: the restore's or the gate's own; refusals 2; infrastructure failures (missing
+image, MySQL not ready) 70. The runner holds the shared machine lock, records image id, steps,
+exit codes, network mode, tree hash before/after and cleanup in `container-record.json`, and
+removes every container and network it labelled.
+
+**Residual risk:** the restore container has egress (internet and the host's networks) and
+evaluates the base revision's build files; the MySQL sidecar runs with the image's default
+capabilities (internal network only). Container isolation depends on the local Docker daemon
+(rootful, seccomp default profile).
 
 ## Step 0
 

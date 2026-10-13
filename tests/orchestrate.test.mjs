@@ -86,9 +86,22 @@ process.stdin.on('end', () => {
   for (const [name, body] of Object.entries({
     git: `#!/usr/bin/env bash\necho "$*" >> "${join(root, 'git-calls.log')}"\nexec "${REAL_GIT}" "$@"\n`,
     gh: `#!/usr/bin/env bash\necho "$*" >> "${join(root, 'gh-calls.log')}"\nexit 1\n`,
-    claude: `#!/usr/bin/env bash\nexec "$@"\n`,
+    // Stays alive as the parent (no exec), so `claude` really is in the ancestry
+    // even when the suite runs outside a Claude Code session (CI, containers).
+    claude: `#!/usr/bin/env bash\n"$@"\nexit $?\n`,
   })) writeFileSync(join(bin, name), body);
   for (const name of ['codex', 'git', 'gh', 'claude']) chmodSync(join(bin, name), 0o755);
+  // Stub gate runner: same interface as verify-container/run-gate.mjs, but runs the
+  // fake repository's verify.sh directly (no Docker in unit tests). Logs its arguments.
+  writeFileSync(join(root, 'gate-runner.mjs'), `import { appendFileSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+const [side, worktree, ...rest] = process.argv.slice(2);
+appendFileSync(process.env.HOME + '/runner-calls.jsonl', JSON.stringify({ side, worktree, rest }) + '\\n');
+const change = rest.includes('--change') ? ['--change', rest[rest.indexOf('--change') + 1]] : [];
+const r = spawnSync('./harness/verify.sh', change, { cwd: worktree, stdio: 'inherit' });
+writeFileSync(rest[rest.indexOf('--record') + 1], JSON.stringify({ steps: [{ name: 'gate', exit: r.status }], cleanup_complete: true, image: { id: 'sha256:stub' } }));
+process.exit(r.status ?? 1);
+`);
   writeFileSync(join(root, 'catalog.json'), JSON.stringify(CATALOG));
   writeFileSync(join(root, 'step0-ready.json'), JSON.stringify({ ready: true }));
   writeFileSync(join(root, 'step0-not-ready.json'), JSON.stringify({ ready: false }));
@@ -140,6 +153,7 @@ function orch(ctx, args, env = {}) {
       ORCH_STATE_ROOT: join(ctx.ws, 'state'),
       ORCH_MODEL_CATALOG: join(root, 'catalog.json'),
       ORCH_STEP0_REPORT: join(root, 'step0-ready.json'),
+      ORCH_GATE_RUNNER: join(root, 'gate-runner.mjs'),
       FAKE_API_KEY: 'should-never-reach-codex',
       SSH_AUTH_SOCK: '/tmp/fake-agent.sock',
       ...env,
@@ -451,4 +465,34 @@ test('a Git hook planted by codex blocks the run and never executes', () => {
   orch(ctx, ['verify', ctx.taskFile, 'be']);
   orch(ctx, ['commit', ctx.taskFile, 'be']);
   assert.ok(!existsSync(join(root, 'home', 'hook-ran')), 'planted hook must not run');
+});
+
+test('verify runs the containerized gate runner with the exact base or change', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  rmSync(join(root, 'home', 'runner-calls.jsonl'), { force: true });
+  runToCommit(ctx, 'be');
+  runToCommit(ctx, 'fe');
+  const calls = readFileSync(join(root, 'home', 'runner-calls.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const be = calls.find((c) => c.side === 'be');
+  const fe = calls.find((c) => c.side === 'fe');
+  assert.equal(be.rest[be.rest.indexOf('--base') + 1], ctx.task.base_revision.be);
+  assert.ok(!be.rest.includes('--allow-restore-inputs'));
+  assert.equal(fe.rest[fe.rest.indexOf('--change') + 1], 'demo-change');
+  assert.equal(state(ctx).sides.be.steps.verify.container.image, 'sha256:stub');
+});
+
+test('restore inputs are protected and the contract check refuses (not containerized)', () => {
+  const ctx = setup();
+  ctx.task.sides.be.allowed_paths = ['src/**'];
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  orch(ctx, ['prepare', ctx.taskFile]);
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/Api.csproj': '<Project><Target Name="X" BeforeTargets="Restore" /></Project>' } }));
+  orch(ctx, ['implement', ctx.taskFile, 'be']);
+  const r = orch(ctx, ['check', ctx.taskFile, 'be']);
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /protected paths changed: src\/Api.csproj/);
+  const c = orch(ctx, ['contract', ctx.taskFile]);
+  assert.equal(c.status, 2);
+  assert.match(c.stderr, /not containerized/);
 });

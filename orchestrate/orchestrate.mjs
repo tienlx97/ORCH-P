@@ -31,6 +31,8 @@ const WORKTREE_ROOT = resolve(process.env.ORCH_WORKTREE_ROOT ?? join(homedir(), 
 const STATE_ROOT = resolve(process.env.ORCH_STATE_ROOT ?? join(BE_REPO, 'harness', 'runs'));
 const STEP0_REPORT = resolve(process.env.ORCH_STEP0_REPORT ?? join(STATE_ROOT, 'orch-step0', 'report.json'));
 const CODEX = process.env.ORCH_CODEX_BIN ?? 'codex';
+// Agent-written code is verified only inside containers (harness/verify-container).
+const GATE_RUNNER = process.env.ORCH_GATE_RUNNER ?? join(HERE, '..', 'verify-container', 'run-gate.mjs');
 const REPOS = { be: BE_REPO, fe: FE_REPO };
 
 // Same patterns as harness/checks/memory-secrets.sh, plus connection-string
@@ -52,6 +54,9 @@ const PROTECTED = [
   '.github/**', 'harness/**', '**/.env', '**/.env.*', '**/*.pem', '**/*.key', '**/*.pfx',
   'pnpm-lock.yaml', 'package-lock.json', '**/packages.lock.json', 'global.json',
   'docker-compose*.yml', 'Dockerfile', '.codex/**', '.claude/**', '.agents/**',
+  // Restore inputs: the BE package restore runs with network access, so it must
+  // only ever evaluate the base revision's build files (verify-container/run-gate.mjs).
+  '**/*.csproj', '**/*.props', '**/*.targets', '**/*.sln', '**/*.slnf', '**/*.rsp', '**/[Nn]u[Gg]et.[Cc]onfig',
 ];
 
 // Only these variables reach Codex. Everything else (API keys, tokens,
@@ -478,11 +483,14 @@ function cmdVerify(taskPath, side) {
   const { spec, s } = sideOf(task, state, side);
   if (s.steps.check?.exit !== 0) refuse(`check must pass before verify (side ${side})`);
   const treeBefore = worktreeTree(s.worktree);
-  const gateArgs = side === 'fe' ? ['--change', spec.change] : [];
-  // No pipe: the gate's own exit code is what gets recorded and returned.
-  const gate = run('./harness/verify.sh', gateArgs, { cwd: s.worktree });
   const dir = join(stateDir(task), `${side}-verify-${Date.now()}`);
   mkdirSync(dir, { recursive: true });
+  const record = join(dir, 'container-record.json');
+  const gateArgs = side === 'fe'
+    ? [GATE_RUNNER, 'fe', s.worktree, '--change', spec.change, '--record', record]
+    : [GATE_RUNNER, 'be', s.worktree, '--base', s.base, '--record', record, ...(spec.allow_restore_input_changes ? ['--allow-restore-inputs'] : [])];
+  // No pipe: the containerized gate's own exit code is what gets recorded and returned.
+  const gate = run(process.execPath, gateArgs, { cwd: s.worktree });
   writeFileSync(join(dir, 'gate.log'), `${gate.stdout}\n${gate.stderr}`);
   const runPath = /Evidence: (harness\/runs\/[^\s/]+)\/?/.exec(gate.stdout)?.[1] ?? null;
   const evidence = preserveEvidence(s.worktree, runPath, join(dir, 'evidence'));
@@ -493,8 +501,10 @@ function cmdVerify(taskPath, side) {
   }
   const treeAfter = worktreeTree(s.worktree);
   const exit = gate.status !== 0 ? gate.status : (treeAfter !== treeBefore ? 1 : (freshness && freshness.exit !== 0 ? freshness.exit : 0));
+  const container = existsSync(record) ? JSON.parse(readFileSync(record, 'utf8')) : null;
   recordStep(state, side, 'verify', {
     exit, gate_exit: gate.status, tree: treeBefore, tree_after: treeAfter, evidence, run_path: runPath, freshness, dir,
+    container: container ? { image: container.image?.id, steps: container.steps, cleanup_complete: container.cleanup_complete, tree: container.tree_before } : null,
   });
   saveState(task, state);
   if (treeAfter !== treeBefore) console.error('the gate changed the worktree; evidence is not bound to a stable tree');
@@ -532,30 +542,12 @@ function cmdCommit(taskPath, side) {
   return 0;
 }
 
-function cmdContract(taskPath) {
-  const { task, digest } = loadTask(taskPath);
-  const state = loadState(task, digest);
-  if (!task.contract_check) refuse('task does not request a contract check');
-  for (const side of ['be', 'fe']) if (state.sides[side]?.status !== 'committed') refuse(`side ${side} must be committed first`);
-  const be = state.sides.be.worktree;
-  const fe = state.sides.fe.worktree;
-  const up = run('./harness/integration/backend.sh', ['up'], { cwd: be });
-  let check = { status: null, stdout: '', stderr: '' };
-  if (up.status === 0) check = run('node', ['--import', './harness/register-node-alias.mjs', 'harness/checks/contract-read-integration.mjs'], { cwd: fe });
-  const down = run('./harness/integration/backend.sh', ['down'], { cwd: be });
-  const dir = join(stateDir(task), `contract-${Date.now()}`);
-  mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, 'contract.log'), [up.stdout, up.stderr, check.stdout, check.stderr, down.stdout, down.stderr].join('\n'));
-  const runPath = /Evidence: (harness\/runs\/[^\s/]+)\/?/.exec(check.stdout)?.[1];
-  const evidence = preserveEvidence(fe, runPath, join(dir, 'evidence'));
-  const exit = up.status !== 0 ? up.status : (check.status !== 0 ? check.status : down.status);
-  state.contract = {
-    exit, up: up.status, check: check.status, down: down.status, evidence,
-    be_commit: state.sides.be.steps.commit.commit, fe_commit: state.sides.fe.steps.commit.commit, at: now(),
-  };
-  saveState(task, state);
-  console.log(`contract: exit ${exit}; evidence ${evidence ?? 'NOT FOUND'}`);
-  return exit;
+function cmdContract() {
+  // The contract-read check builds the API image (agent code compiled by
+  // BuildKit with network) and serves agent-written FE code with `next start`
+  // on the host. Until both run in verification containers it is unavailable
+  // for orchestrated tasks — there is deliberately no override.
+  refuse('contract check is not containerized yet; run docs/coordination/pilot.md manually after human review of both branches');
 }
 
 /** Process ancestry (argv0 basenames) from /proc — execution metadata for review provenance. */
@@ -668,7 +660,7 @@ const COMMANDS = {
   check: (a) => cmdCheck(a[0], a[1]),
   verify: (a) => cmdVerify(a[0], a[1]),
   commit: (a) => cmdCommit(a[0], a[1]),
-  contract: (a) => cmdContract(a[0]),
+  contract: () => cmdContract(),
   'review-record': (a) => cmdReviewRecord(a[0], a[1]),
   status: (a) => cmdStatus(a[0]),
   cleanup: (a) => cmdCleanup(a[0], a.find((x) => x === 'be' || x === 'fe'), { preserve: a.includes('--preserve') }),
