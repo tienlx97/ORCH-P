@@ -1,0 +1,31 @@
+{
+  "id": "ORCH-EXAMPLE",
+  "status": "proposed",
+  "approval": { "source": "conversation/PR link where the user approved this task", "approved_by": "user" },
+  "base_revision": {
+    "be": "<full 40-character BE-P commit SHA>",
+    "fe": "<full 40-character FE-P commit SHA>"
+  },
+  "contract_check": true,
+  "sides": {
+    "be": {
+      "change": "<openspec change slug in BE-P>",
+      "objective": "One sentence: the backend outcome",
+      "complexity": "complex",
+      "model": "<model slug from `codex debug models`>",
+      "allowed_paths": ["src/**", "tests/**", "docs/api/**", "requests/**", "openspec/changes/<slug>/**"],
+      "acceptance_criteria": ["Observable behavior 1", "Tests that prove it"],
+      "inputs": ["openspec/changes/<slug>/proposal.md"],
+      "timeout_minutes": 60
+    },
+    "fe": {
+      "change": "<openspec change slug in FE-P>",
+      "objective": "One sentence: the frontend outcome",
+      "complexity": "normal",
+      "model": "<model slug>",
+      "allowed_paths": ["src/**", "openspec/changes/<slug>/**"],
+      "acceptance_criteria": ["Observable UI behavior", "Adapter tests"],
+      "inputs": ["BE handoff: docs/api changes and the verified BE commit"]
+    }
+  }
+}
