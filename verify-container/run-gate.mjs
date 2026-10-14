@@ -5,6 +5,11 @@
 //   node verify-container/run-gate.mjs be <worktree> --base <sha> [--record <file>] [--allow-restore-inputs]
 //   node verify-container/run-gate.mjs fe <worktree> --change <slug> [--record <file>]
 //   node verify-container/run-gate.mjs probe [<worktree>]
+//   node verify-container/run-gate.mjs restore <worktree> --base <sha> --packages <dir>
+//
+// `restore` prepares a fresh BE worktree for the implementer: the networked
+// package restore of step 1 below, on the base revision's restore inputs, so
+// Codex can build and test offline (`--no-restore`) inside its sandbox.
 //
 // Runs the repository's own unmodified gate (./harness/verify.sh) on
 // agent-written code inside a disposable container instead of on the host:
@@ -77,7 +82,7 @@ export function restoreInputChanges(paths) {
 }
 
 /** Common flags for every verification container: least privilege, no host state. */
-export function containerArgs({ worktree, commonGitDir, nugetRw, network, name, runId, env = {} }) {
+export function containerArgs({ worktree, commonGitDir, nugetRw, packages, network, name, runId, env = {} }) {
   const args = [
     'run', '--rm', '--init', '--name', name, '--label', `companymanagement.verify=${runId}`,
     '--user', `${process.getuid()}:${process.getgid()}`,
@@ -90,6 +95,12 @@ export function containerArgs({ worktree, commonGitDir, nugetRw, network, name, 
   if (nugetRw) {
     args.push('-v', `${nugetRw}:/nuget-rw`, '-e', 'NUGET_PACKAGES=/nuget-rw', '-e', 'NUGET_FALLBACK_PACKAGES=/nuget-ro');
     if (existsSync(NUGET_CACHE)) args.push('-v', `${NUGET_CACHE}:/nuget-ro:ro`);
+  }
+  // Restore for Codex (`restore`): host paths inside the container too, so the
+  // generated obj/project.assets.json resolves on the host for --no-restore builds.
+  if (packages) {
+    args.push('-v', `${packages}:${packages}`, '-e', `NUGET_PACKAGES=${packages}`);
+    if (existsSync(NUGET_CACHE)) args.push('-v', `${NUGET_CACHE}:${NUGET_CACHE}:ro`, '-e', `NUGET_FALLBACK_PACKAGES=${NUGET_CACHE}`);
   }
   // Names only (`-e NAME`): values come from this process's environment, never from argv.
   for (const name of Object.keys(env)) args.push('-e', name);
@@ -221,6 +232,43 @@ function gate(side, worktree, options) {
   }
 }
 
+/**
+ * Package restore for the implementer (orchestrate `prepare`): the same
+ * networked restore as gate step 1, on restore inputs unchanged from --base,
+ * writing packages to --packages (the run's private temp dir) and obj/ in the
+ * worktree. No agent code has run yet; nothing else is built or executed.
+ */
+function restoreForAgent(worktree, options) {
+  const wt = realpathSync(worktree);
+  if (!/^[0-9a-f]{40}$/.test(options.base ?? '')) refuse('--base must be the full commit SHA the worktree starts from');
+  if (!options.packages) refuse('--packages <dir> is required');
+  const packages = resolve(options.packages);
+  const commonGitDir = resolve(wt, git(wt, ['rev-parse', '--git-common-dir']).stdout.trim());
+  const image = requireImage();
+  const inputs = restoreInputChanges(changedPaths(wt, options.base));
+  if (inputs.length) refuse(`restore inputs differ from --base (${inputs.join(', ')}); the agent restore only runs on the base revision's build files`);
+  const runId = `restore-${Date.now()}-${process.pid}`;
+  const record = { side: 'be', command: 'restore', worktree: wt, packages, run_id: runId, image, tree_before: treeHash(wt), steps: [] };
+  mkdirSync(packages, { recursive: true });
+  try {
+    const net = `verify-restore-${runId}`;
+    docker(['network', 'create', '--label', `companymanagement.verify=${runId}`, net]);
+    const r = docker([...containerArgs({ worktree: wt, commonGitDir, packages, network: net, name: `verify-restore-${runId}`, runId }),
+      'dotnet', 'restore', 'CompanyManagement.sln'], { timeout: TIMEOUT_MS });
+    process.stdout.write(r.stdout);
+    process.stderr.write(r.stderr);
+    record.steps.push({ name: 'restore', exit: r.status, network: 'egress (base restore inputs only)' });
+    record.exit = r.status;
+  } finally {
+    record.cleanup_complete = cleanup(runId);
+    record.tree_after = treeHash(wt);
+  }
+  if (options.record) writeFileSync(options.record, `${JSON.stringify(record, null, 2)}\n`);
+  const changed = record.tree_after !== record.tree_before;
+  console.log(`CONTAINER-RESTORE exit=${record.exit} packages=${packages}${changed ? ' (TREE CHANGED)' : ''}`);
+  return changed && record.exit === 0 ? 1 : record.exit;
+}
+
 function probe(worktree) {
   // Runs fixed checks inside a gate container to prove the isolation claims.
   const image = requireImage();
@@ -263,6 +311,7 @@ function parse(argv) {
     if (a === '--base') options.base = rest[++i];
     else if (a === '--change') options.change = rest[++i];
     else if (a === '--record') options.record = rest[++i];
+    else if (a === '--packages') options.packages = rest[++i];
     else if (a === '--allow-restore-inputs') options.allowRestoreInputs = true;
     else options.positional.push(a);
   }
@@ -273,8 +322,8 @@ function main() {
   const { command, options } = parse(process.argv.slice(2));
   if (command === 'build-image') return buildImage();
   if (command === 'probe') return probe(options.positional[0]).ok ? 0 : 1;
-  if (command !== 'be' && command !== 'fe') {
-    console.error('usage: run-gate.mjs build-image | probe [worktree] | be <worktree> --base <sha> | fe <worktree> --change <slug>');
+  if (command !== 'be' && command !== 'fe' && command !== 'restore') {
+    console.error('usage: run-gate.mjs build-image | probe [worktree] | be <worktree> --base <sha> | fe <worktree> --change <slug> | restore <worktree> --base <sha> --packages <dir>');
     return 2;
   }
   // One heavy gate per machine: re-run this command under the shared machine lock.
@@ -286,6 +335,7 @@ function main() {
   }
   const worktree = options.positional[0];
   if (!worktree || !existsSync(worktree)) refuse('worktree path required');
+  if (command === 'restore') return restoreForAgent(worktree, options);
   const { exit, record, scratch } = gate(command, worktree, options);
   record.exit = exit;
   if (options.record) {

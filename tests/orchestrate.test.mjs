@@ -13,10 +13,14 @@ import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  buildFilesystemPolicy, globToRegExp, matchesAny, profileArgs, reviewProvenance, sanitizedEnv, scanSecrets,
+  buildFilesystemPolicy, deniedBy, gateFindings, globToRegExp, hiddenToolchain, matchesAny, profileArgs, reviewProvenance,
+  sanitizedEnv, scanSecrets,
 } from '../orchestrate/orchestrate.mjs';
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'orchestrate', 'orchestrate.mjs');
+// Not under /tmp: the generated sandbox profile denies /tmp, and implement
+// refuses a Codex binary the profile would hide (here: the stub in root/bin).
+const TEST_ROOT_PARENT = process.env.ORCH_TEST_ROOT ?? join(dirname(fileURLToPath(import.meta.url)), '..', 'runs');
 const REAL_GIT = spawnSync('bash', ['-c', 'command -v git'], { encoding: 'utf8' }).stdout.trim();
 const GIT_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
 let root;
@@ -33,7 +37,10 @@ function sh(cwd, cmd) {
   return r.stdout.trim();
 }
 
-/** A fake repository with a verify.sh whose exit code is read from gate-exit. */
+/**
+ * A fake repository with a verify.sh whose exit code is read from gate-exit;
+ * gate-fail-step / gate-fail-log make it report a failed step with that log.
+ */
 function makeRepo(dir, fe) {
   mkdirSync(join(dir, 'harness'), { recursive: true });
   writeFileSync(join(dir, 'harness', 'verify.sh'), `#!/usr/bin/env bash
@@ -41,6 +48,10 @@ cd "$(dirname "$0")/.."
 run="harness/runs/$(date +%s%N)"
 mkdir -p "$run"; echo evidence > "$run/summary.txt"
 code=$(cat "$HOME/gate-exit" 2>/dev/null || echo 0)
+if [ -f "$HOME/gate-fail-step" ]; then
+  failed=$(cat "$HOME/gate-fail-step"); cp "$HOME/gate-fail-log" "$run/$failed.log"
+  echo "    ✘ $failed FAILED — see $run/$failed.log"
+fi
 echo "VERIFICATION — Evidence: $run/"
 exit "$code"
 `);
@@ -59,7 +70,8 @@ exit "$code"
 }
 
 before(() => {
-  root = mkdtempSync(join(tmpdir(), 'orch-test-'));
+  mkdirSync(TEST_ROOT_PARENT, { recursive: true });
+  root = mkdtempSync(join(TEST_ROOT_PARENT, '.orch-test-'));
   const home = join(root, 'home');
   const bin = join(root, 'bin');
   mkdirSync(home);
@@ -102,6 +114,7 @@ process.stdin.on('end', () => {
 import { spawnSync } from 'node:child_process';
 const [side, worktree, ...rest] = process.argv.slice(2);
 appendFileSync(process.env.HOME + '/runner-calls.jsonl', JSON.stringify({ side, worktree, rest }) + '\\n');
+if (side === 'restore') process.exit(Number(process.env.STUB_RESTORE_EXIT ?? 0));
 const change = rest.includes('--change') ? ['--change', rest[rest.indexOf('--change') + 1]] : [];
 const r = spawnSync('./harness/verify.sh', change, { cwd: worktree, stdio: 'inherit' });
 writeFileSync(rest[rest.indexOf('--record') + 1], JSON.stringify({ steps: [{ name: 'gate', exit: r.status }], cleanup_complete: true, image: { id: 'sha256:stub' } }));
@@ -138,7 +151,7 @@ function setup(overrides = {}) {
   const taskFile = join(ws, 'task.json');
   writeFileSync(taskFile, JSON.stringify(task, null, 2));
   writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'v2\n' } }));
-  rmSync(join(root, 'home', 'gate-exit'), { force: true });
+  for (const f of ['gate-exit', 'gate-fail-step', 'gate-fail-log']) rmSync(join(root, 'home', f), { force: true });
   return { ws, be, fe, task, taskFile };
 }
 
@@ -522,4 +535,151 @@ test('state and commits record the ORCH-P revision', () => {
   const s = state(ctx);
   assert.match(s.orch.revision, /^([0-9a-f]{40}|UNKNOWN)$/);
   assert.match(sh(s.sides.be.worktree, 'git log -1 --format=%B'), /Orchestrator: ORCH-P /);
+});
+
+// ── toolchain visibility, offline restore, gate rework ──────────────────
+test('a toolchain under a denied home entry is reported with the deny that hides it', () => {
+  const home = mkdtempSync(join(TEST_ROOT_PARENT, '.orch-home-'));
+  for (const d of ['.asdf/bin', '.nvm/bin']) {
+    mkdirSync(join(home, d), { recursive: true });
+    writeFileSync(join(home, d, 'codex'), '#!/bin/sh\n');
+    chmodSync(join(home, d, 'codex'), 0o755);
+  }
+  const policy = buildFilesystemPolicy({ home, worktreeRoot: join(home, 'orch-worktrees') });
+  assert.equal(deniedBy(policy, join(home, '.asdf', 'bin', 'codex')), join(home, '.asdf'));
+  assert.equal(deniedBy(policy, join(home, '.nvm', 'bin', 'codex')), null);
+  const asdfFirst = `${join(home, '.asdf', 'bin')}:${join(home, '.nvm', 'bin')}`;
+  const nvmFirst = `${join(home, '.nvm', 'bin')}:${join(home, '.asdf', 'bin')}`;
+  assert.deepEqual(hiddenToolchain(policy, [{ name: 'codex' }], asdfFirst).map((h) => h.denied_by), [join(home, '.asdf')]);
+  assert.deepEqual(hiddenToolchain(policy, [{ name: 'codex' }], nvmFirst), [], 'the first match on PATH is what runs');
+  assert.deepEqual(hiddenToolchain(policy, [{ name: 'not-installed' }], nvmFirst), [], 'missing is not hidden');
+  rmSync(home, { recursive: true, force: true });
+});
+
+test('implement refuses a Codex binary the sandbox would hide', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const hiddenDir = join(root, 'home', '.asdf', 'bin');
+  mkdirSync(hiddenDir, { recursive: true });
+  writeFileSync(join(hiddenDir, 'codex'), readFileSync(join(root, 'bin', 'codex')));
+  chmodSync(join(hiddenDir, 'codex'), 0o755);
+  rmSync(join(root, 'home', 'codex-calls.jsonl'), { force: true });
+  const r = orch(ctx, ['implement', ctx.taskFile, 'be'], { ORCH_CODEX_BIN: join(hiddenDir, 'codex') });
+  rmSync(join(root, 'home', '.asdf'), { recursive: true, force: true });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /hides codex .*under denied .*\.asdf/);
+  assert.ok(!existsSync(join(root, 'home', 'codex-calls.jsonl')), 'codex never started');
+});
+
+test('prepare restores BE packages for offline builds and the prompt says how to use them', () => {
+  let ctx = setup();
+  rmSync(join(root, 'home', 'runner-calls.jsonl'), { force: true });
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+  const calls = readFileSync(join(root, 'home', 'runner-calls.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.deepEqual(calls.map((c) => c.side), ['restore'], 'restore for BE only, before any agent run');
+  const s = state(ctx);
+  const arg = (name) => calls[0].rest[calls[0].rest.indexOf(name) + 1];
+  assert.equal(calls[0].worktree, s.sides.be.worktree);
+  assert.equal(arg('--base'), ctx.task.base_revision.be);
+  assert.equal(arg('--packages'), join(ctx.ws, 'worktrees', `${ctx.task.id}-be-tmp`, 'nuget'), 'packages live in the private temp dir');
+  assert.equal(s.sides.be.steps.restore.exit, 0);
+  orch(ctx, ['implement', ctx.taskFile, 'be']);
+  const prompt = readFileSync(join(state(ctx).sides.be.steps.implement.dir, 'prompt.md'), 'utf8');
+  assert.match(prompt, /dotnet build --no-restore -m:1 -nodeReuse:false/);
+  assert.match(prompt, /`dotnet test` cannot run here/);
+  // A failed restore does not stop the run, but the prompt must not promise a build.
+  ctx = setup();
+  const r = orch(ctx, ['prepare', ctx.taskFile], { STUB_RESTORE_EXIT: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /offline package restore failed/);
+  orch(ctx, ['implement', ctx.taskFile, 'be']);
+  const degraded = readFileSync(join(state(ctx).sides.be.steps.implement.dir, 'prompt.md'), 'utf8');
+  assert.match(degraded, /compiling and running tests is impossible here/);
+  assert.doesNotMatch(degraded, /--no-restore/);
+});
+
+test('gate findings: compiler errors and failed tests, deduplicated, relative, secrets dropped', () => {
+  const dir = mkdtempSync(join(TEST_ROOT_PARENT, '.orch-evidence-'));
+  const wt = '/home/u/orch-worktrees/T-be';
+  const err = `${wt}/tests/Api/PortsControllerTests.cs(216,36): error CS0104: 'ShipmentType' is an ambiguous reference [${wt}/tests/Api/Api.csproj]`;
+  writeFileSync(join(dir, 'build.log'), `${err}\n${err}\nBuild FAILED.\n`);
+  writeFileSync(join(dir, 'test.log'), [
+    'Passed!  - Failed:     0, Passed:   442, Skipped:     0, Total:   442 - CompanyManagement.Domain.UnitTests.dll (net8.0)',
+    err,
+    '  Failed CompanyManagement.Tests.PortTests.Delete_InUse [12 ms]',
+    '  Error Message:',
+    '   Expected status 409 but found 500.',
+  ].join('\n'));
+  // Built at runtime so the repository holds no token-shaped literal.
+  const fakeToken = `${'gh'}p_${'a'.repeat(36)}`;
+  writeFileSync(join(dir, 'lint.log'), `src/a.js\n  3:1  error  'x' is not defined  no-undef\n  4:1  error  token ${fakeToken}\n`);
+  const output = [
+    '    ✘ build FAILED — see harness/runs/1/build.log',
+    '    ✘ test FAILED — see harness/runs/1/test.log',
+    '    ✘ lint FAILED (exit 1) — see runs/1/lint.log',
+  ].join('\n');
+  const findings = gateFindings({ output, evidenceDir: dir, worktree: wt });
+  const summaries = findings.map((f) => f.summary);
+  assert.deepEqual(summaries.slice(0, 3), [
+    "build: tests/Api/PortsControllerTests.cs:216 CS0104 'ShipmentType' is an ambiguous reference",
+    'test: test failed CompanyManagement.Tests.PortTests.Delete_InUse — Expected status 409 but found 500.',
+    "lint: 3:1  error  'x' is not defined  no-undef",
+  ]);
+  assert.ok(findings.every((f) => f.severity === 'blocking' && f.source === 'gate'));
+  assert.equal(summaries.filter((x) => x.includes('CS0104')).length, 1, 'one compiler error reported by build and test steps is one finding');
+  assert.ok(!summaries.some((x) => x.includes('Passed!')), 'pass summaries are not findings');
+  assert.ok(!summaries.join('\n').includes(wt), 'paths relative to the worktree');
+  assert.equal(scanSecrets(summaries.join('\n'), 'f').length, 0, 'no secret-like line survives');
+  assert.match(summaries.at(-1), /1 gate lines omitted because they looked like secrets/);
+  assert.match(gateFindings({ output: '', evidenceDir: null, worktree: wt })[0].summary, /without a recognizable failing step/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('a failed gate sends its findings to the next implement on the same worktree; a pass clears them', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  orch(ctx, ['implement', ctx.taskFile, 'be']);
+  orch(ctx, ['check', ctx.taskFile, 'be']);
+  writeFileSync(join(root, 'home', 'gate-exit'), '1');
+  writeFileSync(join(root, 'home', 'gate-fail-step'), 'build');
+  writeFileSync(join(root, 'home', 'gate-fail-log'), "src/App.cs(3,7): error CS0246: The type or namespace name 'Foo' could not be found\n");
+  let r = orch(ctx, ['verify', ctx.taskFile, 'be']);
+  assert.equal(r.status, 1);
+  assert.match(r.stdout, /1 gate findings recorded for rework/);
+  assert.equal(JSON.parse(orch(ctx, ['status', ctx.taskFile]).stdout).overall, 'rework_required');
+  const worktree = state(ctx).sides.be.worktree;
+  orch(ctx, ['implement', ctx.taskFile, 'be']);
+  const s = state(ctx);
+  assert.equal(s.sides.be.worktree, worktree, 'same worktree, no new task id');
+  const prompt = readFileSync(join(s.sides.be.steps.implement.dir, 'prompt.md'), 'utf8');
+  assert.match(prompt, /- \[blocking\] build: src\/App.cs:3 CS0246 The type or namespace name 'Foo' could not be found/);
+  for (const f of ['gate-exit', 'gate-fail-step', 'gate-fail-log']) rmSync(join(root, 'home', f), { force: true });
+  r = orch(ctx, ['verify', ctx.taskFile, 'be']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(state(ctx).sides.be.rework, []);
+  assert.equal(JSON.parse(orch(ctx, ['status', ctx.taskFile]).stdout).sides.be.gate_rework, 0);
+});
+
+test('verify refuses a worktree changed since check (rework must be checked again)', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  orch(ctx, ['implement', ctx.taskFile, 'be']);
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be']).status, 0);
+  writeFileSync(join(state(ctx).sides.be.worktree, 'docs.md'), 'out of scope, written after check\n');
+  const r = orch(ctx, ['verify', ctx.taskFile, 'be']);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /worktree changed since check/);
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be']).status, 1, 'the new check catches the out-of-scope file');
+});
+
+test('an infrastructure failure of the gate is not sent to Codex as rework', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  orch(ctx, ['implement', ctx.taskFile, 'be']);
+  orch(ctx, ['check', ctx.taskFile, 'be']);
+  writeFileSync(join(root, 'home', 'gate-exit'), '70');
+  const r = orch(ctx, ['verify', ctx.taskFile, 'be']);
+  assert.equal(r.status, 70);
+  assert.match(r.stderr, /infrastructure failure/);
+  assert.deepEqual(state(ctx).sides.be.rework, []);
 });

@@ -7,7 +7,7 @@ framework is involved ([Ruflo: not adopted](ruflo-evaluation.md)). Policy: [BE-P
 ```text
 human approves task.json ──► prepare ──► implement (Codex, sandboxed) ──► check ──► verify (gate)
                                                     ▲                                   │
-                                   rework findings ─┘                                   ▼
+                      gate or review findings ─────┘ (same worktree)                   ▼
 human merges ◄── ready_for_human_merge ◄── review-record (Claude Code) ◄── contract ◄── commit (local)
 ```
 
@@ -19,18 +19,36 @@ siblings; override with `ORCH_BE_REPO` / `ORCH_FE_REPO`). Run state goes to `ORC
 | Command | Does | Refuses when |
 |---|---|---|
 | `validate` | Prints the resolved plan (bases, model, effort) | Task not approved; base not a full SHA that is a commit; model/effort not in `codex debug models` |
-| `prepare` | Worktree per side at `base_revision` on `agent/<id>-<side>` under `~/orch-worktrees`; FE `pnpm install --frozen-lockfile --prefer-offline` | Already prepared; worktree path or branch exists |
-| `implement` | `codex exec` with the generated sandbox profile, model, effort, allowlisted environment and private `TMPDIR`; prompt from `prompt.md` + task fields | Step 0 not READY; task file edited since prepare; secret-like text in the prompt |
-| `check` | Changed paths ⊆ `allowed_paths`, no protected paths, secret scan of diff and new files | — (fails with exit 1) |
-| `verify` | The repository's own gate in a verification container (`verify-container/run-gate.mjs`), FE `task.mjs status`; preserves evidence and the container record; binds both to the tree hash | `check` did not pass |
+| `prepare` | Worktree per side at `base_revision` on `agent/<id>-<side>` under `~/orch-worktrees`; BE package restore for offline builds (`run-gate.mjs restore`, below); FE `pnpm install --frozen-lockfile --prefer-offline` | Already prepared; worktree path or branch exists |
+| `implement` | `codex exec` with the generated sandbox profile, model, effort, allowlisted environment and private `TMPDIR`; prompt from `prompt.md` + task fields + pending rework findings | Step 0 not READY; task file edited since prepare; secret-like text in the prompt; `codex`, `node` or (BE) `dotnet` resolves under a path the profile denies |
+| `check` | Changed paths ⊆ `allowed_paths`, no protected paths, secret scan of diff and new files; binds the result to the tree hash | — (fails with exit 1) |
+| `verify` | The repository's own gate in a verification container (`verify-container/run-gate.mjs`), FE `task.mjs status`; preserves evidence and the container record; binds both to the tree hash. A failed gate (not exit 70) records its findings as rework: run `implement`, `check`, `verify` again on the same worktree | `check` did not pass, or the tree changed since `check` |
 | `commit` | Local commit with `Verified-Tree` / `Verification-Evidence` trailers | Gate not passed; evidence missing; tree changed since verification |
 | `contract` | Disabled: the contract-read check would build and serve agent code on the host. A task with `contract_check: true` cannot reach `ready_for_human_merge`; run [pilot.md](../../BE-P/docs/coordination/pilot.md) manually after review | Always |
 | `review-record` | Stores Claude Code's `review.json` with execution provenance | Not run from a Claude Code process; a Codex process in the ancestry; commits differ from the verified commits |
-| `status` | `in_progress`, `blocked`, `rework_required` or `ready_for_human_merge` | — |
+| `status` | `in_progress`, `blocked`, `rework_required` (review or gate findings pending) or `ready_for_human_merge` | — |
 | `cleanup` | Removes worktrees, keeps branches and evidence | Uncommitted changes; unpreserved evidence (unless `--preserve`) |
 
 Exit codes: a child's real exit code is returned (gate, Codex, task status); refusals exit 2.
 Nothing in the tool pushes, merges, deploys or opens pull requests; tests assert it.
+
+**Rework.** Findings reach Codex through the prompt's rework section on the same worktree, so
+a failed gate no longer needs a new task id. Gate findings are compiler errors (`file:line CODE
+message`), failed tests (name and first error line) and the error lines of other failed steps,
+read from the preserved evidence, relative to the worktree, deduplicated, capped at 25; lines that
+look like secrets are dropped (only their count is reported). Infrastructure failures (exit 70)
+are never sent to Codex. A passing `verify` clears gate findings; review findings stay until the
+next `review-record`.
+
+**Offline builds for Codex (BE).** `prepare` runs `run-gate.mjs restore`: the networked package
+restore of the gate's step 1, on the base revision's restore inputs (refused if they differ),
+before any agent code exists. Packages go to `<id>-be-tmp/nuget`, mounted at the same absolute
+path so `obj/project.assets.json` is valid on the host. Inside the sandbox Codex compiles with
+`dotnet build --no-restore -m:1 -nodeReuse:false` (parallel MSBuild nodes fail there with no error
+listed). `dotnet test` cannot run in the sandbox: the vstest host needs a loopback socket and the
+sandbox has no network at all; tests run only in the gate. The package dir is writable by Codex,
+like its `TMPDIR`; nothing outside the sandbox uses it (the gate restores into its own scratch
+dir). A failed restore does not stop `prepare`; the prompt then says compiling is impossible.
 
 ## Task file
 
@@ -94,8 +112,8 @@ image, MySQL not ready) 70. The runner holds the shared machine lock, records im
 exit codes, network mode, tree hash before/after and cleanup in `container-record.json`, and
 removes every container and network it labelled.
 
-**Residual risk:** the restore container has egress (internet and the host's networks) and
-evaluates the base revision's build files; the MySQL sidecar runs with the image's default
+**Residual risk:** the restore containers (gate step 1 and the agent restore at `prepare`) have
+egress (internet and the host's networks) and evaluate the base revision's build files; the MySQL sidecar runs with the image's default
 capabilities (internal network only). Container isolation depends on the local Docker daemon
 (rootful, seccomp default profile).
 
@@ -104,5 +122,7 @@ capabilities (internal network only). Container isolation depends on the local D
 `node orchestrate/step0-probe.mjs` must report READY (`runs/orch-step0/report.json`)
 before `implement` runs. It probes, without a model, the built-in `:workspace` baseline and the
 generated profile in a real BE-P worktree (writes, Git metadata, network, Docker, other
-processes' environment, Windows drives, credential files, canaries), then makes one real
+processes' environment, Windows drives, credential files, canaries), checks that `codex`, `node`
+and `dotnet` on PATH resolve outside every denied path (Codex re-executes itself inside the
+sandbox: a Codex under `~/.asdf` fails with `bwrap: execvp`), then makes one real
 read-only `codex exec` call that tries to read a canary file. Rerun it after Codex upgrades.

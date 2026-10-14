@@ -200,3 +200,35 @@ test('the runner waits on the shared machine lock', async () => {
   assert.equal(r.status, 0, r.stderr);
   assert.ok(Date.now() - started >= 2000, 'waited for the other gate');
 });
+
+test('agent restore: base restore inputs only, egress network, same-path package dir, nothing else runs', () => {
+  const ctx = setup({ 'src/Code.cs': 'class B {}\n' });
+  const packages = join(ctx.dir, 'tmp', 'nuget');
+  const r = runner(ctx, ['restore', ctx.wt, '--base', ctx.base, '--packages', packages]);
+  assert.equal(r.status, 0, r.stderr);
+  const runs = r.calls.filter((c) => c.args[0] === 'run');
+  assert.equal(runs.length, 1, 'one restore container, no gate, no database');
+  const args = runs[0].args;
+  assert.deepEqual(args.slice(-3), ['dotnet', 'restore', 'CompanyManagement.sln']);
+  assert.ok(args.includes(`${packages}:${packages}`), 'packages mounted at the host path');
+  assert.ok(args.includes(`NUGET_PACKAGES=${packages}`));
+  assert.ok(!args.includes('--internal'));
+  for (const flag of ['--cap-drop', '--read-only', 'no-new-privileges']) assert.ok(args.includes(flag) || args.join(' ').includes(flag), flag);
+  const created = r.calls.find((c) => c.args[0] === 'network' && c.args[1] === 'create');
+  assert.ok(created && !created.args.includes('--internal'), 'restore network has egress');
+  assert.deepEqual(JSON.parse(readFileSync(join(ctx.dir, 'state.json'), 'utf8')), { c: [], n: [] }, 'cleaned up');
+  assert.match(r.stdout, /CONTAINER-RESTORE exit=0/);
+});
+
+test('agent restore: refused on changed restore inputs, without --packages, or a short base; real exit code', () => {
+  let ctx = setup({ 'src/Api.csproj': '<Project><Target Name="X" BeforeTargets="Restore" /></Project>\n' });
+  let r = runner(ctx, ['restore', ctx.wt, '--base', ctx.base, '--packages', join(ctx.dir, 'p')]);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /restore inputs differ from --base/);
+  assert.ok(!r.calls.some((c) => c.args[0] === 'run'), 'no container');
+  ctx = setup();
+  assert.equal(runner(ctx, ['restore', ctx.wt, '--base', ctx.base]).status, 2);
+  assert.equal(runner(ctx, ['restore', ctx.wt, '--base', ctx.base.slice(0, 7), '--packages', join(ctx.dir, 'p')]).status, 2);
+  r = runner(ctx, ['restore', ctx.wt, '--base', ctx.base, '--packages', join(ctx.dir, 'p')], { STUB_RESTORE_EXIT: '4' });
+  assert.equal(r.status, 4);
+});

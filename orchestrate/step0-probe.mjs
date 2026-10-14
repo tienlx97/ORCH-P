@@ -24,7 +24,9 @@ import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { buildFilesystemPolicy, profileArgs, sanitizedEnv, scanSecrets } from './orchestrate.mjs';
+import {
+  buildFilesystemPolicy, deniedBy, profileArgs, resolveCommand, sanitizedEnv, scanSecrets,
+} from './orchestrate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ORCH_REPO = resolve(HERE, '..');
@@ -119,6 +121,22 @@ function suite(profile) {
   probe(profile, 'other_worktrees_listed', `ls '${ROOT}' | grep -v '^${id}' | grep -q .`, 'deny', 'informational');
   for (const file of sensitive) probe(profile, `read:${file.replace(HOME, '~')}`, `head -c 1 '${file}' >/dev/null`, 'deny');
   for (const f of [outside, join(BE, `.orch-step0-${process.pid}`), join(FE, `.orch-step0-${process.pid}`), join(BE, '.git', `orch-step0-${process.pid}`), join(tmpdir(), `orch-step0-w-${process.pid}`)]) rmSync(f, { force: true });
+}
+
+// The toolchain must live where the generated profile can see it: Codex
+// re-executes itself inside the sandbox, so a Codex under a denied home entry
+// (e.g. ~/.asdf) makes every probe below fail with `bwrap: execvp`.
+const toolchain = [{ name: 'codex', bin: CODEX }, { name: 'node' }, { name: 'dotnet' }].map(({ name, bin }) => {
+  const path = resolveCommand(bin ?? name, env.PATH);
+  return { name, path, denied_by: path ? deniedBy(policy, path) : null };
+});
+for (const t of toolchain) {
+  results.push({
+    profile: 'orch', name: `toolchain:${t.name}`, expect: 'allow',
+    observed: !t.path ? 'not found on PATH' : (t.denied_by ? `hidden: ${t.path} is under denied ${t.denied_by}` : `visible at ${t.path}`),
+    pass: Boolean(t.path) && !t.denied_by,
+    note: t.denied_by ? 'install it under an allowed toolchain (~/.nvm, ~/.dotnet, ~/.local/bin) or put that one first on PATH' : '',
+  });
 }
 
 probe(':read-only', 'control_read_only_blocks_write', 'touch probe-ro', 'deny', 'if allowed, profiles are not applied');
@@ -229,6 +247,10 @@ if (model) {
   console.log(`${modelOk ? '✔' : '✘'} model probe: ${model.requested_model} effort ${model.requested_effort}, exit ${model.exit}, `
     + `canary ${model.canary_leaked ? 'LEAKED' : 'not leaked'}, reply "${model.reply.slice(0, 60)}", commands ${model.commands_run}`
     + `${model.error ? `, error: ${model.error.slice(0, 120)}` : ''}`);
+}
+for (const t of toolchain.filter((x) => !x.path || x.denied_by)) {
+  console.log(`\n✘ ${t.name}: ${t.path ? `${t.path} is hidden by the sandbox (denied ${t.denied_by})` : 'not found on PATH'} — `
+    + 'install it under an allowed toolchain (~/.nvm, ~/.dotnet, ~/.local/bin) or put that one first on PATH; the probes above cannot run until then.');
 }
 console.log(`\nStep 0 ${report.ready ? 'READY' : 'NOT READY'} — report ${join(OUT, 'report.json')}`);
 process.exitCode = report.ready ? 0 : 1;

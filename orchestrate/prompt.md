@@ -14,10 +14,15 @@ Its rules govern how you implement, test and document the change.
 {{INPUTS}}
 
 ## Findings to address (rework)
+Findings from the repository gate or a review of your previous attempt in this same worktree.
+Fix every one of them; keep the rest of the existing work.
 {{REWORK}}
 
 ## Allowed paths — change nothing else
 {{ALLOWED_PATHS}}
+
+## Tooling in this sandbox
+{{TOOLING}}
 
 ## Rules for this run
 - Do not run `git commit`, `git push`, `git merge`, `gh`, deployment, or Docker commands. The
