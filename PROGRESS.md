@@ -1,0 +1,11 @@
+# Progress Log
+
+Newest first. Evidence directories under `runs/` are local (gitignored).
+
+## 2026-10-14 — Repository created; containerized gates and Step 0 verified
+
+- Moved from BE-P with history (4 commits) plus scaffolding: sibling resolution of BE-P/FE-P, `runs/` state, interface drift check at prepare, ORCH-P revision in state and commit trailers, own gate.
+- Validation 2026-10-14 (local): ORCH-P `./harness/verify.sh --container` PASSED (`ORCH-P/runs/20261014-073040-1143867/`: syntax, 33 tests, secret scan, whitespace, links, container probe 14/14); BE gate in containers PASSED (restore with egress on unchanged restore inputs, then gate on an internal network with a disposable MySQL sidecar; 1413 tests incl. MySQL 47; cleanup complete; tree unchanged); FE gate in a `--network none` container PASSED; host gates PASSED (BE `harness/runs/20261014-072429-1131096/`, FE `FE-P/harness/runs/20261014-072317-3gtwTU/`).
+- Step 0 READY with direct evidence (`ORCH-P/runs/orch-step0/report.json`): inside a real `codex exec` under the implement profile, a check script got EACCES reading the canary, `~/.ssh` key, `~/.codex/auth.json` and BE `.env`, EROFS writing outside the workspace, and a DNS failure for network; the canary never appeared in output. Earlier attempts were inconclusive because the model refused to run `cat` on a path its policy listed as denied.
+- Failure protocol: (1) `.NET` named mutex failed for a uid without a passwd entry — image now creates `verify` with the host uid; (2) review-provenance test passed only inside a Claude Code session (stub `claude` used `exec`) — fixed and proven in a container; (3) a mount assertion assumed the host HOME — rewritten as an allowed-mount check; (4) after the move, replaying patches changed a Dockerfile comment, so every container run was refused as stale until `build-image` — the freshness check worked as designed; (5) a wait loop matched its own command line and never finished — stopped; no more pgrep-based waits.
+- Readiness: foundation complete; no real code-writing pilot has run. The first pilot needs explicit user approval and a small BE+FE task with `contract_check: false` (the contract check is not containerized yet).
