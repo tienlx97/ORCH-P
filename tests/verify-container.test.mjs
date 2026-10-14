@@ -106,7 +106,11 @@ test('container flags are least privilege and carry no host state', () => {
   assert.equal(args[args.indexOf('--user') + 1], `${process.getuid()}:${process.getgid()}`);
   assert.ok(args.includes('/r/.git:/r/.git:ro'), 'Git metadata read-only');
   assert.ok(!joined.includes('docker.sock'), 'no Docker socket');
-  assert.ok(!joined.includes(process.env.HOME ?? '/nonexistent-home') || joined.includes('.nuget/packages:/nuget-ro:ro'), 'only the NuGet cache from home, read-only');
+  // Every bind mount must be one of: worktree, Git metadata (ro), per-run package dir, NuGet cache (ro).
+  const mounts = args.flatMap((x, i) => (x === '-v' ? [args[i + 1]] : []));
+  for (const m of mounts) {
+    assert.ok(['/w:/w', '/r/.git:/r/.git:ro', '/n:/nuget-rw'].includes(m) || /\/\.nuget\/packages:\/nuget-ro:ro$/.test(m), `unexpected mount ${m}`);
+  }
   assert.ok(!args.some((a) => a.includes('SECRET_THING=')), 'env passed by name only');
   assert.ok(args.includes('SECRET_THING'));
   assert.ok(!args.includes('--privileged'));
