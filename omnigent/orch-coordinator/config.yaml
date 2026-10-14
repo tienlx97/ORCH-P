@@ -68,6 +68,14 @@ os_env:
     write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude"]
     write_files: ["~/.claude.json"]
     cwd_allow_hidden: [".nvm", ".claude", ".credentials.json"]
+    # Network only through Omnigent's egress proxy (isolated namespace,
+    # default deny, loopback and private ranges refused): Claude reaches
+    # Anthropic, nothing else, and never the unauthenticated local API.
+    egress_rules:
+      - "* api.anthropic.com/**"
+      - "* console.anthropic.com/**"
+      - "* platform.claude.com/**"
+      - "* claude.ai/**"
 
 guardrails:
   policies:

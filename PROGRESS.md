@@ -2,6 +2,22 @@
 
 Newest first. Evidence directories under `runs/` are local (gitignored).
 
+## 2026-10-15 — Option 3: Codex sessions in Omnigent under the accepted read-isolation risk
+
+- The three options for Codex ignoring the permission profile in Omnigent are saved in `docs/omnigent-evaluation.md`; the user chose option 3 first. `omnigent/pin.json` is approved and records the accepted risk `codex-read-isolation` (exactly the five read checks); AGENTS.md rule 2 names it as the only exception.
+- `implement` (`runner: omnigent`) runs when Step 0 through Omnigent fails only covered checks, warns on every run and records `accepted_risks`. Everything else stays mandatory and is checked per run: Codex's own log must show only `WorkspaceWrite`/`ReadOnly` (read from the session's `logs_2.sqlite`, waiting for the flush), no permission-mode change item, secret scan of the history.
+- Found during the runs: Omnigent labels this stance `full-access` while Codex runs WorkspaceWrite, so the label is recorded but not used; Codex flushes its log seconds after the session is idle.
+- Step 0 through Omnigent (third run): writes outside, network, loopback denied; no credential variables; private TMPDIR; sandbox policies `ReadOnly`, `WorkspaceWrite`; reads allowed (accepted).
+
+## 2026-10-14 — O1: Omnigent installed and probed; Codex sessions in Omnigent blocked
+
+- Installed `omnigent==0.18.0` into `tools/omnigent/.venv` from `tools/omnigent/requirements.lock` (94 packages, hash-pinned, wheels only; wheel sha256 = pin). `~/.omnigent/config.yaml` sets `telemetry: false`.
+- `cockpit.mjs host` / `host-stop` start the daemon (stdin closed: with a pipe the CLI hangs) with the allowlisted environment and `CODEX_HOME=~/.codex-orch` (hub Codex home: `model` only, `auth.json` linked), recorded in `runs/omnigent-host.json`; `implement` and `step0-omnigent.mjs` require that daemon. `HARNESS_CODEX_MINIMAL_CONFIG` was dropped: the daemon strips it before runners.
+- Codex profile passed as a file profile (`--profile`, launch args are capped at 4096 characters) plus `-c default_permissions`.
+- `probe-api`: real REST shapes recorded; client and runner match them. Server bound to 127.0.0.1 only; idle sockets loopback only; no Claude/Codex setting changed.
+- **Step 0 through Omnigent: NOT READY.** Writes outside, network and loopback denied, but reads of the canary, SSH key, `~/.codex/auth.json`, `~/.omnigent` and BE `.env` succeeded: Codex logged `sandbox_policy=WorkspaceWrite … permission_profile: None` for the app-server/`--remote` thread, ignoring the permission profile. `implement` with `runner: omnigent` stays blocked; use `runner: codex-exec`.
+- CEL allowlists confirmed under the installed cel-python (tests no longer skipped). Gate: 96 tests, all pass.
+
 ## 2026-10-14 — Design answers for the ten O1 questions
 
 - Codex sessions in Omnigent: launch args add `shell_environment_policy.inherit="core"` and the run's private `TMPDIR`; `implement` refuses a `~/.codex/config.toml` with MCP servers, notify, hooks, profiles, sandbox/approval settings or a model provider (Omnigent copies it into the session).

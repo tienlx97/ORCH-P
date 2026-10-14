@@ -35,6 +35,11 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
 2. Security controls are the point of this repository. Never weaken the sandbox profile, the
    environment allowlist, container flags, review provenance or exit-code propagation to make a
    run pass; report the blocker instead.
+   The only exception is a risk the user accepted in writing and recorded by name in
+   `omnigent/pin.json` `accepted_risks` (known names in `orchestrate/lib/omnigent.mjs`
+   `KNOWN_RISKS`). Active since 2026-10-14: `codex-read-isolation` (Codex sessions in Omnigent can
+   read outside the worktree; see docs/omnigent-evaluation.md#options-while-codex-ignores-the-profile).
+   Never add or widen an accepted risk without that decision.
 3. Changes that alter what ORCH-P expects from BE-P or FE-P (`INTERFACES` in
    `orchestrate/orchestrate.mjs`) need the matching change in that repository first.
 4. Real Codex runs need a READY Step 0 (`node orchestrate/step0-probe.mjs`) and explicit user

@@ -1,4 +1,4 @@
-# Omnigent evaluation — the agent hub, not yet installed
+# Omnigent evaluation — the agent hub (installed; Codex sessions under accepted risk)
 
 **Status (2026-10-14):** static evaluation done under [AGENTS.md](../AGENTS.md) rule 7. The user
 chose Omnigent as the hub that runs, coordinates and keeps the shared history of every agent.
@@ -121,6 +121,47 @@ ORCH-P/tools/omnigent/.venv/bin/pip install omnigent==0.18.0     # O1: replace w
 ```
 
 `tools/omnigent/.venv/` is git-ignored.
+
+## O1 results (2026-10-14, Omnigent 0.18.0, Codex 0.162.1, WSL)
+
+Installed from `tools/omnigent/requirements.lock` (94 packages, all hash-pinned, wheels only;
+omnigent wheel sha256 = pin). Server and daemon started by `cockpit.mjs host`.
+
+| # | Result |
+|---|---|
+| 1 | **NOT READY.** In a `codex-native-ui` session the check script read the canary, an SSH key, `~/.codex/auth.json`, `~/.omnigent` and BE `.env`; writes outside the worktree, network and loopback to Omnigent were denied. The session's private `config.toml` held the ORCH-P profile (`default_permissions = "orch"` and the full table), also passed as `-c default_permissions="orch"`, yet Codex logged `sandbox_policy=WorkspaceWrite … permission_profile: None` for the thread: the app-server / `--remote` TUI path ran the legacy workspace-write sandbox without the read denials. Option 3 (below) accepts exactly these read checks; everything else held. The approval-mode label is not a signal (Omnigent shows `full-access` for this stance while Codex runs WorkspaceWrite): ORCH-P reads the sandbox policies from the session's own Codex log (`~/.omnigent/codex-native/<id>/codex-home/logs_2.sqlite`, flushed seconds after idle) and blocks anything but `WorkspaceWrite`/`ReadOnly`. Retest after every Codex or Omnigent upgrade. |
+| 2 | The personal `~/.codex/config.toml` has two MCP servers and hooks. Omnigent's `HARNESS_CODEX_MINIMAL_CONFIG` does not reach runners (the daemon strips it), so the hub uses its own `CODEX_HOME` (`~/.codex-orch`: `model` only, `auth.json` linked), set by `cockpit.mjs host`; `implement` checks that home. |
+| 3 | Omnigent's runner environment is already an allowlist (`host/connect.py` `_RUNNER_ENV_ALLOWLIST`); with `shell_environment_policy` the check script saw no credential variables and the private `TMPDIR`. |
+| 4 | `/v1/agents` → `{object, data[], first_id, last_id, has_more}`; `/v1/hosts` → `{hosts[]}` with `host_id`, `status: "online"`, `configured_harnesses` (`codex-native`, `claude-native` true), `gateway_inference` all false. Launch args are capped at 256 entries × 4096 characters, so the profile travels as a Codex file profile. stdin must be closed for `omnigent host --background`. |
+| 9 | Codex sessions: loopback denied. Claude agents: `egress_rules` (isolated network namespace, MITM proxy, default deny, private ranges refused) now limit them to Anthropic hosts; not yet exercised. |
+| 10 | Idle server and daemon: only loopback sockets. No watched Claude/Codex setting changed during install, host start and two probe sessions. |
+| 8 | **Confirmed:** both CEL allowlists compile under the installed cel-python and give the intended decision for all 26 sample events (`tests/omnigent.test.mjs`, no longer skipped). |
+| 5–7 | Not exercised yet (coordinator/reviewer sessions not started). |
+
+## Options while Codex ignores the profile
+
+Saved 2026-10-14 after the O1 probe (question 1). **Option 3 is active** (user's decision);
+options 1 and 2 stay available.
+
+1. **Hybrid.** Codex implementers run with `runner: codex-exec` (Step 0-proven); Omnigent stays
+   the hub for the coordinator, the reviewer, request approvals and stop; after each Codex run
+   ORCH-P imports the session into Omnigent (`omnigent import --harness codex`) for the shared
+   history. Codex sessions appear after the run, not live. Needs: default runner `codex-exec`,
+   Codex session files instead of `--ephemeral` (in the hub `CODEX_HOME`), an import step.
+2. **Wait for Codex.** Keep `runner: omnigent` blocked and rerun `node orchestrate/step0-omnigent.mjs`
+   after every Codex or Omnigent upgrade; use `runner: codex-exec` meanwhile.
+3. **Accept the read-isolation gap (active).** `omnigent/pin.json` records the accepted risk
+   `codex-read-isolation`, which covers exactly the five read checks (canary, SSH key,
+   `~/.codex/auth.json`, `~/.omnigent`, BE `.env`). Codex sessions in Omnigent may run when Step 0
+   through Omnigent fails **only** those checks. Still required on every run: writes outside the
+   worktree, network and loopback denied; no credential variables; private TMPDIR; Codex's own log
+   shows only `WorkspaceWrite`/`ReadOnly` sandboxes; no permission-mode change; no secret-like
+   text in the exported session history (the run is blocked otherwise). Each `implement` prints a
+   warning and records `accepted_risks` in its evidence.
+   **Residual risk:** Codex can read any file the user can (keys, tokens, `.env`) into its
+   conversation, which is sent to the model provider and kept in Omnigent's history; it cannot
+   send it over the network from its commands. Remove the entry when Step 0 through Omnigent is
+   READY.
 
 ## Open questions for the O1 probe
 

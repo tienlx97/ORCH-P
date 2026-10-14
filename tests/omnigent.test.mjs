@@ -12,10 +12,10 @@ import { fileURLToPath } from 'node:url';
 
 import { probeApi, shapeOf, startProblems } from '../orchestrate/cockpit.mjs';
 import {
-  BUNDLE_AGENTS, COORDINATOR_SHELL, lintBundle, OMNIGENT_OPT_OUTS, omnigentEnv, parseVersion, readPin,
+  BUNDLE_AGENTS, COORDINATOR_SHELL, KNOWN_RISKS, lintBundle, step0Acceptance, OMNIGENT_OPT_OUTS, omnigentEnv, parseVersion, readPin,
 } from '../orchestrate/lib/omnigent.mjs';
 import {
-  codexLaunchArgs, codexUserConfigProblems, lastAssistantText, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
+  codexLaunchArgs, codexProfileName, codexProfileToml, codexSandboxPolicies, codexUserConfigProblems, lastAssistantText, sandboxPolicyProblems, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
 } from '../orchestrate/lib/omnigent-runner.mjs';
 import { CHECKS, checkScript, enforcementFromItems, verdict } from '../orchestrate/step0-omnigent.mjs';
 import { startOmnigentStub } from './omnigent-stub.mjs';
@@ -43,6 +43,7 @@ function bundleCopy({ agent = (t) => t, server = (t) => t, pin = (p) => p } = {}
 }
 
 const approved = (p) => ({ ...p, status: 'approved', approval: { source: 'test', approved_by: 'user' } });
+const unapproved = (p) => ({ ...p, status: 'evaluated-static', approval: null, accepted_risks: undefined });
 
 function stubOmnigent(version) {
   const bin = join(fresh('bin'), 'omnigent');
@@ -69,7 +70,8 @@ test('omnigentEnv passes identity and display only and sets every opt-out', () =
     ANTHROPIC_API_KEY: 'x', OPENAI_API_KEY: 'x', OPENROUTER_API_KEY: 'x', DATABRICKS_TOKEN: 'x',
     GH_TOKEN: 'x', SSH_AUTH_SOCK: '/s', OMNIGENT_ANALYTICS: '1', OMNIGENT_INDEX_URL: 'https://x', CODEX_HOME: '/c',
   });
-  assert.deepEqual(env, { HOME: '/h', PATH: '/bin', TERM: 'xterm', LANG: 'C.UTF-8', ...OMNIGENT_OPT_OUTS });
+  assert.deepEqual(env, { HOME: '/h', PATH: '/bin', TERM: 'xterm', LANG: 'C.UTF-8', ...OMNIGENT_OPT_OUTS, CODEX_HOME: '/h/.codex-orch' });
+  assert.equal(omnigentEnv({ HOME: '/h', CODEX_HOME: '/h/.codex', ORCH_CODEX_HOME: '/hub' }).CODEX_HOME, '/hub', 'never the personal ~/.codex');
 });
 
 test('parseVersion reads the installed version', () => {
@@ -79,11 +81,13 @@ test('parseVersion reads the installed version', () => {
 });
 
 // ── bundle lint ──────────────────────────────────────────────────────────
-test('the repository bundle passes the lint and is evaluated, not approved', () => {
+test('the repository bundle passes the lint; the pin is approved and records only known accepted risks', () => {
   assert.deepEqual(lintBundle(BUNDLE), []);
   const { pin, problems } = readPin(BUNDLE);
   assert.deepEqual(problems, []);
-  assert.equal(pin.status, 'evaluated-static');
+  assert.equal(pin.status, 'approved');
+  assert.ok(pin.approval.source && pin.approval.approved_by);
+  for (const risk of pin.accepted_risks ?? []) assert.deepEqual(risk.checks, KNOWN_RISKS[risk.id]);
   assert.ok(readFileSync(join(BUNDLE, AGENT), 'utf8').includes(`r'${COORDINATOR_SHELL}'`));
 });
 
@@ -121,23 +125,45 @@ test('the reviewer config is linted for its own shell allowlist and write paths'
   assert.ok(edit((t) => t.replace('read_paths: ["~/.nvm"]', 'read_paths: ["~/"]')).some((p) => /orch-reviewer.*read_paths must be exactly/.test(p)));
   assert.ok(edit((t) => t.replace('write_files: ["~/.claude.json"]', 'write_files: ["~/.claude.json", "~/.ssh/config"]')).some((p) => /write_files must be exactly/.test(p)));
   assert.ok(edit((t) => t.replace('cwd_allow_hidden: [".git",', 'cwd_allow_hidden: ["*", ".git",')).some((p) => /cwd_allow_hidden must be exactly/.test(p)));
+  assert.ok(edit((t) => t.replace('      - "* claude.ai/**"\n', '      - "* claude.ai/**"\n      - "* *.example.com/**"\n')).some((p) => /orch-reviewer.*egress_rules must be exactly/.test(p)));
+  assert.ok(edit((t) => t.replace(/ {4}egress_rules:\n(?: {6}- .*\n)+/, '')).some((p) => /egress_rules must be exactly/.test(p)));
+  assert.ok(edit((t) => t.replace('    egress_rules:', '    egress_allow_private_destinations: true\n    egress_rules:')).some((p) => /egress_allow_private_destinations/.test(p)));
   assert.deepEqual(Object.keys(BUNDLE_AGENTS), ['orch-coordinator', 'orch-reviewer']);
   const extra = bundleCopy();
   cpSync(join(extra, 'orch-reviewer'), join(extra, 'codex-worker'), { recursive: true });
   assert.ok(lintBundle(extra).some((p) => /codex-worker: not an ORCH-P agent/.test(p)));
 });
 
+test('accepted risks: only known ones, exactly their checks, with the user\'s decision; they cover only those checks', () => {
+  const risk = { id: 'codex-read-isolation', checks: [...KNOWN_RISKS['codex-read-isolation']], approved_by: 'user', source: 's', date: '2026-10-14' };
+  assert.ok(lintBundle(bundleCopy({ pin: (p) => ({ ...p, accepted_risks: [{ ...risk, id: 'codex-network' }] }) })).some((p) => /unknown risk codex-network/.test(p)));
+  assert.ok(lintBundle(bundleCopy({ pin: (p) => ({ ...p, accepted_risks: [{ ...risk, checks: [...risk.checks, 'NETWORK'] }] }) })).some((p) => /checks must be exactly/.test(p)));
+  assert.ok(lintBundle(bundleCopy({ pin: (p) => ({ ...p, accepted_risks: [{ ...risk, approved_by: undefined }] }) })).some((p) => /needs approved_by/.test(p)));
+
+  const pin = { accepted_risks: [risk] };
+  const reads = { status: 0, script_completed: true, secret_hits: [], permission_changed: false, canary_leaked: true, failed: [...risk.checks] };
+  assert.deepEqual(step0Acceptance(reads, pin), { ok: true, accepted: ['codex-read-isolation'], checks: risk.checks });
+  assert.equal(step0Acceptance(reads, {}).ok, false, 'not without the recorded acceptance');
+  assert.match(step0Acceptance({ ...reads, failed: [...risk.checks, 'NETWORK'] }, pin).reason, /no accepted risk covers: NETWORK/);
+  assert.match(step0Acceptance({ ...reads, failed: ['WRITE_OUTSIDE'] }, pin).reason, /WRITE_OUTSIDE/);
+  assert.match(step0Acceptance({ ...reads, permission_changed: true }, pin).reason, /permission mode changed/);
+  assert.match(step0Acceptance({ ...reads, secret_hits: ['x'] }, pin).reason, /secret-like/);
+  assert.match(step0Acceptance({ ...reads, script_completed: false }, pin).reason, /did not complete/);
+  assert.equal(step0Acceptance({ ready: true }, {}).ok, true);
+  assert.equal(step0Acceptance({ error: 'boom' }, pin).ok, false);
+});
+
 test('the lint refuses telemetry on and a loose or unapproved pin', () => {
   assert.ok(lintBundle(bundleCopy({ server: () => 'telemetry: true\n' })).some((p) => /telemetry: false/.test(p)));
   assert.ok(lintBundle(bundleCopy({ pin: (p) => ({ ...p, version: '>=0.18' }) })).some((p) => /exact release/.test(p)));
   assert.ok(lintBundle(bundleCopy({ pin: (p) => ({ ...p, version: '0.19.0.dev20261014' }) })).some((p) => /exact release/.test(p)));
-  assert.ok(lintBundle(bundleCopy({ pin: (p) => ({ ...p, status: 'approved' }) })).some((p) => /written user approval/.test(p)));
+  assert.ok(lintBundle(bundleCopy({ pin: (p) => ({ ...p, status: 'approved', approval: null }) })).some((p) => /written user approval/.test(p)));
 });
 
 // ── start gate ───────────────────────────────────────────────────────────
 test('start is refused until the pin is approved, the version matches and telemetry is off', () => {
   const env = { HOME: homeWith('telemetry: false\n'), PATH: process.env.PATH };
-  const notApproved = startProblems({ bundle: bundleCopy(), bin: stubOmnigent('0.18.0'), env });
+  const notApproved = startProblems({ bundle: bundleCopy({ pin: unapproved }), bin: stubOmnigent('0.18.0'), env });
   assert.ok(notApproved.some((p) => /evaluated, not approved/.test(p)), JSON.stringify(notApproved));
 
   const wrongVersion = startProblems({ bundle: bundleCopy({ pin: approved }), bin: stubOmnigent('0.19.0'), env });
@@ -205,9 +231,9 @@ test('cockpit start reviewer starts the reviewer agent; other names are refused'
   assert.match(other.stderr, /unexpected arguments: polly/);
 });
 
-test('cockpit start refuses with exit 2 on the repository bundle (not approved)', () => {
+test('cockpit start refuses with exit 2 on an unapproved bundle', () => {
   const result = spawnSync(process.execPath, [join(REPO, 'orchestrate', 'cockpit.mjs'), 'start'], {
-    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: homeWith('telemetry: false\n'), ORCH_OMNIGENT_BIN: stubOmnigent('0.18.0') },
+    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: homeWith('telemetry: false\n'), ORCH_OMNIGENT_BIN: stubOmnigent('0.18.0'), ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: unapproved }) },
   });
   assert.equal(result.status, 2);
   assert.match(result.stderr, /evaluated, not approved/);
@@ -234,6 +260,15 @@ test('codex launch args carry the Step 0 profile, no prompts, a filtered environ
   assert.deepEqual(sessionPolicies('/w/T-be').map((p) => p.name), ['orch_worktree_guard', 'orch_blast_radius', 'orch_tool_cap', 'orch_loop_guard']);
   assert.equal(sessionPolicies('/w/T-be')[0].factory_params.allowed_root, '/w/T-be');
   assert.equal(sessionPolicies('/w/T-be')[1].factory_params.risky_action, 'DENY');
+});
+
+test('the Step 0 profile as a Codex file profile matches the -c form', () => {
+  const toml = codexProfileToml({ '/h/.ssh': 'deny', '/h/.nvm': 'read' });
+  assert.match(toml, /^default_permissions = "orch"$/m);
+  assert.match(toml, /^\[permissions\.orch\]\nextends = ":workspace"$/m);
+  assert.match(toml, /^"\/h\/\.ssh" = "deny"$/m);
+  assert.equal(codexProfileName('ORCH-T1', 'be'), 'orch-ORCH-T1-be');
+  assert.equal(codexProfileName('A.B', 'fe'), 'orch-A-B-fe');
 });
 
 test('a Codex user config that would start processes or swap the profile in the session is refused', () => {
@@ -270,13 +305,45 @@ test('a session is created on the worktree, guarded before the prompt, and expor
   } finally { await stub.close(); }
 });
 
-test('a permission change made in the UI during the run is reported', async () => {
-  const stub = await startOmnigentStub({ afterMessage: ({ session }) => { session.labels['omnigent.codex_native.approval_mode'] = 'full-access'; } });
+test('a permission change made in the UI during the run is reported (from the history, not the label)', async () => {
+  const stub = await startOmnigentStub({ afterMessage: ({ items }) => { items.push({ type: 'external_codex_approval_mode_change', data: { mode: 'full-access' } }); } });
   try {
     const result = await runCodexSession(sessionArgs(stub));
     assert.equal(result.status, 0);
     assert.equal(result.permissionChanged, true);
   } finally { await stub.close(); }
+});
+
+test('a label Omnigent sets after launch is the baseline, not a permission change', async () => {
+  const stub = await startOmnigentStub({ label: 'full-access', labelAfterPolls: 3 });
+  try {
+    const result = await runCodexSession(sessionArgs(stub));
+    assert.equal(result.permissionChanged, false);
+    assert.deepEqual(result.approvalLabel, { before: 'full-access', after: 'full-access' });
+    const firstMessage = stub.requests.findIndex((r) => r.body?.type === 'message');
+    const sessionGets = stub.requests.slice(0, firstMessage).filter((r) => r.method === 'GET' && r.path === '/v1/sessions/conv_1');
+    assert.ok(sessionGets.length >= 3, 'the prompt waits for the label');
+  } finally { await stub.close(); }
+});
+
+test('the sandbox Codex logged is the ground truth: only WorkspaceWrite / ReadOnly pass, unreadable fails closed', async () => {
+  const home = fresh('omni-home');
+  const codexHome = fresh('codex-home');
+  mkdirSync(join(home, 'codex-native', 'abc'), { recursive: true });
+  writeFileSync(join(home, 'codex-native', 'abc', 'state.json'), JSON.stringify({ session_id: 'conv_9', codex_home: codexHome }));
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(join(codexHome, 'logs_2.sqlite'));
+  db.exec('create table logs (id integer primary key, feedback_log_body text)');
+  db.prepare('insert into logs (feedback_log_body) values (?)').run('approval_policy=Never sandbox_policy=WorkspaceWrite { writable_roots: [] }');
+  db.prepare('insert into logs (feedback_log_body) values (?)').run('sandbox_policy=ReadOnly { network_access: false }');
+  const ok = await codexSandboxPolicies({ sessionId: 'conv_9', omnigentHome: home });
+  assert.deepEqual(ok, { policies: ['ReadOnly', 'WorkspaceWrite'] });
+  assert.deepEqual(sandboxPolicyProblems(ok), []);
+  db.prepare('insert into logs (feedback_log_body) values (?)').run('sandbox_policy=DangerFullAccess');
+  db.close();
+  assert.deepEqual(sandboxPolicyProblems(await codexSandboxPolicies({ sessionId: 'conv_9', omnigentHome: home })), ['Codex ran with sandbox DangerFullAccess']);
+  assert.match(sandboxPolicyProblems(await codexSandboxPolicies({ sessionId: 'other', omnigentHome: home, settleMs: 0 }))[0], /not verifiable: no Omnigent state/);
+  assert.match(sandboxPolicyProblems({ policies: [] })[0], /logged no sandbox policy/);
 });
 
 test('a policy that cannot be attached stops the session before any prompt', async () => {

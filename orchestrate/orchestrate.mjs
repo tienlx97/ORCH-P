@@ -26,9 +26,9 @@ import {
   AgentObserver, deriveLive, HEARTBEAT_MS, openObservers, readJson, snapshotPath, withLock, writeJsonAtomic,
 } from './lib/agent-state.mjs';
 import { codexProjector, lineSplitter } from './lib/event-stream.mjs';
-import { readPin } from './lib/omnigent.mjs';
+import { orchHostStatus, readPin, step0Acceptance } from './lib/omnigent.mjs';
 import {
-  codexLaunchArgs, codexUserConfigProblems, lastAssistantText, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
+  codexLaunchArgs, codexProfileName, codexSandboxPolicies, sandboxPolicyProblems, codexProfileToml, codexUserConfigProblems, lastAssistantText, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
 } from './lib/omnigent-runner.mjs';
 import { scanSecrets } from './lib/secrets.mjs';
 
@@ -53,6 +53,7 @@ const REPOS = { be: BE_REPO, fe: FE_REPO };
 // `codex-exec` is the direct `codex exec` path, kept until O1 approves Omnigent.
 const RUNNERS = ['omnigent', 'codex-exec'];
 const OMNIGENT_BUNDLE = resolve(process.env.ORCH_OMNIGENT_BUNDLE ?? join(ORCH_REPO, 'omnigent'));
+const OMNIGENT_HOST_RECORD = resolve(process.env.ORCH_OMNIGENT_HOST_RECORD ?? join(ORCH_REPO, 'runs', 'omnigent-host.json'));
 const STEP0_OMNIGENT_REPORT = resolve(process.env.ORCH_STEP0_OMNIGENT_REPORT ?? join(STATE_ROOT, 'orch-step0', 'omnigent-report.json'));
 
 // Paths no implementation agent may change unless the approved task names
@@ -765,13 +766,15 @@ function finishImplement({ task, state, side, spec, s, obs, dir, metadataBefore,
 /** Step 0 through Omnigent (step0-omnigent.mjs) must be READY for the pinned Omnigent and the installed Codex. */
 function step0OmnigentReady(pin) {
   const rerun = 'run node orchestrate/step0-omnigent.mjs';
-  if (!existsSync(STEP0_OMNIGENT_REPORT)) return `Step 0 through Omnigent has not run (${STEP0_OMNIGENT_REPORT}); ${rerun}`;
+  const no = (blocked) => ({ blocked, accepted: [], checks: [] });
+  if (!existsSync(STEP0_OMNIGENT_REPORT)) return no(`Step 0 through Omnigent has not run (${STEP0_OMNIGENT_REPORT}); ${rerun}`);
   const report = JSON.parse(readFileSync(STEP0_OMNIGENT_REPORT, 'utf8'));
-  if (report.ready !== true) return `Step 0 through Omnigent did not pass (${STEP0_OMNIGENT_REPORT}); Codex sessions in Omnigent are blocked`;
-  if (report.omnigent_version !== pin.version) return `Step 0 through Omnigent ran on Omnigent ${report.omnigent_version}, pinned is ${pin.version}; ${rerun}`;
+  const verdict = step0Acceptance(report, pin);
+  if (!verdict.ok) return no(`Step 0 through Omnigent did not pass (${verdict.reason}; ${STEP0_OMNIGENT_REPORT}); Codex sessions in Omnigent are blocked`);
+  if (report.omnigent_version !== pin.version) return no(`Step 0 through Omnigent ran on Omnigent ${report.omnigent_version}, pinned is ${pin.version}; ${rerun}`);
   const codex = run(CODEX, ['--version']).stdout.trim();
-  if (report.codex_version !== codex) return `Step 0 through Omnigent ran on ${report.codex_version || 'an unknown Codex'}, installed is ${codex || 'unknown'}; ${rerun}`;
-  return null;
+  if (report.codex_version !== codex) return no(`Step 0 through Omnigent ran on ${report.codex_version || 'an unknown Codex'}, installed is ${codex || 'unknown'}; ${rerun}`);
+  return { blocked: null, accepted: verdict.accepted, checks: verdict.checks ?? [] };
 }
 
 /** `implement` as a Codex session in Omnigent (lib/omnigent-runner.mjs). */
@@ -785,15 +788,27 @@ async function implementViaOmnigent({ task, state, side, spec, s, dir, prompt: b
   }
   let base;
   try { base = loopbackUrl(process.env.ORCH_OMNIGENT_URL ?? undefined); } catch (error) { refuse(error.message); }
-  const blocked = step0OmnigentReady(pin);
-  if (blocked) refuse(blocked);
-  const codexConfig = join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'config.toml');
+  const step0 = step0OmnigentReady(pin);
+  if (step0.blocked) refuse(step0.blocked);
+  if (step0.accepted.length) {
+    console.error(`WARNING: running with accepted risk ${step0.accepted.join(', ')} (omnigent/pin.json): Codex commands in this session can read files outside the worktree (${step0.checks.join(', ')} not enforced); writes, network and loopback stay denied.`);
+  }
+  const host = orchHostStatus({ home: homedir(), record: OMNIGENT_HOST_RECORD });
+  if (!host.ok) refuse(host.reason);
+  const codexConfig = join(host.codexHome, 'config.toml');
   const configProblems = codexUserConfigProblems(existsSync(codexConfig) ? readFileSync(codexConfig, 'utf8') : '');
   if (configProblems.length) {
     refuse(`${codexConfig} would be copied into the Omnigent session; remove: ${configProblems.join('; ')}`);
   }
   const attempt = state.log.filter((e) => e.side === side && e.step === 'implement').length + 1;
-  const launchArgs = codexLaunchArgs({ profile: profileArgs(policy), model: spec.model, effort: spec.effort, tmpDir: sideTmpDir(task, side) });
+  // The profile goes into the hub Codex home as a file profile (launch args are capped at 4096 chars);
+  // `-c default_permissions` selects it on the command line too: from the config file alone the
+  // app-server thread ran WorkspaceWrite with no permission profile (observed 2026-10-14, Codex 0.162.1).
+  const profileName = codexProfileName(task.id, side);
+  const profileToml = codexProfileToml(policy);
+  writeFileSync(join(host.codexHome, `${profileName}.config.toml`), profileToml, { mode: 0o600 });
+  writeFileSync(join(dir, 'codex-profile.toml'), profileToml, { mode: 0o600 });
+  const launchArgs = codexLaunchArgs({ profile: ['--profile', profileName, '-c', 'default_permissions="orch"'], model: spec.model, effort: spec.effort, tmpDir: sideTmpDir(task, side) });
   const policies = sessionPolicies(s.worktree);
   const agentName = process.env.ORCH_OMNIGENT_CODEX_AGENT ?? 'codex-native-ui';
   writeFileSync(join(dir, 'command.json'), `${JSON.stringify({ runner: 'omnigent', server: base, agent: agentName, launch_args: launchArgs, policies }, null, 2)}\n`);
@@ -825,17 +840,23 @@ async function implementViaOmnigent({ task, state, side, spec, s, dir, prompt: b
   write('session-items.jsonl', result.items.map((i) => JSON.stringify(i)).join('\n') + (result.items.length ? '\n' : ''));
   write('session.json', `${JSON.stringify(result.session, null, 2)}\n`);
   write('last-message.md', lastAssistantText(result.items) ?? '');
+  // Ground truth from Codex's own log: the sandbox it actually ran.
+  const sandbox = await codexSandboxPolicies({ sessionId: result.sessionId, omnigentHome: join(homedir(), '.omnigent') });
+  const sandboxProblems = sandboxPolicyProblems(sandbox);
   obs.emit('process.exit', { exit: result.status, signal: null, timed_out: result.timedOut, interrupted: result.interrupted, overflow: false });
   return finishImplement({
     task, state, side, spec, s, obs, dir, metadataBefore, status: result.status,
     evidence: ['session-items.jsonl', 'session.json', 'last-message.md'],
     record: {
-      session_id: result.sessionId, permission_changed: result.permissionChanged,
+      session_id: result.sessionId, permission_changed: result.permissionChanged, approval_label: result.approvalLabel,
+      sandbox_policies: sandbox.policies ?? null, sandbox_problems: sandboxProblems,
+      accepted_risks: step0.accepted,
       ...(result.timedOut ? { timed_out: true } : {}), ...(result.interrupted ? { interrupted: result.interrupted } : {}),
       ...(result.note ? { note: result.note } : {}),
     },
     why: `${result.timedOut ? ' (timed out)' : ''}${result.interrupted ? ` (interrupted by ${result.interrupted})` : ''}${result.note ? ` (${result.note})` : ''}`,
-    blockedBy: result.permissionChanged ? 'the Codex permission mode was changed in Omnigent during the run; the Step 0 profile no longer held' : null,
+    blockedBy: result.permissionChanged ? 'the Codex permission mode was changed in Omnigent during the run; the Step 0 profile no longer held'
+      : sandboxProblems.length ? `${sandboxProblems.join('; ')}; inspect the session before any further step` : null,
   });
 }
 

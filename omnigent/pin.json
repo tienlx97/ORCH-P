@@ -5,6 +5,27 @@
   "wheel_sha256": "940652288d3bb90b976557859ac5b40124944427e4bfd3f346b84b801b1d2716",
   "evaluated": "2026-10-14",
   "evaluation": "docs/omnigent-evaluation.md",
-  "status": "evaluated-static",
-  "approval": null
+  "status": "approved",
+  "approval": {
+    "source": "Claude Code conversation 2026-10-14: the user chose Omnigent as the agent hub and, after the O1 probe, option 3 (accept the read-isolation gap) ahead of options 1 and 2 (docs/omnigent-evaluation.md#options-while-codex-ignores-the-profile)",
+    "approved_by": "user",
+    "date": "2026-10-14"
+  },
+  "accepted_risks": [
+    {
+      "id": "codex-read-isolation",
+      "checks": [
+        "CANARY_READ",
+        "SSH_KEY_READ",
+        "CODEX_AUTH_READ",
+        "OMNIGENT_STATE_READ",
+        "BE_ENV_READ"
+      ],
+      "reason": "Codex 0.162.1 runs Omnigent codex-native threads with the legacy WorkspaceWrite sandbox and ignores the ORCH-P permission profile, so commands can read files outside the worktree. Writes outside the worktree, network, loopback, credential variables and the private TMPDIR stay enforced and checked.",
+      "approved_by": "user",
+      "source": "Claude Code conversation 2026-10-14: the user chose Omnigent as the agent hub and, after the O1 probe, option 3 (accept the read-isolation gap) ahead of options 1 and 2 (docs/omnigent-evaluation.md#options-while-codex-ignores-the-profile)",
+      "date": "2026-10-14",
+      "until": "node orchestrate/step0-omnigent.mjs reports READY; retest after every Codex or Omnigent upgrade, then remove this entry"
+    }
+  ]
 }

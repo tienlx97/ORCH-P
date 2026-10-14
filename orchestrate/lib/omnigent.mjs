@@ -19,11 +19,24 @@ const PASS_ENV = ['HOME', 'PATH', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'COLORTERM
 // Every documented opt-out (telemetry/client.py is_disabled, update_check.py
 // _ENV_SKIP at v0.18.0). With these set, the telemetry client never fetches its
 // remote config and no update check reaches the package index.
+// The host daemon keeps only an allowlist of its environment for runners
+// (host/connect.py _RUNNER_ENV_ALLOWLIST: PATH, HOME, locale, TLS stores,
+// CODEX_HOME, OMNIGENT_*), so only OMNIGENT_* settings and CODEX_HOME reach
+// the sessions; DO_NOT_TRACK is kept for the CLI itself.
 export const OMNIGENT_OPT_OUTS = Object.freeze({
   OMNIGENT_ANALYTICS: '0',
   DO_NOT_TRACK: '1',
   OMNIGENT_NO_UPDATE_CHECK: '1',
 });
+
+/**
+ * The hub's own Codex home: Omnigent copies config.toml and links auth.json
+ * from CODEX_HOME into every session, so the hub gets a home whose config has
+ * no MCP servers, hooks, profiles or providers, separate from ~/.codex.
+ */
+export function hubCodexHome(source = process.env) {
+  return source.ORCH_CODEX_HOME ?? join(source.HOME ?? '', '.codex-orch');
+}
 
 /**
  * The environment Omnigent runs with: identity, display and locale only, plus
@@ -33,7 +46,7 @@ export const OMNIGENT_OPT_OUTS = Object.freeze({
 export function omnigentEnv(source = process.env) {
   const env = {};
   for (const name of PASS_ENV) if (source[name] !== undefined) env[name] = source[name];
-  return { ...env, ...OMNIGENT_OPT_OUTS };
+  return { ...env, ...OMNIGENT_OPT_OUTS, CODEX_HOME: hubCodexHome(source) };
 }
 
 const SHA1 = /^[0-9a-f]{40}$/;
@@ -54,7 +67,40 @@ export function readPin(bundleDir) {
   if (pin.status === 'approved' && (!pin.approval?.source || !pin.approval?.approved_by)) {
     problems.push('an approved pin needs approval.source and approval.approved_by (AGENTS.md rule 7: written user approval)');
   }
+  for (const risk of pin.accepted_risks ?? []) {
+    const known = KNOWN_RISKS[risk?.id];
+    if (!known) { problems.push(`accepted_risks: unknown risk ${risk?.id} (known: ${Object.keys(KNOWN_RISKS).join(', ')})`); continue; }
+    if (JSON.stringify(risk.checks) !== JSON.stringify(known)) problems.push(`accepted_risks.${risk.id}.checks must be exactly ${known.join(', ')}`);
+    if (!risk.approved_by || !risk.source || !risk.date) problems.push(`accepted_risks.${risk.id} needs approved_by, source and date (the user's written decision)`);
+  }
   return { pin, problems };
+}
+
+// Gaps the user may accept, by name, with the Step 0 checks each one covers.
+// Nothing else can be accepted: write isolation, network, loopback, credential
+// variables, the private TMPDIR and the secret scan always have to hold.
+export const KNOWN_RISKS = Object.freeze({
+  'codex-read-isolation': Object.freeze(['CANARY_READ', 'SSH_KEY_READ', 'CODEX_AUTH_READ', 'OMNIGENT_STATE_READ', 'BE_ENV_READ']),
+});
+
+/**
+ * Whether a Step 0-through-Omnigent report allows Codex sessions: READY, or
+ * failed only in checks covered by risks the pin records as accepted.
+ */
+export function step0Acceptance(report, pin) {
+  if (!report || report.error) return { ok: false, reason: `the probe did not complete${report?.error ? ` (${report.error})` : ''}` };
+  if (report.ready === true) return { ok: true, accepted: [] };
+  const risks = (pin?.accepted_risks ?? []).filter((r) => KNOWN_RISKS[r.id]);
+  const covered = risks.flatMap((r) => KNOWN_RISKS[r.id]);
+  const failed = Array.isArray(report.failed) ? report.failed : null;
+  if (!failed) return { ok: false, reason: 'the report lists no checks' };
+  const open = failed.filter((c) => !covered.includes(c));
+  if (open.length) return { ok: false, reason: `checks failed that no accepted risk covers: ${open.join(', ')}` };
+  if (report.status !== 0 || !report.script_completed) return { ok: false, reason: 'the check script did not complete in the session' };
+  if (report.secret_hits?.length) return { ok: false, reason: 'secret-like text in the session history' };
+  if (report.permission_changed) return { ok: false, reason: 'the permission mode changed during the probe' };
+  if (report.canary_leaked && !covered.includes('CANARY_READ')) return { ok: false, reason: 'the canary leaked' };
+  return { ok: true, accepted: risks.map((r) => r.id), checks: failed };
 }
 
 // Agent-config settings that would undo the posture (docs/omnigent-evaluation.md).
@@ -89,6 +135,8 @@ export const COORDINATOR_SHELL = '^node ORCH-P/orchestrate/orchestrate\\.mjs (st
 export const REVIEWER_GIT = '^git -C (BE-P|FE-P) (show|diff|log) [A-Za-z0-9._/:^~ -]+$';
 export const REVIEWER_ORCH = '^node ORCH-P/orchestrate/orchestrate\\.mjs (status [A-Za-z0-9._/-]+\\.json|review-record [A-Za-z0-9._/-]+\\.json ORCH-P/runs/reviews/[A-Za-z0-9_-]+\\.json)$';
 const CLAUDE_SANDBOX = { read_paths: '["~/.nvm"]', write_files: '["~/.claude.json"]' };
+// The only hosts a Claude agent's sandbox may reach (Omnigent egress proxy).
+export const CLAUDE_EGRESS = Object.freeze(['* api.anthropic.com/**', '* console.anthropic.com/**', '* platform.claude.com/**', '* claude.ai/**']);
 export const BUNDLE_AGENTS = Object.freeze({
   'orch-coordinator': {
     shell: [COORDINATOR_SHELL],
@@ -126,10 +174,33 @@ export function lintBundle(bundleDir) {
       const found = [...text.matchAll(new RegExp(`^\\s*${key}\\s*:\\s*(\\[.*\\])\\s*$`, 'gm'))].map((m) => m[1]);
       if (found.length !== 1 || found[0] !== expected) problems.push(`${name}: ${key} must be exactly ${expected}`);
     }
+    const egress = text.match(/^\s*egress_rules\s*:\s*\n((?:\s*#.*\n|\s+-\s+"[^"]*"\s*\n)*)/m)?.[1];
+    const rules = egress ? [...egress.matchAll(/-\s+"([^"]*)"/g)].map((m) => m[1]) : null;
+    if (JSON.stringify(rules) !== JSON.stringify(CLAUDE_EGRESS)) problems.push(`${name}: egress_rules must be exactly ${CLAUDE_EGRESS.join(', ')}`);
+    if (/^\s*egress_allow_private_destinations\s*:\s*true/m.test(text)) problems.push(`${name}: forbidden: egress_allow_private_destinations (would reach loopback)`);
     const shells = [...text.matchAll(/\.matches\(r'(\^(?:git|node) [^']*)'\)/g)].map((m) => m[1]);
     if (JSON.stringify(shells) !== JSON.stringify(spec.shell)) problems.push(`${name}: the shell allowlist differs from orchestrate/lib/omnigent.mjs`);
   }
   return problems;
+}
+
+/**
+ * Whether the running Omnigent host daemon is the one `cockpit.mjs host`
+ * started (allowlisted environment, opt-outs, minimal Codex config): its
+ * record names the pid that ~/.omnigent/host.pid names now, and it is alive.
+ */
+export function orchHostStatus({ home, record }) {
+  let saved;
+  try { saved = JSON.parse(readFileSync(record, 'utf8')); } catch { return { ok: false, reason: 'no host record; start the daemon with `node orchestrate/cockpit.mjs host`' }; }
+  let current;
+  try { current = Number.parseInt(readFileSync(join(home, '.omnigent', 'host.pid'), 'utf8'), 10); } catch { return { ok: false, reason: 'the Omnigent host daemon is not running; start it with `node orchestrate/cockpit.mjs host`' }; }
+  if (current !== saved.pid) return { ok: false, reason: `the running Omnigent daemon (pid ${current}) was not started by cockpit.mjs host; stop it (omnigent host stop) and run \`node orchestrate/cockpit.mjs host\`` };
+  try { process.kill(current, 0); } catch (error) { if (error.code !== 'EPERM') return { ok: false, reason: 'the Omnigent host daemon recorded by cockpit.mjs is gone; run `node orchestrate/cockpit.mjs host`' }; }
+  for (const [key, value] of Object.entries(OMNIGENT_OPT_OUTS)) {
+    if (saved.env?.[key] !== value) return { ok: false, reason: `the host record lacks ${key}=${value}; restart with \`node orchestrate/cockpit.mjs host\`` };
+  }
+  if (!saved.env?.CODEX_HOME) return { ok: false, reason: 'the host record lacks CODEX_HOME (the hub Codex home); restart with `node orchestrate/cockpit.mjs host`' };
+  return { ok: true, record: saved, codexHome: saved.env.CODEX_HOME };
 }
 
 /** Parses `omnigent --version` output ("omnigent 0.18.0" or "0.18.0"). */

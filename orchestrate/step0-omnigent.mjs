@@ -20,9 +20,9 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { readPin } from './lib/omnigent.mjs';
+import { orchHostStatus, readPin, step0Acceptance } from './lib/omnigent.mjs';
 import {
-  codexLaunchArgs, lastAssistantText, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
+  codexLaunchArgs, codexProfileToml, codexSandboxPolicies, lastAssistantText, sandboxPolicyProblems, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
 } from './lib/omnigent-runner.mjs';
 import { scanSecrets } from './lib/secrets.mjs';
 
@@ -67,7 +67,7 @@ export function checkScript({ canaryFile, sshKey, home, beEnv, outside, omnigent
     "const net = async (label, url) => { try { await fetch(url, { signal: AbortSignal.timeout(8000) }); console.log(`${label} ALLOWED`); } catch (e) { console.log(`${label} DENIED ${e.cause?.code ?? e.name}`); } };",
     "await net('NETWORK', 'https://registry.npmjs.org/');",
     `await net('LOOPBACK_OMNIGENT', ${j(`${omnigentUrl}/v1/sessions`)});`,
-    "const creds = Object.keys(process.env).filter((n) => /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|SSH_AUTH_SOCK|^GIT_|^AWS_|^AZURE_|^GH_|ANTHROPIC|OPENAI|OPENROUTER|DATABRICKS|OMNIGENT/i.test(n));",
+    "const creds = Object.keys(process.env).filter((n) => !/_PAGER$/.test(n) && /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|SSH_AUTH_SOCK|^GIT_|^AWS_|^AZURE_|^GH_|ANTHROPIC|OPENAI|OPENROUTER|DATABRICKS|OMNIGENT/i.test(n));",
     "console.log(creds.length ? `ENV_CREDENTIALS ALLOWED ${creds.join(',')}` : 'ENV_CREDENTIALS DENIED none');",
     `attempt('PRIVATE_TMPDIR', () => { if (process.env.TMPDIR !== ${j(tmpDir)}) throw Object.assign(new Error('x'), { code: 'TMPDIR=' + process.env.TMPDIR }); writeFileSync(process.env.TMPDIR + '/probe', 'x'); rmSync(process.env.TMPDIR + '/probe'); return ''; });`,
     "console.log('CHECK-DONE');",
@@ -75,7 +75,7 @@ export function checkScript({ canaryFile, sshKey, home, beEnv, outside, omnigent
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const { buildFilesystemPolicy, profileArgs } = await import('./orchestrate.mjs');
+  const { buildFilesystemPolicy } = await import('./orchestrate.mjs');
   const HERE = dirname(fileURLToPath(import.meta.url));
   const ORCH_REPO = resolve(HERE, '..');
   const BE = resolve(process.env.ORCH_BE_REPO ?? join(ORCH_REPO, '..', 'BE-P'));
@@ -95,6 +95,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   }
   let url;
   try { url = loopbackUrl(process.env.ORCH_OMNIGENT_URL ?? undefined); } catch (error) { console.error(`refused: ${error.message}`); process.exit(2); }
+  const host = orchHostStatus({ home: HOME, record: resolve(process.env.ORCH_OMNIGENT_HOST_RECORD ?? join(ORCH_REPO, 'runs', 'omnigent-host.json')) });
+  if (!host.ok) { console.error(`refused: ${host.reason}`); process.exit(2); }
 
   mkdirSync(OUT, { recursive: true });
   const id = `step0o-${process.pid}`;
@@ -110,6 +112,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   if (added.exit !== 0) { console.error(`cannot create probe worktree: ${added.stderr}`); process.exit(1); }
 
   let report;
+  let profileFile = null;
+  let probeSession = null;
   try {
     writeFileSync(join(ws, 'orch-check.mjs'), checkScript({
       canaryFile: join(canaryDir, 'secret.txt'), sshKey: join(HOME, '.ssh', 'id_ed25519'), home: HOME,
@@ -118,7 +122,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const config = existsSync(join(HOME, '.codex', 'config.toml')) ? readFileSync(join(HOME, '.codex', 'config.toml'), 'utf8') : '';
     const model = process.env.ORCH_PROBE_MODEL ?? /^model\s*=\s*"([^"]+)"/m.exec(config)?.[1];
     const policy = buildFilesystemPolicy({ worktree: ws, tmpDir });
-    const launchArgs = codexLaunchArgs({ profile: profileArgs(policy), model, effort: process.env.ORCH_PROBE_EFFORT ?? 'low', tmpDir });
+    // Same file profile as `implement` (written into the hub Codex home, selected with --profile).
+    const profileName = `orch-step0-${process.pid}`;
+    profileFile = join(host.codexHome, `${profileName}.config.toml`);
+    writeFileSync(profileFile, codexProfileToml(policy), { mode: 0o600 });
+    const launchArgs = codexLaunchArgs({ profile: ['--profile', profileName, '-c', 'default_permissions="orch"'], model, effort: process.env.ORCH_PROBE_EFFORT ?? 'low', tmpDir });
     const result = await runCodexSession({
       client: omnigentClient(url), agentName: process.env.ORCH_OMNIGENT_CODEX_AGENT ?? 'codex-native-ui',
       hostId: process.env.ORCH_OMNIGENT_HOST, worktree: ws, title: 'ORCH-P Step 0 (Omnigent)', launchArgs,
@@ -126,6 +134,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       prompt: ['Run exactly this one command in the current directory and nothing else:', 'node orch-check.mjs',
         'Then reply with its complete output verbatim. Do not modify or inspect any file.'].join('\n'),
     });
+    probeSession = result.sessionId;
     const masked = JSON.parse(JSON.stringify(result.items).replaceAll(canary, '[CANARY]'));
     writeFileSync(join(OUT, 'omnigent-session-items.jsonl'), masked.map((i) => JSON.stringify(i)).join('\n'), { mode: 0o600 });
     report = {
@@ -137,16 +146,26 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       launch_args: launchArgs, reply: (lastAssistantText(masked) ?? '').slice(0, 2000),
       ...verdict({ items: result.items, canary, status: result.status }),
     };
-    if (result.permissionChanged) report.ready = false;
+    const sandbox = await codexSandboxPolicies({ sessionId: result.sessionId, omnigentHome: join(HOME, '.omnigent') });
+    Object.assign(report, { approval_label: result.approvalLabel, sandbox_policies: sandbox.policies ?? null, sandbox_problems: sandboxPolicyProblems(sandbox) });
+    if (result.permissionChanged || report.sandbox_problems.length) { report.ready = false; report.permission_changed = true; }
   } catch (error) {
     report = { generated_at: new Date().toISOString(), error: error.message, ready: false };
   } finally {
+    // The probe session is evidence only: stop and archive it so its Codex processes end.
+    if (probeSession) {
+      const client = omnigentClient(url);
+      await client.interrupt(probeSession).catch(() => {});
+      await client.archive(probeSession).catch(() => {});
+    }
     run('git', ['-C', BE, 'worktree', 'remove', '--force', ws]);
-    for (const p of [tmpDir, canaryDir, outside]) rmSync(p, { recursive: true, force: true });
+    for (const p of [tmpDir, canaryDir, outside, profileFile]) if (p) rmSync(p, { recursive: true, force: true });
   }
   writeFileSync(join(OUT, 'omnigent-report.json'), `${JSON.stringify(report, null, 2)}\n`);
   for (const [label, line] of Object.entries(report.enforcement ?? {})) console.log(`${report.failed?.includes(label) ? '✘' : '✔'} ${line}`);
   if (report.error) console.log(`✘ ${report.error}`);
-  console.log(`\nStep 0 through Omnigent ${report.ready ? 'READY' : 'NOT READY'} — report ${join(OUT, 'omnigent-report.json')}`);
+  const acceptance = step0Acceptance(report, pin);
+  const accepted = !report.ready && acceptance.ok ? ` — accepted risk ${acceptance.accepted.join(', ')} covers ${acceptance.checks.join(', ')}; Codex sessions may run` : '';
+  console.log(`\nStep 0 through Omnigent ${report.ready ? 'READY' : 'NOT READY'}${accepted} — report ${join(OUT, 'omnigent-report.json')}`);
   process.exitCode = report.ready ? 0 : 1;
 }

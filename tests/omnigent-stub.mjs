@@ -13,9 +13,10 @@ export async function startOmnigentStub({
   onMessage = async () => {},
   afterMessage = () => {},
   hang = false,
+  labelAfterPolls = 0,
 } = {}) {
   const requests = [];
-  const session = { id: 'conv_1', status: 'idle', runner_online: false, labels: { 'omnigent.codex_native.approval_mode': label } };
+  const session = { id: 'conv_1', status: 'idle', runner_online: false, labels: labelAfterPolls ? {} : { 'omnigent.codex_native.approval_mode': label } };
   const items = [];
   let polls = 0;
   let working = false;
@@ -38,6 +39,7 @@ export async function startOmnigentStub({
       if (req.method === 'GET' && p === `/v1/sessions/${session.id}`) {
         polls += 1;
         session.runner_online = true;
+        if (labelAfterPolls && polls >= labelAfterPolls) session.labels['omnigent.codex_native.approval_mode'] = label;
         if (working && !hang && polls > busyPolls) { working = false; session.status = 'idle'; }
         return send(200, { ...session, labels: { ...session.labels } });
       }
