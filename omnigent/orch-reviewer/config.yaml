@@ -42,12 +42,15 @@ os_env:
   cwd: .
   sandbox:
     type: linux_bwrap
-    # Claude's own login and state (~/.claude, ~/.claude.json) and the nvm node
-    # for `node ORCH-P/...`; $HOME is otherwise not mounted. The tool allowlist
+    # Claude's own login and state (~/.claude, ~/.claude.json), the nvm node
+    # for `node ORCH-P/...`, and Omnigent's runtime dir /tmp/omnigent-<uid>
+    # (its hooks in Claude write the settings/bridge files there; observed
+    # 2026-10-15 — without it Claude never accepts a message). $HOME is
+    # otherwise not mounted. The tool allowlist
     # still denies every Read/Write of a dot-path, so only the Claude process
     # itself uses them.
     read_paths: ["~/.nvm"]
-    write_paths: ["ORCH-P/runs", "~/.claude"]
+    write_paths: ["ORCH-P/runs", "~/.claude", "/tmp/omnigent-1000"]
     write_files: ["~/.claude.json"]
     cwd_allow_hidden: [".git", ".nvm", ".claude", ".credentials.json"]
     # Network only through Omnigent's egress proxy (isolated namespace,

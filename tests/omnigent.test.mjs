@@ -100,7 +100,7 @@ test('the lint refuses every setting that undoes the posture', () => {
     [(t) => t.replace('harness: claude-native', 'harness: codex-native'), /harness other than claude-native/],
     [(t) => t.replace('spec_version: 1', 'spec_version: 1\nspawn: true'), /spawn/],
     [(t) => t.replace('cwd: .', 'cwd: .\n  env_passthrough: ["HOME"]'), /env_passthrough/],
-    [(t) => t.replace('write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude"]', 'write_paths: ["."]'), /write_paths must be exactly/],
+    [(t) => t.replace('write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude", "/tmp/omnigent-1000"]', 'write_paths: ["."]'), /write_paths must be exactly/],
     [(t) => t.replace('? {"result": "ASK", "reason": "Run this ORCH-P step?', '? {"result": "ASK", "reason": "Run this ORCH-P step?').replace("(status|validate) [A-Za-z0-9", "(status|validate|cleanup) [A-Za-z0-9"), /shell allowlist differs/],
     [(t) => t.replace('(status|validate) [A-Za-z0-9', '(status|validate|implement) [A-Za-z0-9'), /shell allowlist differs/],
     [(t) => t.replace(/ {4}loop_guard:[\s\S]*$/, ''), /detect_loop/],
@@ -120,7 +120,7 @@ test('the reviewer config is linted for its own shell allowlist and write paths'
     return lintBundle(dir);
   };
   assert.ok(edit((t) => t.replace('(show|diff|log)', '(show|diff|log|push)')).some((p) => /orch-reviewer.*shell allowlist differs/.test(p)));
-  assert.ok(edit((t) => t.replace('write_paths: ["ORCH-P/runs", "~/.claude"]', 'write_paths: ["."]')).some((p) => /orch-reviewer.*write_paths/.test(p)));
+  assert.ok(edit((t) => t.replace('write_paths: ["ORCH-P/runs", "~/.claude", "/tmp/omnigent-1000"]', 'write_paths: ["."]')).some((p) => /orch-reviewer.*write_paths/.test(p)));
   assert.ok(edit((t) => t.replace('type: linux_bwrap', 'type: none')).some((p) => /orch-reviewer.*sandbox type none/.test(p)));
   assert.ok(edit((t) => t.replace('read_paths: ["~/.nvm"]', 'read_paths: ["~/"]')).some((p) => /orch-reviewer.*read_paths must be exactly/.test(p)));
   assert.ok(edit((t) => t.replace('write_files: ["~/.claude.json"]', 'write_files: ["~/.claude.json", "~/.ssh/config"]')).some((p) => /write_files must be exactly/.test(p)));

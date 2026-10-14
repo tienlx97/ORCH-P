@@ -136,7 +136,8 @@ omnigent wheel sha256 = pin). Server and daemon started by `cockpit.mjs host`.
 | 9 | Codex sessions: loopback denied. Claude agents: `egress_rules` (isolated network namespace, MITM proxy, default deny, private ranges refused) now limit them to Anthropic hosts; not yet exercised. |
 | 10 | Idle server and daemon: only loopback sockets. No watched Claude/Codex setting changed during install, host start and two probe sessions. |
 | 8 | **Confirmed:** both CEL allowlists compile under the installed cel-python and give the intended decision for all 26 sample events (`tests/omnigent.test.mjs`, no longer skipped). |
-| 5–7 | Not exercised yet (coordinator/reviewer sessions not started). |
+| 5 | **Partly.** `claude-native` starts in `linux_bwrap` only with write access to Omnigent's runtime dir `/tmp/omnigent-<uid>` (its hooks write settings and bridge files there) besides `~/.claude`; now in both agents. With `egress_rules` set, sessions created through the REST API (`omnigent agent add` + `POST /v1/sessions`) cannot reach the egress proxy (`.egress.sock: Connection refused`), so Claude never reaches the API; without them the coordinator works (read allowed, refusals honoured, Bash waits for the user's approval under `permission_mode: default`). `egress_rules` stay in the configs pending the user's choice (drop them, accepting loopback reachability behind the CEL allowlist and per-command approval, or investigate the proxy). `omni run -p` without a TTY stops the session after the first message; agents are installed with `omnigent agent add` and sessions created over REST or in the web UI. |
+| 6–7 | Not exercised yet (`node` in the sandbox waits for the user's approval of the first Bash call; the reviewer needs a committed task). |
 
 ## Options while Codex ignores the profile
 

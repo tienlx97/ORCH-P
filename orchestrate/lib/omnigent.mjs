@@ -140,11 +140,11 @@ export const CLAUDE_EGRESS = Object.freeze(['* api.anthropic.com/**', '* console
 export const BUNDLE_AGENTS = Object.freeze({
   'orch-coordinator': {
     shell: [COORDINATOR_SHELL],
-    sandbox: { ...CLAUDE_SANDBOX, write_paths: '["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude"]', cwd_allow_hidden: '[".nvm", ".claude", ".credentials.json"]' },
+    sandbox: { ...CLAUDE_SANDBOX, write_paths: '["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude", "/tmp/omnigent-1000"]', cwd_allow_hidden: '[".nvm", ".claude", ".credentials.json"]' },
   },
   'orch-reviewer': {
     shell: [REVIEWER_GIT, REVIEWER_ORCH],
-    sandbox: { ...CLAUDE_SANDBOX, write_paths: '["ORCH-P/runs", "~/.claude"]', cwd_allow_hidden: '[".git", ".nvm", ".claude", ".credentials.json"]' },
+    sandbox: { ...CLAUDE_SANDBOX, write_paths: '["ORCH-P/runs", "~/.claude", "/tmp/omnigent-1000"]', cwd_allow_hidden: '[".git", ".nvm", ".claude", ".credentials.json"]' },
   },
 });
 
