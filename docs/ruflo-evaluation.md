@@ -2,7 +2,7 @@
 
 **Decision (user, 2026-10-14):** Ruflo is not adopted. AI-AGENTS.md §7.3 is closed as
 "Evaluated — Not Adopted". Coordination stays manual (one or two agents), with the
-lightweight orchestration proposed for §7.4 instead. Policy: [coordination](README.md).
+lightweight orchestration proposed for §7.4 instead. Policy: [BE-P coordination](../../BE-P/docs/coordination/README.md).
 
 ## What was evaluated
 

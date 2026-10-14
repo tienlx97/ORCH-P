@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Lightweight BE/FE orchestration (docs/orchestration.md).
 //
-//   node orchestrate/orchestrate.mjs <command> <task.json> [side] [options]
+//   node orchestrate/orchestrate.mjs <command> <task.json> [side] [options]   (from ORCH-P)
 //
 // Commands: validate, prepare, implement, check, verify, commit, contract,
 // review-record, status, cleanup. Every child process runs without a shell
@@ -22,13 +22,15 @@ import { basename, dirname, isAbsolute, join, normalize, resolve } from 'node:pa
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const BE_REPO = resolve(process.env.ORCH_BE_REPO ?? join(HERE, '..', '..'));
-const FE_REPO = resolve(process.env.ORCH_FE_REPO ?? join(BE_REPO, '..', 'FE-P'));
+const ORCH_REPO = resolve(HERE, '..');
+// BE-P and FE-P are siblings of ORCH-P in the workspace unless configured.
+const BE_REPO = resolve(process.env.ORCH_BE_REPO ?? join(ORCH_REPO, '..', 'BE-P'));
+const FE_REPO = resolve(process.env.ORCH_FE_REPO ?? join(ORCH_REPO, '..', 'FE-P'));
 // Outside ~/projects on purpose: the sandbox profile denies ~/projects (main
 // checkouts, their .env files, other projects), and a denied parent cannot be
 // re-opened for a child path.
 const WORKTREE_ROOT = resolve(process.env.ORCH_WORKTREE_ROOT ?? join(homedir(), 'orch-worktrees'));
-const STATE_ROOT = resolve(process.env.ORCH_STATE_ROOT ?? join(BE_REPO, 'harness', 'runs'));
+const STATE_ROOT = resolve(process.env.ORCH_STATE_ROOT ?? join(ORCH_REPO, 'runs'));
 const STEP0_REPORT = resolve(process.env.ORCH_STEP0_REPORT ?? join(STATE_ROOT, 'orch-step0', 'report.json'));
 const CODEX = process.env.ORCH_CODEX_BIN ?? 'codex';
 // Agent-written code is verified only inside containers (harness/verify-container).
@@ -339,10 +341,38 @@ function cmdValidate(taskPath) {
   return 0;
 }
 
+// What the orchestrator relies on in each repository at the base revision. A
+// missing piece means ORCH-P and that repository have drifted apart.
+const INTERFACES = {
+  be: [
+    ['harness/verify.sh', null],
+    ['tests/CompanyManagement.MySql.IntegrationTests/MySqlApiFactory.cs', 'MYSQL_INTEGRATION_CONNECTION_STRING'],
+  ],
+  fe: [['harness/verify.sh', null], ['harness/task.mjs', null]],
+};
+
+export function checkInterfaces(repo, base, side) {
+  const missing = [];
+  for (const [path, needle] of INTERFACES[side]) {
+    const blob = git(repo, ['show', `${base}:${path}`]);
+    if (blob.status !== 0) missing.push(`${side}: ${path} missing at ${base.slice(0, 12)}`);
+    else if (needle && !blob.stdout.includes(needle)) missing.push(`${side}: ${path} lacks ${needle} at ${base.slice(0, 12)}`);
+  }
+  return missing;
+}
+
+function orchRevision() {
+  const head = git(ORCH_REPO, ['rev-parse', 'HEAD']);
+  const dirty = git(ORCH_REPO, ['status', '--porcelain', '--untracked-files=no']).stdout.trim() !== '';
+  return { revision: head.status === 0 ? head.stdout.trim() : 'UNKNOWN', dirty };
+}
+
 function cmdPrepare(taskPath) {
   const { task, digest } = loadTask(taskPath);
+  const drift = Object.keys(task.sides).flatMap((side) => checkInterfaces(REPOS[side], task.base_revision[side], side));
+  if (drift.length) refuse(`base revisions do not provide what ORCH-P needs:\n  - ${drift.join('\n  - ')}`);
   if (existsSync(join(stateDir(task), 'state.json'))) refuse(`task ${task.id} already prepared; use a new task id for a new run`);
-  const state = { id: task.id, task_digest: digest, prepared_at: now(), sides: {}, log: [], review: null };
+  const state = { id: task.id, task_digest: digest, orch: orchRevision(), prepared_at: now(), sides: {}, log: [], review: null };
   mkdirSync(stateDir(task), { recursive: true });
   writeFileSync(join(stateDir(task), 'task.json'), readFileSync(taskPath));
   for (const side of Object.keys(task.sides)) {
@@ -503,7 +533,7 @@ function cmdVerify(taskPath, side) {
   const exit = gate.status !== 0 ? gate.status : (treeAfter !== treeBefore ? 1 : (freshness && freshness.exit !== 0 ? freshness.exit : 0));
   const container = existsSync(record) ? JSON.parse(readFileSync(record, 'utf8')) : null;
   recordStep(state, side, 'verify', {
-    exit, gate_exit: gate.status, tree: treeBefore, tree_after: treeAfter, evidence, run_path: runPath, freshness, dir,
+    exit, gate_exit: gate.status, tree: treeBefore, tree_after: treeAfter, evidence, run_path: runPath, freshness, dir, orch: orchRevision(),
     container: container ? { image: container.image?.id, steps: container.steps, cleanup_complete: container.cleanup_complete, tree: container.tree_before } : null,
   });
   saveState(task, state);
@@ -526,6 +556,7 @@ function cmdCommit(taskPath, side) {
     `Orchestrated task ${task.id} (${side}); verified before commit.`, '',
     `Implemented-By: codex ${implement.model ?? spec.model} effort=${implement.effort ?? spec.effort}`,
     `Verified-Tree: ${verified.tree}`,
+    `Orchestrator: ORCH-P ${verified.orch?.revision ?? 'UNKNOWN'}${verified.orch?.dirty ? ' (dirty)' : ''}`,
     `Verification-Evidence: ${verified.evidence}`,
   ].join('\n');
   for (const args of [['add', '-A'], ['commit', '-q', '-F', '-']]) {
@@ -547,7 +578,7 @@ function cmdContract() {
   // BuildKit with network) and serves agent-written FE code with `next start`
   // on the host. Until both run in verification containers it is unavailable
   // for orchestrated tasks — there is deliberately no override.
-  refuse('contract check is not containerized yet; run docs/coordination/pilot.md manually after human review of both branches');
+  refuse('contract check is not containerized yet; run BE-P docs/coordination/pilot.md manually after human review of both branches');
 }
 
 /** Process ancestry (argv0 basenames) from /proc — execution metadata for review provenance. */

@@ -27,11 +27,12 @@ import { fileURLToPath } from 'node:url';
 import { buildFilesystemPolicy, profileArgs, sanitizedEnv, scanSecrets } from './orchestrate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const BE = resolve(HERE, '..', '..');
-const FE = resolve(BE, '..', 'FE-P');
+const ORCH_REPO = resolve(HERE, '..');
+const BE = resolve(process.env.ORCH_BE_REPO ?? join(ORCH_REPO, '..', 'BE-P'));
+const FE = resolve(process.env.ORCH_FE_REPO ?? join(ORCH_REPO, '..', 'FE-P'));
 const HOME = homedir();
 const CODEX = process.env.ORCH_CODEX_BIN ?? 'codex';
-const OUT = resolve(process.env.ORCH_STEP0_DIR ?? join(BE, 'harness', 'runs', 'orch-step0'));
+const OUT = resolve(process.env.ORCH_STEP0_DIR ?? join(ORCH_REPO, 'runs', 'orch-step0'));
 const ROOT = resolve(process.env.ORCH_WORKTREE_ROOT ?? join(HOME, 'orch-worktrees'));
 const skipModel = process.argv.includes('--skip-model');
 const MARK = 'ORCH-PROBE-RAN';

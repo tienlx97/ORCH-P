@@ -2,7 +2,7 @@
 
 Codex implements one side of an approved task in an isolated Git worktree; the existing
 BE/FE gates verify it; Claude Code reviews it; a human pushes and merges. No orchestration
-framework is involved ([Ruflo: not adopted](ruflo-evaluation.md)). Policy: [coordination](README.md).
+framework is involved ([Ruflo: not adopted](ruflo-evaluation.md)). Policy: [BE-P coordination](../../BE-P/docs/coordination/README.md).
 
 ```text
 human approves task.json ──► prepare ──► implement (Codex, sandboxed) ──► check ──► verify (gate)
@@ -13,7 +13,8 @@ human merges ◄── ready_for_human_merge ◄── review-record (Claude Cod
 
 ## Commands
 
-`node orchestrate/orchestrate.mjs <command> <task.json> [be|fe]` from BE-P.
+`node orchestrate/orchestrate.mjs <command> <task.json> [be|fe]` from ORCH-P (BE-P and FE-P are its
+siblings; override with `ORCH_BE_REPO` / `ORCH_FE_REPO`). Run state goes to `ORCH-P/runs/`.
 
 | Command | Does | Refuses when |
 |---|---|---|
@@ -23,7 +24,7 @@ human merges ◄── ready_for_human_merge ◄── review-record (Claude Cod
 | `check` | Changed paths ⊆ `allowed_paths`, no protected paths, secret scan of diff and new files | — (fails with exit 1) |
 | `verify` | The repository's own gate in a verification container (`verify-container/run-gate.mjs`), FE `task.mjs status`; preserves evidence and the container record; binds both to the tree hash | `check` did not pass |
 | `commit` | Local commit with `Verified-Tree` / `Verification-Evidence` trailers | Gate not passed; evidence missing; tree changed since verification |
-| `contract` | Disabled: the contract-read check would build and serve agent code on the host. A task with `contract_check: true` cannot reach `ready_for_human_merge`; run [pilot.md](pilot.md) manually after review | Always |
+| `contract` | Disabled: the contract-read check would build and serve agent code on the host. A task with `contract_check: true` cannot reach `ready_for_human_merge`; run [pilot.md](../../BE-P/docs/coordination/pilot.md) manually after review | Always |
 | `review-record` | Stores Claude Code's `review.json` with execution provenance | Not run from a Claude Code process; a Codex process in the ancestry; commits differ from the verified commits |
 | `status` | `in_progress`, `blocked`, `rework_required` or `ready_for_human_merge` | — |
 | `cleanup` | Removes worktrees, keeps branches and evidence | Uncommitted changes; unpreserved evidence (unless `--preserve`) |
@@ -100,7 +101,7 @@ capabilities (internal network only). Container isolation depends on the local D
 
 ## Step 0
 
-`node orchestrate/step0-probe.mjs` must report READY (`harness/runs/orch-step0/report.json`)
+`node orchestrate/step0-probe.mjs` must report READY (`runs/orch-step0/report.json`)
 before `implement` runs. It probes, without a model, the built-in `:workspace` baseline and the
 generated profile in a real BE-P worktree (writes, Git metadata, network, Docker, other
 processes' environment, Windows drives, credential files, canaries), then makes one real

@@ -46,6 +46,11 @@ exit "$code"
 `);
   chmodSync(join(dir, 'harness', 'verify.sh'), 0o755);
   if (fe) writeFileSync(join(dir, 'harness', 'task.mjs'), 'process.exit(Number(process.env.STUB_TASK_EXIT ?? 0));\n');
+  else {
+    // The interface ORCH-P checks for at the base revision (containerized MySQL seam).
+    mkdirSync(join(dir, 'tests', 'CompanyManagement.MySql.IntegrationTests'), { recursive: true });
+    writeFileSync(join(dir, 'tests', 'CompanyManagement.MySql.IntegrationTests', 'MySqlApiFactory.cs'), '// MYSQL_INTEGRATION_CONNECTION_STRING\n');
+  }
   writeFileSync(join(dir, '.gitignore'), 'harness/runs/\n');
   mkdirSync(join(dir, 'src'), { recursive: true });
   writeFileSync(join(dir, 'src', 'app.txt'), 'v1\n');
@@ -182,7 +187,9 @@ test('glob matching', () => {
 });
 
 test('secret scan reports locations, never values', () => {
-  const hits = scanSecrets('ok\nconst k = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"\nServer=x;Password=hunter22;', 'f');
+  // Built at runtime so the repository itself holds no token-shaped literal.
+  const fakeToken = `${'gh'}p_${'a'.repeat(36)}`;
+  const hits = scanSecrets(`ok\nconst k = "${fakeToken}"\nServer=x;Password=hunter22;`, 'f');
   assert.deepEqual(hits, ['f:2', 'f:3']);
   assert.ok(!hits.join().includes('ghp_'));
 });
@@ -495,4 +502,24 @@ test('restore inputs are protected and the contract check refuses (not container
   const c = orch(ctx, ['contract', ctx.taskFile]);
   assert.equal(c.status, 2);
   assert.match(c.stderr, /not containerized/);
+});
+
+test('prepare refuses base revisions that lack what ORCH-P relies on', () => {
+  const ctx = setup();
+  sh(ctx.fe, 'git rm -q harness/task.mjs && git -c user.email=t@l -c user.name=t commit -qm drop');
+  ctx.task.base_revision.fe = sh(ctx.fe, 'git rev-parse HEAD');
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  const r = orch(ctx, ['prepare', ctx.taskFile]);
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /fe: harness\/task.mjs missing/);
+  assert.ok(!existsSync(join(ctx.ws, 'worktrees')), 'nothing prepared');
+});
+
+test('state and commits record the ORCH-P revision', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  runToCommit(ctx, 'be');
+  const s = state(ctx);
+  assert.match(s.orch.revision, /^([0-9a-f]{40}|UNKNOWN)$/);
+  assert.match(sh(s.sides.be.worktree, 'git log -1 --format=%B'), /Orchestrator: ORCH-P /);
 });
