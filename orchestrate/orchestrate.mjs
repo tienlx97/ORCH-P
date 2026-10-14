@@ -120,6 +120,32 @@ export function buildFilesystemPolicy({ home = homedir(), worktreeRoot = WORKTRE
   return policy;
 }
 
+/** Where a command really lives: the first PATH entry that has it, symlinks resolved. */
+export function resolveCommand(name, pathVar = process.env.PATH ?? '') {
+  if (name.includes('/')) { try { return realpathSync(name); } catch { return null; } }
+  for (const dir of pathVar.split(':').filter(Boolean)) {
+    try { if (statSync(join(dir, name)).isFile()) return realpathSync(join(dir, name)); } catch { /* next entry */ }
+  }
+  return null;
+}
+
+/** The deny entry of `policy` that hides `path` (a denied parent wins over any child), or null. */
+export function deniedBy(policy, path) {
+  return Object.entries(policy).find(([p, mode]) => mode === 'deny' && (path === p || path.startsWith(`${p}/`)))?.[0] ?? null;
+}
+
+/**
+ * Toolchain commands the sandbox profile would hide from Codex. Codex re-executes
+ * itself inside the sandbox, so a Codex installed under a denied home entry
+ * (e.g. ~/.asdf) fails with `bwrap: execvp` before any work starts.
+ */
+export function hiddenToolchain(policy, commands, pathVar = process.env.PATH ?? '') {
+  return commands
+    .map(({ name, bin }) => ({ name, path: resolveCommand(bin ?? name, pathVar) }))
+    .map((c) => ({ ...c, denied_by: c.path ? deniedBy(policy, c.path) : null }))
+    .filter((c) => c.denied_by);
+}
+
 export function profileArgs(policy, base = ':workspace', name = 'orch') {
   const table = Object.entries(policy).map(([path, mode]) => `${JSON.stringify(path)}=${JSON.stringify(mode)}`).join(', ');
   return [
@@ -298,6 +324,11 @@ function recordStep(state, side, step, data) {
   state.log.push({ side, step, exit: data.exit ?? null, at: now() });
 }
 
+/** The run's private temp dir: writable inside the sandbox (TMPDIR, BE packages). */
+function sideTmpDir(task, side) {
+  return join(WORKTREE_ROOT, `${task.id}-${side}-tmp`);
+}
+
 function sideOf(task, state, side) {
   if (!task.sides[side] || !state.sides[side]) refuse(`side must be one of: ${Object.keys(task.sides).join(', ')}`);
   return { spec: task.sides[side], s: state.sides[side] };
@@ -318,6 +349,64 @@ function worktreeTree(worktree) {
   } finally {
     rmSync(index, { force: true });
   }
+}
+
+const GATE_FINDINGS_MAX = 25;
+
+/**
+ * A failed gate as rework findings for the next `implement` prompt: compiler
+ * errors, failed tests and error lines of each failed step, read from the
+ * gate output and the preserved evidence. Lines that look like secrets are
+ * dropped, never echoed; the prompt is scanned again before Codex sees it.
+ */
+export function gateFindings({ output, evidenceDir, worktree }) {
+  const findings = [];
+  const seen = new Set();
+  let dropped = 0;
+  // `step` prefixes the summary; the same compiler error reported by two steps
+  // (build, then the test step's own build) is one finding.
+  const add = (summary, step = null) => {
+    const clean = summary.replaceAll(`${worktree}/`, '').replace(/\s+\[[^\]]*proj\]\s*$/, '').trim().slice(0, 400);
+    if (!clean || seen.has(clean)) return;
+    if (scanSecrets(clean, 'gate').length) { dropped += 1; return; }
+    seen.add(clean);
+    findings.push({ severity: 'blocking', source: 'gate', summary: step ? `${step}: ${clean}` : clean });
+  };
+  const log = (step) => {
+    const file = evidenceDir ? join(evidenceDir, `${step}.log`) : null;
+    return file && existsSync(file) ? readFileSync(file, 'utf8').split('\n') : [];
+  };
+  for (const line of output.split('\n')) if (/^refused: /.test(line.trim())) add(`gate ${line.trim()}`);
+  for (const step of [...new Set([...output.matchAll(/✘\s+(\S+)\s+FAILED/g)].map((m) => m[1]))]) {
+    const lines = log(step);
+    const before = findings.length;
+    let specific = false;
+    // Compilers (dotnet, tsc): path(line,col): error CODE: message
+    for (const l of lines) {
+      const m = /^\s*(.+?)\((\d+),\d+\): error ([A-Z]+\d+): (.*)$/.exec(l);
+      if (m) { specific = true; add(`${m[1]}:${m[2]} ${m[3]} ${m[4]}`, step); }
+    }
+    // dotnet test: "Failed <name> [12 ms]" followed by "Error Message:" and the message.
+    lines.forEach((l, i) => {
+      const m = /^\s*Failed (\S+) \[/.exec(l);
+      if (!m) return;
+      specific = true;
+      const at = lines.slice(i + 1, i + 6).findIndex((x) => /^\s*Error Message:/.test(x));
+      const message = at >= 0 ? (lines[i + 2 + at] ?? '').trim() : '';
+      add(`test failed ${m[1]}${message ? ` — ${message}` : ''}`, step);
+    });
+    // Anything else (eslint, node:test, scripts): the step's error lines, not its pass summaries.
+    if (!specific) {
+      lines.filter((l) => /\berror\b|✖|^not ok|FAIL/i.test(l) && !/Failed:\s+0\b|^\s*Passed!/.test(l))
+        .slice(0, 8).forEach((l) => add(l.trim(), step));
+    }
+    if (!specific && findings.length === before) add(`gate step ${step} failed; see ${step}.log in the verification evidence`);
+  }
+  if (findings.length === 0) add('the repository gate failed without a recognizable failing step; see gate.log');
+  const kept = findings.slice(0, GATE_FINDINGS_MAX);
+  if (findings.length > kept.length) kept.push({ severity: 'blocking', source: 'gate', summary: `${findings.length - kept.length} more gate findings omitted` });
+  if (dropped) kept.push({ severity: 'blocking', source: 'gate', summary: `${dropped} gate lines omitted because they looked like secrets` });
+  return kept;
 }
 
 /** Changed paths in the worktree relative to the base (committed, staged, unstaged, untracked). */
@@ -384,6 +473,20 @@ function cmdPrepare(taskPath) {
     state.sides[side] = { worktree, branch, base: task.base_revision[side], steps: {} };
     recordStep(state, side, 'worktree', { exit: add.status });
     if (add.status !== 0) { saveState(task, state); console.error(add.stderr.trim()); return add.status; }
+    if (side === 'be') {
+      // Codex has no network, so without this it can neither build nor test.
+      // The restore runs in a verification container with egress — the same
+      // step `verify` runs first — on the base revision's restore inputs; the
+      // packages land in this run's private temp dir at the same absolute path
+      // so obj/project.assets.json is valid for `dotnet build --no-restore`.
+      const packages = join(sideTmpDir(task, side), 'nuget');
+      mkdirSync(packages, { recursive: true });
+      const restore = run(process.execPath, [GATE_RUNNER, 'restore', worktree, '--base', task.base_revision[side], '--packages', packages]);
+      const log = join(stateDir(task), 'be-restore.log');
+      writeFileSync(log, `${restore.stdout}\n${restore.stderr}`);
+      recordStep(state, side, 'restore', { exit: restore.status, log, packages });
+      if (restore.status !== 0) console.error(`be: offline package restore failed (exit ${restore.status}, ${log}); Codex will not be able to build`);
+    }
     if (side === 'fe' && existsSync(join(worktree, 'package.json'))) {
       const log = join(stateDir(task), 'fe-install.log');
       const install = run('pnpm', ['install', '--frozen-lockfile', '--prefer-offline'], { cwd: worktree });
@@ -403,6 +506,24 @@ function step0Ready() {
   return report.ready === true ? null : `Step 0 did not pass (${STEP0_REPORT}); real implementation is blocked`;
 }
 
+function toolingNote(side, s) {
+  if (side === 'fe') return '- Dependencies are installed in `node_modules`; there is no network, so do not install packages.';
+  // Observed in the real sandbox (2026-10-14): parallel MSBuild nodes fail
+  // silently ("Build FAILED", 0 errors), and the vstest host cannot open its
+  // loopback socket, so tests compile here but only run in the gate.
+  if (s.steps.restore?.exit === 0) {
+    return [
+      '- NuGet packages of the base revision are restored for this worktree and there is no network. Compile every project you touch,',
+      '  test projects included, with `dotnet build --no-restore -m:1 -nodeReuse:false <project or CompanyManagement.sln>` and fix',
+      '  every error before finishing. Without `-m:1` the build fails with no error listed. Do not run `dotnet restore`.',
+      '- `dotnet test` cannot run here (the test host needs a loopback socket the sandbox blocks). The orchestrator\'s gate runs',
+      '  the tests; report them as not run, not as passed.',
+    ].join('\n');
+  }
+  return '- Package restore is not available for this worktree, so compiling and running tests is impossible here. Check every type, '
+    + 'using and signature you touch against the source by reading it, and list compilation as not verified in your report.';
+}
+
 function renderPrompt(task, side, spec, s) {
   const template = readFileSync(join(HERE, 'prompt.md'), 'utf8');
   const values = {
@@ -414,7 +535,8 @@ function renderPrompt(task, side, spec, s) {
     ALLOWED_PATHS: spec.allowed_paths.map((p) => `- ${p}`).join('\n'),
     ACCEPTANCE: spec.acceptance_criteria.map((c) => `- ${c}`).join('\n'),
     INPUTS: (spec.inputs ?? []).map((i) => `- ${i}`).join('\n') || '- (none)',
-    REWORK: (s.rework ?? []).map((f) => `- [${f.severity}] ${f.file ?? ''} ${f.summary}`).join('\n') || '- (none)',
+    REWORK: (s.rework ?? []).map((f) => `- [${f.severity}]${f.file ? ` ${f.file}` : ''} ${f.summary}`).join('\n') || '- (none)',
+    TOOLING: toolingNote(side, s),
   };
   return template.replace(/\{\{(\w+)\}\}/g, (_, key) => values[key] ?? '');
 }
@@ -431,10 +553,15 @@ function cmdImplement(taskPath, side) {
   const dir = join(stateDir(task), `${side}-implement-${Date.now()}`);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, 'prompt.md'), prompt);
-  const tmpDir = join(WORKTREE_ROOT, `${task.id}-${side}-tmp`);
+  const tmpDir = sideTmpDir(task, side);
   mkdirSync(tmpDir, { recursive: true });
   const policy = buildFilesystemPolicy({ worktree: s.worktree, tmpDir });
   writeFileSync(join(dir, 'filesystem-policy.json'), `${JSON.stringify(policy, null, 2)}\n`);
+  const hidden = hiddenToolchain(policy, [{ name: 'codex', bin: CODEX }, { name: 'node' }, ...(side === 'be' ? [{ name: 'dotnet' }] : [])], sanitizedEnv().PATH);
+  if (hidden.length) {
+    refuse(`the sandbox profile hides ${hidden.map((h) => `${h.name} (${h.path}, under denied ${h.denied_by})`).join(', ')}; `
+      + 'install it under an allowed toolchain (~/.nvm, ~/.dotnet, ~/.local/bin) or put that one first on PATH');
+  }
   const args = [
     'exec', '-C', s.worktree, ...profileArgs(policy), '-m', spec.model,
     '-c', `model_reasoning_effort="${spec.effort}"`, '--ignore-user-config', '--ephemeral',
@@ -489,7 +616,10 @@ function cmdCheck(taskPath, side) {
     }),
   ];
   const ok = paths.length > 0 && outOfScope.length === 0 && protectedHits.length === 0 && secretHits.length === 0;
-  recordStep(state, side, 'check', { exit: ok ? 0 : 1, changed: paths, out_of_scope: outOfScope, protected: protectedHits, secret_hits: secretHits });
+  // The tree binds the result: a rework implement after this check needs a new check.
+  recordStep(state, side, 'check', {
+    exit: ok ? 0 : 1, tree: worktreeTree(s.worktree), changed: paths, out_of_scope: outOfScope, protected: protectedHits, secret_hits: secretHits,
+  });
   if (!ok) state.sides[side].status = 'blocked';
   saveState(task, state);
   if (paths.length === 0) console.error('no changes to check');
@@ -513,6 +643,7 @@ function cmdVerify(taskPath, side) {
   const { spec, s } = sideOf(task, state, side);
   if (s.steps.check?.exit !== 0) refuse(`check must pass before verify (side ${side})`);
   const treeBefore = worktreeTree(s.worktree);
+  if (s.steps.check.tree !== treeBefore) refuse(`worktree changed since check; run check again (side ${side})`);
   const dir = join(stateDir(task), `${side}-verify-${Date.now()}`);
   mkdirSync(dir, { recursive: true });
   const record = join(dir, 'container-record.json');
@@ -536,9 +667,21 @@ function cmdVerify(taskPath, side) {
     exit, gate_exit: gate.status, tree: treeBefore, tree_after: treeAfter, evidence, run_path: runPath, freshness, dir, orch: orchRevision(),
     container: container ? { image: container.image?.id, steps: container.steps, cleanup_complete: container.cleanup_complete, tree: container.tree_before } : null,
   });
+  // Gate failures go back to Codex on the same worktree (`implement` again);
+  // infrastructure failures (70: image missing, MySQL not ready) are not its to fix.
+  const reviewFindings = (s.rework ?? []).filter((f) => f.source !== 'gate');
+  let found = [];
+  if (exit !== 0 && gate.status !== 70) {
+    found = gate.status !== 0 ? gateFindings({ output: `${gate.stdout}\n${gate.stderr}`, evidenceDir: evidence, worktree: s.worktree }) : [];
+    if (treeAfter !== treeBefore) found.push({ severity: 'blocking', source: 'gate', summary: 'the gate changed tracked or untracked files; generated output must be committed or ignored' });
+    if (freshness && freshness.exit !== 0) found.push({ severity: 'blocking', source: 'gate', summary: `harness/task.mjs status failed (exit ${freshness.exit}): task evidence is not fresh` });
+  }
+  s.rework = [...reviewFindings, ...found];
   saveState(task, state);
   if (treeAfter !== treeBefore) console.error('the gate changed the worktree; evidence is not bound to a stable tree');
   console.log(`verify ${side}: gate exit ${gate.status}; tree ${treeBefore.slice(0, 12)}; evidence ${evidence ?? 'NOT FOUND'}`);
+  if (found.length) console.log(`verify ${side}: ${found.length} gate findings recorded for rework — run implement, check and verify ${side} again`);
+  else if (exit !== 0 && gate.status === 70) console.error(`verify ${side}: infrastructure failure (exit 70); fix the environment and run verify again`);
   return exit;
 }
 
@@ -641,12 +784,14 @@ function cmdStatus(taskPath) {
       status: s.status ?? 'in_progress', branch: s.branch, base: s.base,
       steps: Object.fromEntries(Object.entries(s.steps).map(([k, v]) => [k, v.exit])),
       commit: s.steps.commit?.commit ?? null,
+      gate_rework: (s.rework ?? []).filter((f) => f.source === 'gate').length,
     }])),
     contract: state.contract ? state.contract.exit : null,
     review: state.review?.status ?? 'missing',
   };
   const allCommitted = Object.values(state.sides).every((s) => s.status === 'committed');
-  summary.overall = state.review?.status === 'rework_required' ? 'rework_required'
+  const gateRework = Object.values(state.sides).some((s) => (s.rework ?? []).some((f) => f.source === 'gate'));
+  summary.overall = state.review?.status === 'rework_required' || gateRework ? 'rework_required'
     : Object.values(state.sides).some((s) => s.status === 'blocked') ? 'blocked'
       : allCommitted && (!task.contract_check || state.contract?.exit === 0) && state.review?.status === 'ready_for_human_merge'
         ? 'ready_for_human_merge' : 'in_progress';
