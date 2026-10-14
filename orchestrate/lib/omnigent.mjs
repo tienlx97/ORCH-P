@@ -88,9 +88,16 @@ const REQUIRED = [
 export const COORDINATOR_SHELL = '^node ORCH-P/orchestrate/orchestrate\\.mjs (status|validate) [A-Za-z0-9._/-]+\\.json$';
 export const REVIEWER_GIT = '^git -C (BE-P|FE-P) (show|diff|log) [A-Za-z0-9._/:^~ -]+$';
 export const REVIEWER_ORCH = '^node ORCH-P/orchestrate/orchestrate\\.mjs (status [A-Za-z0-9._/-]+\\.json|review-record [A-Za-z0-9._/-]+\\.json ORCH-P/runs/reviews/[A-Za-z0-9_-]+\\.json)$';
+const CLAUDE_SANDBOX = { read_paths: '["~/.nvm"]', write_files: '["~/.claude.json"]' };
 export const BUNDLE_AGENTS = Object.freeze({
-  'orch-coordinator': { shell: [COORDINATOR_SHELL], writePaths: '["ORCH-P/runs/proposals", "ORCH-P/runs/requests"]' },
-  'orch-reviewer': { shell: [REVIEWER_GIT, REVIEWER_ORCH], writePaths: '["ORCH-P/runs"]' },
+  'orch-coordinator': {
+    shell: [COORDINATOR_SHELL],
+    sandbox: { ...CLAUDE_SANDBOX, write_paths: '["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude"]', cwd_allow_hidden: '[".nvm", ".claude", ".credentials.json"]' },
+  },
+  'orch-reviewer': {
+    shell: [REVIEWER_GIT, REVIEWER_ORCH],
+    sandbox: { ...CLAUDE_SANDBOX, write_paths: '["ORCH-P/runs", "~/.claude"]', cwd_allow_hidden: '[".git", ".nvm", ".claude", ".credentials.json"]' },
+  },
 });
 
 function agentDirs(bundleDir) {
@@ -115,8 +122,10 @@ export function lintBundle(bundleDir) {
     const text = readFileSync(file, 'utf8');
     for (const [pattern, what] of FORBIDDEN) if (pattern.test(text)) problems.push(`${name}: forbidden: ${what}`);
     for (const [pattern, what] of REQUIRED) if (!pattern.test(text)) problems.push(`${name}: missing: ${what}`);
-    const writes = text.match(/^\s*write_paths\s*:\s*(\[.*\])\s*$/m)?.[1];
-    if (writes !== spec.writePaths) problems.push(`${name}: write_paths must be exactly ${spec.writePaths}`);
+    for (const [key, expected] of Object.entries(spec.sandbox)) {
+      const found = [...text.matchAll(new RegExp(`^\\s*${key}\\s*:\\s*(\\[.*\\])\\s*$`, 'gm'))].map((m) => m[1]);
+      if (found.length !== 1 || found[0] !== expected) problems.push(`${name}: ${key} must be exactly ${expected}`);
+    }
     const shells = [...text.matchAll(/\.matches\(r'(\^(?:git|node) [^']*)'\)/g)].map((m) => m[1]);
     if (JSON.stringify(shells) !== JSON.stringify(spec.shell)) problems.push(`${name}: the shell allowlist differs from orchestrate/lib/omnigent.mjs`);
   }

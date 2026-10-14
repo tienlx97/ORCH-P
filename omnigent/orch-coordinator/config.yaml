@@ -60,7 +60,14 @@ os_env:
   cwd: .
   sandbox:
     type: linux_bwrap
-    write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests"]
+    # Claude's own login and state (~/.claude, ~/.claude.json) and the nvm node
+    # for `node ORCH-P/...`; $HOME is otherwise not mounted. The tool allowlist
+    # still denies every Read/Write of a dot-path, so only the Claude process
+    # itself uses them.
+    read_paths: ["~/.nvm"]
+    write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude"]
+    write_files: ["~/.claude.json"]
+    cwd_allow_hidden: [".nvm", ".claude", ".credentials.json"]
 
 guardrails:
   policies:
@@ -98,7 +105,9 @@ guardrails:
                 ? {"result": "DENY", "reason": "Writes need a plain path."} :
               event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/proposals/[A-Za-z0-9._-]+\.json$') ? {} :
               event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/requests/[A-Za-z0-9_-]+\.json$')
-                ? {"result": "ASK", "reason": "Run this ORCH-P step? Check the command, task and side in the request."} :
+                ? (event.data.name == "Write" && has(event.data.arguments.content)
+                    ? {"result": "ASK", "reason": "Run this ORCH-P request? " + event.data.arguments.content}
+                    : {"result": "DENY", "reason": "Requests are written whole with Write, never edited."}) :
               {"result": "DENY", "reason": "Writes are limited to ORCH-P/runs/proposals/<ID>.json and ORCH-P/runs/requests/<id>.json."}) :
             {"result": "DENY", "reason": "Tool not on the ORCH-P coordinator allowlist."}
     tool_cap:

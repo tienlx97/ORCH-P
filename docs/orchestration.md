@@ -23,7 +23,7 @@ siblings; override with `ORCH_BE_REPO` / `ORCH_FE_REPO`). Run state goes to `ORC
 |---|---|---|
 | `validate` | Prints the resolved plan (bases, model, effort) | Task not approved; base not a full SHA that is a commit; model/effort not in `codex debug models` |
 | `prepare` | Worktree per side at `base_revision` on `agent/<id>-<side>` under `~/orch-worktrees`; BE package restore for offline builds (`run-gate.mjs restore`, below); FE `pnpm install --frozen-lockfile --prefer-offline` | Already prepared; worktree path or branch exists |
-| `implement` | `runner: omnigent` (default): a Codex session in Omnigent ([below](#omnigent-hub)); `runner: codex-exec`: `codex exec` directly. Both use the generated sandbox profile, model, effort and a prompt from `prompt.md` + task fields + pending rework findings; `codex-exec` also gets the allowlisted environment and private `TMPDIR` | Step 0 not READY; task file edited since prepare; secret-like text in the prompt; `codex`, `node` or (BE) `dotnet` resolves under a path the profile denies; `omnigent`: pin not approved, server not loopback |
+| `implement` | `runner: omnigent` (default): a Codex session in Omnigent ([below](#omnigent-hub)); `runner: codex-exec`: `codex exec` directly. Both use the generated sandbox profile, model, effort and a prompt from `prompt.md` + task fields + pending rework findings; `codex-exec` also gets the allowlisted environment and private `TMPDIR` | Step 0 not READY; task file edited since prepare; secret-like text in the prompt; `codex`, `node` or (BE) `dotnet` resolves under a path the profile denies; `omnigent`: pin not approved, server not loopback, Step 0 through Omnigent not READY for these versions, `~/.codex/config.toml` with MCP servers, notify, hooks, profiles, sandbox/approval settings or a model provider |
 | `check` | Changed paths ⊆ `allowed_paths`, no protected paths, secret scan of diff and new files; binds the result to the tree hash | — (fails with exit 1) |
 | `verify` | The repository's own gate in a verification container (`verify-container/run-gate.mjs`), FE `task.mjs status`; preserves evidence and the container record; binds both to the tree hash. A failed gate (not exit 70) records its findings as rework: run `implement`, `check`, `verify` again on the same worktree | `check` did not pass, or the tree changed since `check` |
 | `commit` | Local commit with `Verified-Tree` / `Verification-Evidence` trailers | Gate not passed; evidence missing; tree changed since verification |
@@ -120,8 +120,12 @@ human: approves task files (status "approved") in the terminal; pushes and merge
 - **Implementers.** `implement` (`runner: omnigent`) creates a top-level `codex-native-ui`
   session through the loopback REST API (`ORCH_OMNIGENT_URL`, default `http://127.0.0.1:6767`;
   anything else is refused) on the side's worktree, with launch args = the Step 0 permission
-  profile, `approval_policy="never"`, model and effort. It refuses if the server returns other
-  launch args. Session policies are attached before the prompt (writes only in the worktree,
+  profile, `approval_policy="never"`, `shell_environment_policy.inherit="core"` (Codex filters
+  the daemon's environment for every command) with `TMPDIR` set to the run's private temp dir,
+  model and effort. It refuses if the server returns other launch args, and before that unless
+  `orchestrate/step0-omnigent.mjs` reported READY for the pinned Omnigent and the installed Codex
+  (the Step 0 checks, plus loopback to Omnigent, credential variables and the private TMPDIR,
+  run inside a real Omnigent Codex session). Session policies are attached before the prompt (writes only in the worktree,
   no push or destructive command, tool cap, loop guard); any that fails stops the session. It
   waits for the session to go idle (timeout → interrupt, 127; Ctrl-C / SIGTERM → interrupt, 128),
   then exports the session history to the run directory (`session-items.jsonl`, `session.json`,
@@ -143,6 +147,9 @@ human: approves task files (status "approved") in the terminal; pushes and merge
   `omnigent/*/config.yaml`. `cockpit.mjs lint` (in `harness/verify.sh`) rejects any bypass,
   `sandbox: none`, other harnesses, sub-agents, credential pass-through, push/PR instructions,
   a changed shell allowlist or write path, and unknown agents.
+- **O1 helpers:** `cockpit.mjs probe-api` records the real `/v1/agents` and `/v1/hosts` responses
+  (GET only). `cockpit.mjs start` warns when a session changed `~/.claude/settings*.json`,
+  `~/.codex/config.toml` or `~/.codex/hooks.json`.
 - **Status inside a sandbox** uses the cached Codex model catalog (`runs/model-catalog.json`,
   written whenever `codex debug models` runs) because the `codex` binary is not visible there.
 

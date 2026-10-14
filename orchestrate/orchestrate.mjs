@@ -28,7 +28,7 @@ import {
 import { codexProjector, lineSplitter } from './lib/event-stream.mjs';
 import { readPin } from './lib/omnigent.mjs';
 import {
-  codexLaunchArgs, lastAssistantText, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
+  codexLaunchArgs, codexUserConfigProblems, lastAssistantText, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
 } from './lib/omnigent-runner.mjs';
 import { scanSecrets } from './lib/secrets.mjs';
 
@@ -53,6 +53,7 @@ const REPOS = { be: BE_REPO, fe: FE_REPO };
 // `codex-exec` is the direct `codex exec` path, kept until O1 approves Omnigent.
 const RUNNERS = ['omnigent', 'codex-exec'];
 const OMNIGENT_BUNDLE = resolve(process.env.ORCH_OMNIGENT_BUNDLE ?? join(ORCH_REPO, 'omnigent'));
+const STEP0_OMNIGENT_REPORT = resolve(process.env.ORCH_STEP0_OMNIGENT_REPORT ?? join(STATE_ROOT, 'orch-step0', 'omnigent-report.json'));
 
 // Paths no implementation agent may change unless the approved task names
 // them in `protected_paths_override` (gates, CI, credentials, lockfiles).
@@ -761,6 +762,18 @@ function finishImplement({ task, state, side, spec, s, obs, dir, metadataBefore,
   return status;
 }
 
+/** Step 0 through Omnigent (step0-omnigent.mjs) must be READY for the pinned Omnigent and the installed Codex. */
+function step0OmnigentReady(pin) {
+  const rerun = 'run node orchestrate/step0-omnigent.mjs';
+  if (!existsSync(STEP0_OMNIGENT_REPORT)) return `Step 0 through Omnigent has not run (${STEP0_OMNIGENT_REPORT}); ${rerun}`;
+  const report = JSON.parse(readFileSync(STEP0_OMNIGENT_REPORT, 'utf8'));
+  if (report.ready !== true) return `Step 0 through Omnigent did not pass (${STEP0_OMNIGENT_REPORT}); Codex sessions in Omnigent are blocked`;
+  if (report.omnigent_version !== pin.version) return `Step 0 through Omnigent ran on Omnigent ${report.omnigent_version}, pinned is ${pin.version}; ${rerun}`;
+  const codex = run(CODEX, ['--version']).stdout.trim();
+  if (report.codex_version !== codex) return `Step 0 through Omnigent ran on ${report.codex_version || 'an unknown Codex'}, installed is ${codex || 'unknown'}; ${rerun}`;
+  return null;
+}
+
 /** `implement` as a Codex session in Omnigent (lib/omnigent-runner.mjs). */
 async function implementViaOmnigent({ task, state, side, spec, s, dir, prompt: basePrompt, policy }) {
   // An Omnigent session has no --output-schema: the schema goes into the prompt (and its evidence copy).
@@ -772,8 +785,15 @@ async function implementViaOmnigent({ task, state, side, spec, s, dir, prompt: b
   }
   let base;
   try { base = loopbackUrl(process.env.ORCH_OMNIGENT_URL ?? undefined); } catch (error) { refuse(error.message); }
+  const blocked = step0OmnigentReady(pin);
+  if (blocked) refuse(blocked);
+  const codexConfig = join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'config.toml');
+  const configProblems = codexUserConfigProblems(existsSync(codexConfig) ? readFileSync(codexConfig, 'utf8') : '');
+  if (configProblems.length) {
+    refuse(`${codexConfig} would be copied into the Omnigent session; remove: ${configProblems.join('; ')}`);
+  }
   const attempt = state.log.filter((e) => e.side === side && e.step === 'implement').length + 1;
-  const launchArgs = codexLaunchArgs({ profile: profileArgs(policy), model: spec.model, effort: spec.effort });
+  const launchArgs = codexLaunchArgs({ profile: profileArgs(policy), model: spec.model, effort: spec.effort, tmpDir: sideTmpDir(task, side) });
   const policies = sessionPolicies(s.worktree);
   const agentName = process.env.ORCH_OMNIGENT_CODEX_AGENT ?? 'codex-native-ui';
   writeFileSync(join(dir, 'command.json'), `${JSON.stringify({ runner: 'omnigent', server: base, agent: agentName, launch_args: launchArgs, policies }, null, 2)}\n`);

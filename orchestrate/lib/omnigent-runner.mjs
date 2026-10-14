@@ -70,9 +70,37 @@ export function omnigentClient(base, { fetchImpl = fetch } = {}) {
   };
 }
 
-/** Codex launch args: the Step 0 profile, no approval prompts (headless), the task's model and effort. */
-export function codexLaunchArgs({ profile, model, effort }) {
-  return [...profile, '-c', 'approval_policy="never"', '-m', model, '-c', `model_reasoning_effort="${effort}"`];
+/**
+ * Codex launch args: the Step 0 profile, no approval prompts (headless), a
+ * minimal environment for every command (Codex's own filter: the session
+ * inherits the Omnigent daemon's environment, which ORCH-P does not control)
+ * with the run's private TMPDIR, and the task's model and effort.
+ */
+export function codexLaunchArgs({ profile, model, effort, tmpDir }) {
+  return [
+    ...profile, '-c', 'approval_policy="never"',
+    '-c', 'shell_environment_policy.inherit="core"',
+    '-c', 'shell_environment_policy.ignore_default_excludes=false',
+    '-c', `shell_environment_policy.set.TMPDIR=${JSON.stringify(tmpDir)}`,
+    '-m', model, '-c', `model_reasoning_effort="${effort}"`,
+  ];
+}
+
+/**
+ * Omnigent copies ~/.codex/config.toml into each session's private CODEX_HOME,
+ * so `codex exec --ignore-user-config` has no equivalent there. Settings that
+ * start processes outside the command sandbox or switch profiles are refused.
+ */
+export function codexUserConfigProblems(text) {
+  if (!text) return [];
+  const problems = [];
+  if (/^\s*\[\s*mcp_servers\b/m.test(text) || /^\s*mcp_servers\s*=/m.test(text)) problems.push('mcp_servers (MCP servers run outside the command sandbox)');
+  if (/^\s*notify\s*=/m.test(text)) problems.push('notify (runs a program on every turn)');
+  if (/^\s*\[\s*hooks\b/m.test(text) || /^\s*hooks\s*=/m.test(text)) problems.push('hooks');
+  if (/^\s*\[\s*profiles\b/m.test(text) || /^\s*profile\s*=/m.test(text)) problems.push('profiles / profile (could replace the permission profile)');
+  if (/^\s*(default_permissions|sandbox_mode|approval_policy)\s*=/m.test(text)) problems.push('a top-level sandbox or approval setting');
+  if (/^\s*model_provider\s*=|^\s*\[\s*model_providers\b/m.test(text)) problems.push('a model provider (could route to a paid API)');
+  return problems;
 }
 
 /** Session policies on top of the sandbox: no writes outside the worktree, no push or destructive command. */

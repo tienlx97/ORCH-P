@@ -887,8 +887,15 @@ function omnigentSetup() {
   cpSync(join(dirname(CLI), '..', 'omnigent'), bundle, { recursive: true });
   const pin = JSON.parse(readFileSync(join(bundle, 'pin.json'), 'utf8'));
   writeFileSync(join(bundle, 'pin.json'), JSON.stringify({ ...pin, status: 'approved', approval: { source: 'test', approved_by: 'user' } }));
+  // A READY Step 0 through Omnigent for the pinned version and the stub Codex.
+  const codexVersion = spawnSync('codex', ['--version'], { encoding: 'utf8', env: orchEnv(ctx), input: '' }).stdout.trim();
+  writeFileSync(join(ctx.ws, 'step0-omnigent.json'), JSON.stringify({ ready: true, omnigent_version: pin.version, codex_version: codexVersion }));
   return { ctx, bundle };
 }
+
+const omnigentEnvFor = (ctx, bundle, extra = {}) => ({
+  ORCH_OMNIGENT_BUNDLE: bundle, ORCH_STEP0_OMNIGENT_REPORT: join(ctx.ws, 'step0-omnigent.json'), ORCH_OMNIGENT_POLL_MS: '10', ...extra,
+});
 
 test('omnigent runner: refused until the Omnigent pin is approved', () => {
   const ctx = setup();
@@ -910,7 +917,7 @@ test('omnigent runner: Codex runs as a session on the worktree; evidence is the 
   const worktree = state(ctx).sides.be.worktree;
   const stub = await startOmnigentStub({ onMessage: ({ session }) => writeFileSync(join(session.workspace, 'src', 'app.txt'), 'v2\n') });
   try {
-    const run = orchAsync(ctx, ['implement', ctx.taskFile, 'be'], { ORCH_OMNIGENT_BUNDLE: bundle, ORCH_OMNIGENT_URL: stub.url, ORCH_OMNIGENT_POLL_MS: '10' });
+    const run = orchAsync(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url }));
     const result = await run.done;
     assert.equal(result.code, 0, result.out);
     const create = stub.requests.find((r) => r.method === 'POST' && r.path === '/v1/sessions');
@@ -919,6 +926,8 @@ test('omnigent runner: Codex runs as a session on the worktree; evidence is the 
     const args = create.body.terminal_launch_args;
     assert.ok(args.includes('default_permissions="orch"'), JSON.stringify(args));
     assert.ok(args.includes('approval_policy="never"'));
+    assert.ok(args.includes('shell_environment_policy.inherit="core"'));
+    assert.ok(args.some((a) => /^shell_environment_policy\.set\.TMPDIR=".+-be-tmp"$/.test(a)), JSON.stringify(args));
     assert.deepEqual(args.slice(args.indexOf('-m'), args.indexOf('-m') + 2), ['-m', 'test-model']);
     const prompt = stub.requests.find((r) => r.body?.type === 'message').body.data.content[0].text;
     assert.match(prompt, /Demo backend change/);
@@ -939,7 +948,7 @@ test('omnigent runner: a permission change in the UI blocks the run', async () =
   orch(ctx, ['prepare', ctx.taskFile]);
   const stub = await startOmnigentStub({ afterMessage: ({ session }) => { session.labels['omnigent.codex_native.approval_mode'] = 'full-access'; } });
   try {
-    const result = await orchAsync(ctx, ['implement', ctx.taskFile, 'be'], { ORCH_OMNIGENT_BUNDLE: bundle, ORCH_OMNIGENT_URL: stub.url, ORCH_OMNIGENT_POLL_MS: '10' }).done;
+    const result = await orchAsync(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url })).done;
     assert.notEqual(result.code, 0, result.out);
     assert.match(result.out, /permission mode was changed in Omnigent/);
     const s = state(ctx).sides.be;
@@ -949,10 +958,40 @@ test('omnigent runner: a permission change in the UI blocks the run', async () =
   } finally { await stub.close(); }
 });
 
+test('omnigent runner: an MCP server in ~/.codex/config.toml is refused before any session', () => {
+  const { ctx, bundle } = omnigentSetup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const codexHome = join(ctx.ws, 'codex-home');
+  mkdirSync(codexHome);
+  writeFileSync(join(codexHome, 'config.toml'), '[mcp_servers.x]\ncommand = "x"\n');
+  const r = orch(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: 'http://127.0.0.1:9', CODEX_HOME: codexHome }));
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /would be copied into the Omnigent session; remove: mcp_servers/);
+});
+
+test('omnigent runner: refused without a READY Step 0 through Omnigent for these versions', () => {
+  const { ctx, bundle } = omnigentSetup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const report = join(ctx.ws, 'step0-omnigent.json');
+  const good = JSON.parse(readFileSync(report, 'utf8'));
+  const cases = [
+    [null, /has not run/],
+    [{ ...good, ready: false }, /did not pass/],
+    [{ ...good, omnigent_version: '0.17.0' }, /ran on Omnigent 0\.17\.0, pinned is 0\.18\.0/],
+    [{ ...good, codex_version: 'codex-cli 0.1.0' }, /ran on codex-cli 0\.1\.0, installed is/],
+  ];
+  for (const [content, expected] of cases) {
+    if (content) writeFileSync(report, JSON.stringify(content)); else rmSync(report, { force: true });
+    const r = orch(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: 'http://127.0.0.1:9' }));
+    assert.equal(r.status, 2, r.stderr);
+    assert.match(r.stderr, expected);
+  }
+});
+
 test('omnigent runner: a non-loopback server URL is refused', () => {
   const { ctx, bundle } = omnigentSetup();
   orch(ctx, ['prepare', ctx.taskFile]);
-  const r = orch(ctx, ['implement', ctx.taskFile, 'be'], { ORCH_OMNIGENT_BUNDLE: bundle, ORCH_OMNIGENT_URL: 'http://0.0.0.0:6767' });
+  const r = orch(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: 'http://0.0.0.0:6767' }));
   assert.equal(r.status, 2);
   assert.match(r.stderr, /loopback/);
 });

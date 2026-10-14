@@ -2,6 +2,14 @@
 
 Newest first. Evidence directories under `runs/` are local (gitignored).
 
+## 2026-10-14 — Design answers for the ten O1 questions
+
+- Codex sessions in Omnigent: launch args add `shell_environment_policy.inherit="core"` and the run's private `TMPDIR`; `implement` refuses a `~/.codex/config.toml` with MCP servers, notify, hooks, profiles, sandbox/approval settings or a model provider (Omnigent copies it into the session).
+- `orchestrate/step0-omnigent.mjs`: Step 0 inside a real Omnigent Codex session (canary, credentials, `~/.omnigent`, `.env`, write outside, network, loopback to Omnigent, credential env vars, private TMPDIR); `implement` with `runner: omnigent` requires it READY for the pinned Omnigent and installed Codex.
+- `cockpit.mjs probe-api` (GET only) records real REST shapes; `cockpit.mjs start` warns when a session changed Claude/Codex settings.
+- Agents: `~/.claude` login files and `~/.nvm` in their sandboxes (dot-path tool access still denied); request writes are `Write` only and the ASK shows the request. `tests/cel_check.py` evaluates both CEL allowlists where cel-python exists (skipped here).
+- Open after O1: whether the local server can require a token or the agent sandbox takes egress rules (question 9). Details: `docs/omnigent-evaluation.md`.
+
 ## 2026-10-14 — Omnigent as the agent hub; AgentHUD removed
 
 - Rules: AGENTS.md rule 7 admits a third-party platform only after a written static evaluation and the user's written approval. The user then chose Omnigent as the hub that runs, coordinates and keeps the shared history of every agent.

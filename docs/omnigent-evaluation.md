@@ -122,34 +122,22 @@ ORCH-P/tools/omnigent/.venv/bin/pip install omnigent==0.18.0     # O1: replace w
 
 `tools/omnigent/.venv/` is git-ignored.
 
-## Open questions for the O1 probe (UNKNOWN until observed)
+## Open questions for the O1 probe
 
-1. **Step 0 through Omnigent:** in a `codex-native-ui` session created with the ORCH-P launch
-   args, does the canary / `~/.ssh` / `~/.codex/auth.json` / `.env` read fail and the network stay
-   closed? Do `-c permissions.*` args reach the app-server that runs the commands (the code passes
-   `default_permissions` through `normalize_codex_permission_launch_args`)? Is `approval_policy`
-   honoured so the headless session never stalls?
-2. Omnigent copies `~/.codex/config.toml` into a private `CODEX_HOME` per session, so the
-   `--ignore-user-config` of `codex exec` is lost: which user settings (MCP servers, profiles)
-   reach the session, and can `minimal_config` be selected?
-3. Which `TMPDIR` does the session use (the profile denies `/tmp`; BE builds need a writable temp)?
-4. Does `GET /v1/agents` list `codex-native-ui` before first use, and what do `/v1/hosts` and the
-   list envelopes look like? Does the session reach `idle` after the turn, and how does a Codex
-   approval-mode change show in labels and items?
-5. Does `claude-native` start under `linux_bwrap` in WSL with Claude subscription login (HOME is
-   not mounted)? If not, coordinator and reviewer are BLOCKED; they must not fall back to
-   `sandbox: none`.
-6. Is `node` reachable inside that sandbox (`/usr` only; an nvm node under `$HOME` is not)?
-7. Does `review-record` from the reviewer session see `CLAUDECODE=1` and a `claude` process in its
-   ancestry inside the sandbox's pid namespace?
-8. Does `cel_policy` compile both expressions (raw strings, `matches`, `has` on map keys), do
-   native tool names arrive as `Bash` / `Read` / `Write` with `command` / `file_path`, and does an
-   ASK on the request write show its content?
-9. Can a sandboxed agent shell reach `127.0.0.1:6767`? If yes, it could call the unauthenticated
-   local API (e.g. approve its own ASK); the allowlists forbid every such command, but that is a
-   policy, not a kernel boundary.
-10. Exactly what leaves the machine with all opt-outs set, and which files outside `~/.omnigent`
-    are written (hooks in `~/.claude`, `~/.codex`)?
+Each question has a design answer in place (2026-10-14); O1 confirms it with evidence.
+
+| # | Question | Expected | In place now | O1 confirms with |
+|---|---|---|---|---|
+| 1 | Does the Step 0 profile hold in an Omnigent Codex session (`-c permissions.*` reaching the app-server, no approval stall)? | Partly unknown | `orchestrate/step0-omnigent.mjs`: a session created exactly like `implement` runs a check script (canary, SSH key, `~/.codex/auth.json`, `~/.omnigent`, BE `.env`, write outside, network, loopback to Omnigent, credential env vars, private TMPDIR). `implement` (`runner: omnigent`) refuses unless that report is READY for the pinned Omnigent and the installed Codex | One run of `step0-omnigent.mjs` (one model call) |
+| 2 | Which `~/.codex/config.toml` settings reach the session (no `--ignore-user-config`)? | All of them | `implement` refuses a user config with `mcp_servers`, `notify`, `hooks`, `profiles`/`profile`, a top-level sandbox/approval setting or a model provider | The session's private config in `~/.omnigent` |
+| 3 | Environment and `TMPDIR` of the session's commands | The daemon's environment | Launch args `shell_environment_policy.inherit="core"`, default excludes kept, `set.TMPDIR` = the run's private temp dir | `ENV_CREDENTIALS` / `PRIVATE_TMPDIR` in check 1 |
+| 4 | REST list envelopes, `codex-native-ui` listed, host fields, status transitions | `{data: [...]}`; idle after the turn | Client reads `data`/`items`/bare arrays; `cockpit.mjs probe-api` (GET only, no model) records real responses and their shapes in `runs/omnigent-api/` and checks agent and host | `probe-api`, then the stub follows the recorded shapes |
+| 5 | `claude-native` in `linux_bwrap` with `$HOME` unmounted | Fails without its login files | Both agents get `write_paths` `~/.claude`, `write_files` `~/.claude.json`, `cwd_allow_hidden` `.claude`, `.credentials.json`; the CEL allowlist still denies every Read/Write of a dot-path, so only the Claude process uses them | Starting each agent |
+| 6 | `node` inside that sandbox | nvm under `$HOME` is invisible | `read_paths: ["~/.nvm"]` (+ `.nvm` unmasked) | `status` from the coordinator |
+| 7 | `review-record` provenance from the reviewer session | Passes (Claude in the same pid namespace sets `CLAUDECODE=1`) | No change | One `review-record` on the pilot |
+| 8 | Do the CEL expressions compile; does the ASK show the request? | Compile | Request writes: `Write` only (edits denied), ASK reason = `"Run this ORCH-P request? " + content`. `tests/cel_check.py` evaluates both allowlists on sample events; the tests run where cel-python and PyYAML exist (the Omnigent venv) and skip elsewhere | `./harness/verify.sh` after install (tests no longer skipped) |
+| 9 | Can a sandboxed **Claude** agent shell reach `127.0.0.1:6767` (unauthenticated local API)? | Yes (`allow_network` defaults to true; Claude needs the network) | Codex sessions: network denied by the profile, checked by `LOOPBACK_OMNIGENT` in check 1. Claude agents: their shell allowlists forbid every network command — a policy, not a kernel boundary | Whether the local server can require a token (accounts mode) or the agent sandbox takes egress rules that exclude loopback; adopt whichever exists |
+| 10 | Data leaving the machine; files written outside `~/.omnigent` | Telemetry off; hooks written into agent settings | `cockpit.mjs start` hashes `~/.claude/settings*.json`, `~/.codex/config.toml`, `~/.codex/hooks.json` before and after each session, warns and logs changes to `runs/omnigent-config-changes.jsonl` | `ss`/`strace` during one session |
 
 ## Re-evaluation triggers
 

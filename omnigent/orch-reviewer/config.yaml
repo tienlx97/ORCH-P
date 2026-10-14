@@ -42,8 +42,14 @@ os_env:
   cwd: .
   sandbox:
     type: linux_bwrap
-    write_paths: ["ORCH-P/runs"]
-    cwd_allow_hidden: [".git"]
+    # Claude's own login and state (~/.claude, ~/.claude.json) and the nvm node
+    # for `node ORCH-P/...`; $HOME is otherwise not mounted. The tool allowlist
+    # still denies every Read/Write of a dot-path, so only the Claude process
+    # itself uses them.
+    read_paths: ["~/.nvm"]
+    write_paths: ["ORCH-P/runs", "~/.claude"]
+    write_files: ["~/.claude.json"]
+    cwd_allow_hidden: [".git", ".nvm", ".claude", ".credentials.json"]
 
 guardrails:
   policies:

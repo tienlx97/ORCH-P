@@ -4,6 +4,7 @@
 //   node orchestrate/cockpit.mjs lint     static checks of omnigent/ (harness/verify.sh runs this)
 //   node orchestrate/cockpit.mjs check    lint + pin approval + installed version + telemetry config
 //   node orchestrate/cockpit.mjs start [coordinator|reviewer]   check, then that agent's session (from the workspace root)
+//   node orchestrate/cockpit.mjs probe-api   read-only GETs against the running server; records the real response shapes
 //
 // Omnigent is a pinned, separately installed third-party platform
 // (tools/omnigent/.venv, see docs/omnigent-evaluation.md#install). Nothing
@@ -11,11 +12,13 @@
 // (AGENTS.md rule 7). The environment is an allowlist with every opt-out set;
 // API keys and gateway variables never reach it.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { lintBundle, omnigentEnv, parseVersion, readPin } from './lib/omnigent.mjs';
+import { loopbackUrl } from './lib/omnigent-runner.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ORCH_REPO = resolve(HERE, '..');
@@ -45,6 +48,57 @@ export function startProblems({ bundle = BUNDLE, bin = BIN, env = omnigentEnv() 
   return problems;
 }
 
+// Agent settings outside ~/.omnigent that a platform could change (hooks,
+// MCP servers, permission defaults). Hashed around every session.
+export const WATCHED_CONFIG = ['.claude/settings.json', '.claude/settings.local.json', '.codex/config.toml', '.codex/hooks.json'];
+
+export function configSnapshot(home) {
+  return Object.fromEntries(WATCHED_CONFIG.map((rel) => {
+    const file = join(home ?? '', rel);
+    return [rel, existsSync(file) ? createHash('sha256').update(readFileSync(file)).digest('hex') : null];
+  }));
+}
+
+/** Files whose hash differs between two snapshots. */
+export function configChanges(before, after) {
+  return WATCHED_CONFIG.filter((rel) => before[rel] !== after[rel]);
+}
+
+/** Shape of a JSON value without its data: keys and types, arrays as their first element. */
+export function shapeOf(value, depth = 0) {
+  if (Array.isArray(value)) return value.length ? [shapeOf(value[0], depth + 1)] : [];
+  if (value && typeof value === 'object') {
+    if (depth > 4) return 'object';
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, shapeOf(v, depth + 1)]));
+  }
+  return value === null ? 'null' : typeof value;
+}
+
+/**
+ * O1: what /v1/agents and /v1/hosts really return, so the REST stub and
+ * lib/omnigent-runner.mjs can be checked against it. GET only; no model call.
+ */
+export async function probeApi({ url = process.env.ORCH_OMNIGENT_URL, outDir = join(ORCH_REPO, 'runs', 'omnigent-api'), fetchImpl = fetch } = {}) {
+  const base = loopbackUrl(url ?? undefined);
+  mkdirSync(outDir, { recursive: true, mode: 0o700 });
+  const found = {};
+  for (const name of ['agents', 'hosts']) {
+    const response = await fetchImpl(`${base}/v1/${name}`, { redirect: 'error' });
+    const body = response.ok ? await response.json() : null;
+    writeFileSync(join(outDir, `${name}.json`), `${JSON.stringify({ status: response.status, body }, null, 2)}\n`, { mode: 0o600 });
+    writeFileSync(join(outDir, `${name}.shape.json`), `${JSON.stringify(shapeOf(body), null, 2)}\n`, { mode: 0o600 });
+    found[name] = { status: response.status, body };
+  }
+  const list = (b) => (Array.isArray(b) ? b : b?.data ?? b?.items ?? b?.agents ?? b?.hosts ?? []);
+  const agents = list(found.agents.body);
+  const hosts = list(found.hosts.body);
+  const problems = [];
+  if (!agents.some((a) => (a?.name ?? a?.agent_name) === 'codex-native-ui')) problems.push('no agent named codex-native-ui in /v1/agents (set ORCH_OMNIGENT_CODEX_AGENT or resolve it first)');
+  const online = hosts.filter((h) => h?.online === true || h?.status === 'online' || h?.connected === true);
+  if (online.length !== 1) problems.push(`expected exactly one online host in /v1/hosts, found ${online.length} (set ORCH_OMNIGENT_HOST)`);
+  return { problems, outDir, agents: agents.length, hosts: hosts.length };
+}
+
 function report(problems, ok) {
   for (const p of problems) console.error(`refused: ${p}`);
   if (problems.length === 0) console.log(ok);
@@ -54,6 +108,10 @@ function report(problems, ok) {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [command, ...rest] = process.argv.slice(2);
   const agent = command === 'start' ? AGENTS[rest[0] ?? 'coordinator'] : null;
+  if (!['lint', 'check', 'start', 'probe-api'].includes(command)) {
+    console.error('usage: node orchestrate/cockpit.mjs lint|check|start [coordinator|reviewer]|probe-api');
+    process.exit(2);
+  }
   if (command === 'start' ? rest.length > 1 || !agent : rest.length) process.exit(report([`unexpected arguments: ${rest.join(' ')}`]));
   if (command === 'lint') {
     const problems = lintBundle(BUNDLE);
@@ -62,15 +120,27 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.exit(problems.length === 0 ? 0 : 1);
   }
   if (command === 'check') process.exit(report(startProblems(), 'cockpit: ready to start'));
-  if (command === 'start') {
-    const env = omnigentEnv();
-    const code = report(startProblems({ env }), `cockpit: starting ${agent} on the loopback server`);
-    if (code !== 0) process.exit(code);
-    // An agent sandbox can only bind write paths that exist.
-    for (const dir of ['proposals', 'requests', 'reviews']) mkdirSync(join(ORCH_REPO, 'runs', dir), { recursive: true, mode: 0o700 });
-    const result = spawnSync(BIN, ['run', agent], { stdio: 'inherit', env, cwd: WORKSPACE });
-    process.exit(result.error ? 127 : result.status ?? (result.signal ? 128 : 1));
+  if (command === 'probe-api') {
+    try {
+      const { problems, outDir, agents, hosts } = await probeApi();
+      console.log(`probe-api: ${agents} agents, ${hosts} hosts; responses and shapes in ${outDir}`);
+      process.exit(report(problems, 'probe-api: the runner can resolve the Codex agent and the host'));
+    } catch (error) {
+      console.error(`refused: ${error.message}`);
+      process.exit(2);
+    }
   }
-  console.error('usage: node orchestrate/cockpit.mjs lint|check|start [coordinator|reviewer]');
-  process.exit(2);
+  const env = omnigentEnv();
+  const code = report(startProblems({ env }), `cockpit: starting ${agent} on the loopback server`);
+  if (code !== 0) process.exit(code);
+  // An agent sandbox can only bind write paths that exist.
+  for (const dir of ['proposals', 'requests', 'reviews']) mkdirSync(join(ORCH_REPO, 'runs', dir), { recursive: true, mode: 0o700 });
+  const before = configSnapshot(env.HOME);
+  const result = spawnSync(BIN, ['run', agent], { stdio: 'inherit', env, cwd: WORKSPACE });
+  const changed = configChanges(before, configSnapshot(env.HOME));
+  if (changed.length) {
+    appendFileSync(join(ORCH_REPO, 'runs', 'omnigent-config-changes.jsonl'), `${JSON.stringify({ at: new Date().toISOString(), agent, changed })}\n`, { mode: 0o600 });
+    console.error(`WARNING: the Omnigent session changed ${changed.map((c) => `~/${c}`).join(', ')}; review them (hooks, MCP servers, permissions) before the next run`);
+  }
+  process.exit(result.error ? 127 : result.status ?? (result.signal ? 128 : 1));
 }
