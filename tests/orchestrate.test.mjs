@@ -3,9 +3,10 @@
 // FE-P, a stub `codex` binary (no model calls, no quota), and `git` / `gh`
 // wrappers that log every invocation so the tests can prove nothing is pushed.
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import {
-  appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -16,6 +17,7 @@ import {
   buildFilesystemPolicy, deniedBy, gateFindings, globToRegExp, hiddenToolchain, matchesAny, profileArgs, reviewProvenance,
   sanitizedEnv, scanSecrets,
 } from '../orchestrate/orchestrate.mjs';
+import { agentHudBin, hudEnv } from '../orchestrate/hud.mjs';
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'orchestrate', 'orchestrate.mjs');
 // Not under /tmp: the generated sandbox profile denies /tmp, and implement
@@ -92,8 +94,18 @@ for (const [file, content] of Object.entries(plan.write ?? {})) {
   fs.mkdirSync(path.dirname(path.join(cwd, file)), { recursive: true });
   fs.writeFileSync(path.join(cwd, file), content);
 }
+// plan.stream: live steps before the final turn — raw text, a JSON event, waiting
+// for a release file in HOME ("{side}" → be/fe from the worktree name), a pause.
+const side = cwd.endsWith('-fe') ? 'fe' : 'be';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 process.stdin.resume(); process.stdin.on('data', () => {});
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
+  for (const step of plan.stream ?? []) {
+    if (step.raw !== undefined) process.stdout.write(step.raw);
+    if (step.event) process.stdout.write(JSON.stringify(step.event) + '\\n');
+    if (step.wait) while (!fs.existsSync(path.join(process.env.HOME, step.wait.replace('{side}', side)))) await sleep(20);
+    if (step.sleep) await sleep(step.sleep);
+  }
   process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }) + '\\n');
   if (plan.leak) process.stdout.write(plan.leak + '\\n');
   const o = args[args.indexOf('-o') + 1]; if (o) fs.writeFileSync(o, '{"status":"implemented"}');
@@ -156,27 +168,28 @@ function setup(overrides = {}) {
 }
 
 function orch(ctx, args, env = {}) {
-  return spawnSync(process.execPath, [CLI, ...args], {
-    encoding: 'utf8',
-    env: {
-      ...GIT_ENV,
-      PATH: `${join(root, 'bin')}:${process.env.PATH}`,
-      HOME: join(root, 'home'),
-      GIT_CONFIG_GLOBAL: '/dev/null',
-      GIT_CONFIG_NOSYSTEM: '1',
-      GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@l', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@l',
-      ORCH_BE_REPO: ctx.be,
-      ORCH_FE_REPO: ctx.fe,
-      ORCH_WORKTREE_ROOT: join(ctx.ws, 'worktrees'),
-      ORCH_STATE_ROOT: join(ctx.ws, 'state'),
-      ORCH_MODEL_CATALOG: join(root, 'catalog.json'),
-      ORCH_STEP0_REPORT: join(root, 'step0-ready.json'),
-      ORCH_GATE_RUNNER: join(root, 'gate-runner.mjs'),
-      FAKE_API_KEY: 'should-never-reach-codex',
-      SSH_AUTH_SOCK: '/tmp/fake-agent.sock',
-      ...env,
-    },
-  });
+  return spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8', env: orchEnv(ctx, env) });
+}
+
+function orchEnv(ctx, env = {}) {
+  return {
+    ...GIT_ENV,
+    PATH: `${join(root, 'bin')}:${process.env.PATH}`,
+    HOME: join(root, 'home'),
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@l', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@l',
+    ORCH_BE_REPO: ctx.be,
+    ORCH_FE_REPO: ctx.fe,
+    ORCH_WORKTREE_ROOT: join(ctx.ws, 'worktrees'),
+    ORCH_STATE_ROOT: join(ctx.ws, 'state'),
+    ORCH_MODEL_CATALOG: join(root, 'catalog.json'),
+    ORCH_STEP0_REPORT: join(root, 'step0-ready.json'),
+    ORCH_GATE_RUNNER: join(root, 'gate-runner.mjs'),
+    FAKE_API_KEY: 'should-never-reach-codex',
+    SSH_AUTH_SOCK: '/tmp/fake-agent.sock',
+    ...env,
+  };
 }
 
 function state(ctx) {
@@ -682,4 +695,216 @@ test('an infrastructure failure of the gate is not sent to Codex as rework', () 
   assert.equal(r.status, 70);
   assert.match(r.stderr, /infrastructure failure/);
   assert.deepEqual(state(ctx).sides.be.rework, []);
+});
+
+// ── live observability ───────────────────────────────────────────────────
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const cmdEvent = (id, command, phase = 'started', extra = {}) => ({
+  type: `item.${phase}`, item: { id, type: 'command_execution', command, aggregated_output: '', exit_code: null, status: 'in_progress', ...extra },
+});
+
+/** `implement` (or another command) as a background process. */
+function orchAsync(ctx, args, env = {}) {
+  const child = spawn(process.execPath, [CLI, ...args], { env: orchEnv(ctx, env), stdio: ['ignore', 'pipe', 'pipe'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.stderr.on('data', (d) => { out += d; });
+  const done = once(child, 'exit').then(([code, signal]) => ({ code, signal, out }));
+  return { child, done };
+}
+
+function live(ctx, side) {
+  return JSON.parse(orch(ctx, ['status', ctx.taskFile]).stdout).sides[side].live;
+}
+
+async function waitFor(what, fn, ms = 15_000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const value = fn();
+    if (value) return value;
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
+    await sleepMs(50);
+  }
+}
+
+const hudFiles = (ctx) => {
+  const files = [];
+  const walk = (dir) => { if (!existsSync(dir)) return; for (const n of readdirSync(dir, { withFileTypes: true })) { const p = join(dir, n.name); if (n.isDirectory()) walk(p); else files.push(p); } };
+  walk(join(ctx.ws, 'state', 'agenthud', 'codex'));
+  return files;
+};
+const liveText = (ctx) => {
+  const liveDir = join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'live');
+  const files = [...hudFiles(ctx)];
+  for (const sub of ['streams', 'agents']) if (existsSync(join(liveDir, sub))) for (const n of readdirSync(join(liveDir, sub))) files.push(join(liveDir, sub, n));
+  return files.map((f) => readFileSync(f, 'utf8')).join('\n');
+};
+
+test('live: an agent event is visible in status, the stream and AgentHUD before codex exits', async () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  rmSync(join(root, 'home', 'release-be'), { force: true });
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({
+    write: { 'src/app.txt': 'v2\n' },
+    stream: [
+      { event: { type: 'thread.started', thread_id: 't' } },
+      { event: cmdEvent('item_0', '/bin/bash -c "dotnet build --no-restore -m:1 X.sln"') },
+      { wait: 'release-{side}' },
+      { event: cmdEvent('item_0', '/bin/bash -c "dotnet build"', 'completed', { exit_code: 0, status: 'completed' }) },
+      { event: { type: 'item.completed', item: { id: 'item_1', type: 'file_change', status: 'completed', changes: [{ path: 'src/app.txt', kind: 'update' }] } } },
+    ],
+  }));
+  const run = orchAsync(ctx, ['implement', ctx.taskFile, 'be']);
+  const running = await waitFor('RUNNING with dotnet build', () => { const l = live(ctx, 'be'); return l.status === 'RUNNING' && l.current?.label === 'dotnet build' ? l : null; });
+  assert.equal(run.child.exitCode, null, 'orchestrator still running');
+  assert.equal(running.state, 'running');
+  assert.equal(running.model, 'test-model');
+  assert.equal(running.effort, 'high');
+  assert.equal(running.attempt, 1);
+  const hud = hudFiles(ctx).filter((f) => f.endsWith('-be.jsonl'));
+  assert.equal(hud.length, 1, 'one AgentHUD session per agent (prepare made one per side)');
+  const recs = readFileSync(hud[0], 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(recs.some((r) => r.payload?.name === 'exec_command' && JSON.parse(r.payload.arguments).cmd === 'dotnet build'), 'tool call in AgentHUD before exit');
+  assert.ok(recs.some((r) => r.payload?.type === 'user_message' && r.payload.message.startsWith('[running] ORCH-T')));
+  writeFileSync(join(root, 'home', 'release-be'), '');
+  const result = await run.done;
+  assert.equal(result.code, 0, result.out);
+  const done = live(ctx, 'be');
+  assert.deepEqual([done.status, done.state, done.next], ['IDLE', 'idle', 'check']);
+  assert.deepEqual(done.counts, { commands: 1, failed_commands: 0, files_changed: 1, messages: 0, anomalies: 0 });
+  assert.deepEqual(done.last_file, { ...done.last_file, path: 'src/app.txt', in_scope: true });
+  assert.deepEqual(done.usage, { input_tokens: 10, output_tokens: 2 });
+  assert.equal(state(ctx).sides.be.steps.implement.exit, 0, 'evidence path unchanged');
+  for (const step of ['check', 'verify', 'commit']) assert.equal(orch(ctx, [step, ctx.taskFile, 'be']).status, 0);
+  assert.deepEqual([live(ctx, 'be').state, live(ctx, 'be').next], ['waiting_review', 'review']);
+  assert.equal(live(ctx, 'fe').status, 'IDLE', 'fe was only prepared');
+});
+
+test('live: concurrent BE and FE implement stay isolated and neither loses its state', async () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  for (const s of ['be', 'fe']) rmSync(join(root, 'home', `release-${s}`), { force: true });
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({
+    write: { 'src/app.txt': 'v2\n' },
+    stream: [{ event: cmdEvent('item_0', '/bin/bash -c "ls"') }, { wait: 'release-{side}' }],
+  }));
+  const be = orchAsync(ctx, ['implement', ctx.taskFile, 'be']);
+  const fe = orchAsync(ctx, ['implement', ctx.taskFile, 'fe']);
+  await waitFor('both RUNNING', () => live(ctx, 'be').status === 'RUNNING' && live(ctx, 'fe').status === 'RUNNING');
+  // FE finishes first; BE loaded the state before FE saved it.
+  writeFileSync(join(root, 'home', 'release-fe'), '');
+  assert.equal((await fe.done).code, 0);
+  writeFileSync(join(root, 'home', 'release-be'), '');
+  assert.equal((await be.done).code, 0);
+  const s = state(ctx);
+  assert.equal(s.sides.be.steps.implement.exit, 0);
+  assert.equal(s.sides.fe.steps.implement.exit, 0, 'FE implement survived the later BE save');
+  assert.equal(s.log.filter((e) => e.step === 'implement').length, 2);
+  const streams = readdirSync(join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'live', 'streams')).filter((n) => n.includes('-implement-'));
+  assert.deepEqual(streams.map((n) => n.slice(-9)).sort(), ['be.ndjson', 'fe.ndjson']);
+  assert.equal(hudFiles(ctx).filter((f) => /-(be|fe)\.jsonl$/.test(f)).length, 2);
+  assert.ok(!existsSync(join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'state.json.lock')), 'lock released');
+});
+
+test('live: secrets, terminal escapes, outside paths and malformed lines never reach observers', async () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const token = `${'gh'}p_${'c'.repeat(36)}`;
+  const esc = String.fromCharCode(27);
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({
+    write: { 'src/app.txt': 'v2\n' },
+    stream: [
+      { event: cmdEvent('item_0', `/bin/bash -c "curl -H 'Authorization: Bearer ${token}' ${esc}]0;owned${esc}\\\\ x"`) },
+      { event: { type: 'item.completed', item: { id: 'item_1', type: 'agent_message', text: `here is ${token} ${esc}[2J` } } },
+      { event: { type: 'item.completed', item: { id: 'item_2', type: 'file_change', status: 'completed', changes: [{ path: `src/${esc}[31mx.txt`, kind: 'add' }, { path: '/home/someone/.ssh/id_rsa', kind: 'update' }] } } },
+      { raw: '{"type": "item.started", "item": \n' },
+      { raw: `${'z'.repeat(1_100_000)}\n` },
+      { event: { type: 'turn.failed', error: { message: `quota ${token}` } } },
+    ],
+  }));
+  const r = await orchAsync(ctx, ['implement', ctx.taskFile, 'be']).done;
+  assert.notEqual(r.code, 0, 'raw output held a secret: the side is blocked as before');
+  assert.ok(!r.out.includes(token));
+  const text = liveText(ctx);
+  assert.ok(!text.includes(token), 'no secret in live files');
+  assert.ok(!text.includes(esc), 'no escape character in live files');
+  assert.ok(!text.includes('.ssh') && !text.includes('owned') && !text.includes('Authorization'), 'no arguments, no outside paths');
+  assert.match(text, /<outside-worktree>/);
+  const l = live(ctx, 'be');
+  assert.equal(l.state, 'blocked');
+  assert.equal(l.counts.anomalies, 2, 'one malformed and one oversized line');
+  assert.equal(state(ctx).sides.be.status, 'blocked');
+});
+
+test('live: timeout and SIGTERM keep run() exit codes and record why codex stopped', async () => {
+  let ctx = setup();
+  ctx.task.sides.be.timeout_minutes = 0.005;
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  orch(ctx, ['prepare', ctx.taskFile]);
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ stream: [{ sleep: 20_000 }] }));
+  let r = await orchAsync(ctx, ['implement', ctx.taskFile, 'be']).done;
+  assert.equal(r.code, 127, 'timeout → 127, as spawnSync reported it');
+  let step = state(ctx).sides.be.steps.implement;
+  assert.deepEqual([step.exit, step.signal, step.timed_out], [127, 'SIGTERM', true]);
+  assert.deepEqual([live(ctx, 'be').state, live(ctx, 'be').summary], ['failed', 'codex exit 127 (timed out)']);
+
+  ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  rmSync(join(root, 'home', 'release-never'), { force: true });
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ stream: [{ event: cmdEvent('item_0', 'sleep 100') }, { wait: 'release-never' }] }));
+  const run = orchAsync(ctx, ['implement', ctx.taskFile, 'be']);
+  await waitFor('RUNNING', () => live(ctx, 'be').status === 'RUNNING');
+  run.child.kill('SIGTERM');
+  r = await run.done;
+  assert.equal(r.code, 128, 'codex killed by the forwarded SIGTERM → 128');
+  step = state(ctx).sides.be.steps.implement;
+  assert.deepEqual([step.exit, step.signal, step.interrupted], [128, 'SIGTERM', 'SIGTERM']);
+  assert.equal(live(ctx, 'be').state, 'failed');
+});
+
+test('live: a killed orchestrator shows ORPHANED, a refusal mid-command keeps the previous state', async () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  rmSync(join(root, 'home', 'release-orphan'), { force: true });
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ stream: [{ event: cmdEvent('item_0', 'ls') }, { wait: 'release-orphan' }] }));
+  const run = orchAsync(ctx, ['implement', ctx.taskFile, 'be']);
+  await waitFor('RUNNING', () => live(ctx, 'be').status === 'RUNNING');
+  run.child.kill('SIGKILL');
+  await run.done;
+  const orphan = live(ctx, 'be');
+  assert.equal(orphan.status, 'ORPHANED');
+  assert.match(orphan.reason, /did not record a result/);
+  writeFileSync(join(root, 'home', 'release-orphan'), ''); // let the stub codex exit
+  // check refuses after it started (the worktree's Git link is gone): the side stays as it was.
+  const wt = state(ctx).sides.fe.worktree;
+  rmSync(join(wt, '.git'));
+  const c = orch(ctx, ['check', ctx.taskFile, 'fe']);
+  assert.equal(c.status, 2, c.stderr);
+  const fe = live(ctx, 'fe');
+  assert.deepEqual([fe.status, fe.state], ['IDLE', 'idle']);
+  assert.match(fe.summary, /check ended without a result/);
+});
+
+test('live: AgentHUD renders the sanitized projection (when the pinned AgentHUD is installed)', { skip: !existsSync(join(dirname(CLI), '..', 'tools', 'agenthud', 'node_modules', 'agenthud', 'package.json')) && 'tools/agenthud not installed' }, () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'v2\n' }, stream: [{ event: cmdEvent('item_0', '/bin/bash -c "dotnet build"') }] }));
+  assert.equal(orch(ctx, ['implement', ctx.taskFile, 'be']).status, 0);
+  const hud = spawnSync(process.execPath, [join(dirname(CLI), 'hud.mjs'), '--once'], {
+    encoding: 'utf8', env: { PATH: process.env.PATH, TERM: 'dumb', COLUMNS: '160', ORCH_HUD_ROOT: join(ctx.ws, 'state', 'agenthud') }, timeout: 30_000,
+  });
+  assert.equal(hud.status, 0, hud.stderr);
+  assert.match(hud.stdout, /\[idle\] ORCH-T\d+ · be/);
+  // AgentHUD parses the activity as Codex (`report` is test-only here: hud.mjs refuses it).
+  const hudRoot = join(ctx.ws, 'state', 'agenthud');
+  const report = spawnSync(process.execPath, [agentHudBin().bin, 'report', '--format', 'json', '--include', 'all'], {
+    encoding: 'utf8', env: hudEnv({ PATH: process.env.PATH }, hudRoot), cwd: hudRoot, timeout: 30_000,
+  });
+  assert.equal(report.status, 0, report.stderr);
+  const activity = JSON.stringify(JSON.parse(report.stdout));
+  assert.match(activity, /dotnet build/);
+  assert.match(activity, /codex finished; next: check/);
+  const refused = spawnSync(process.execPath, [join(dirname(CLI), 'hud.mjs'), 'summary'], { encoding: 'utf8' });
+  assert.equal(refused.status, 2);
+  assert.match(refused.stderr, /only the live view/);
 });

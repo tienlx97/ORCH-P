@@ -16,7 +16,9 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
 ## Layout
 
 - `orchestrate/` — `orchestrate.mjs` (commands), `step0-probe.mjs` (sandbox verification),
-  `prompt.md`, `report.schema.json`, `task.example.json`.
+  `prompt.md`, `report.schema.json`, `task.example.json`; `lib/` live observability (sanitized
+  events, agent snapshots, AgentHUD projection) and `hud.mjs` (AgentHUD launcher).
+- `tools/agenthud/` — pinned AgentHUD manifest and lockfile (`npm ci --ignore-scripts --prefix tools/agenthud`).
 - `verify-container/` — verification image and `run-gate.mjs` (containerized BE/FE gates).
 - `tests/` — stub-based tests (no model calls, no Docker); `harness/` — this repo's gate.
 - `runs/` — run state and evidence (gitignored).

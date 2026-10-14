@@ -12,14 +12,23 @@
 // code path for it, and tests/orchestrate.test.mjs asserts that no
 // `git push` or `gh` call happens. Local commits happen only after `verify`
 // passed on exactly the tree being committed.
-import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { spawn, spawnSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import {
-  cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync, writeFileSync,
+  closeSync, cpSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, realpathSync, rmSync, statSync,
+  writeFileSync, writeSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import {
+  AgentObserver, deriveLive, HEARTBEAT_MS, openObservers, readJson, snapshotPath, withLock, writeJsonAtomic,
+} from './lib/agent-state.mjs';
+import { codexProjector, lineSplitter } from './lib/event-stream.mjs';
+import { scanSecrets } from './lib/secrets.mjs';
+
+export { scanSecrets };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ORCH_REPO = resolve(HERE, '..');
@@ -36,19 +45,8 @@ const CODEX = process.env.ORCH_CODEX_BIN ?? 'codex';
 // Agent-written code is verified only inside containers (harness/verify-container).
 const GATE_RUNNER = process.env.ORCH_GATE_RUNNER ?? join(HERE, '..', 'verify-container', 'run-gate.mjs');
 const REPOS = { be: BE_REPO, fe: FE_REPO };
-
-// Same patterns as harness/checks/memory-secrets.sh, plus connection-string
-// passwords, bearer/JWT tokens and generic assignments. Defense in depth only:
-// the sandbox and the environment allowlist are the primary controls.
-const SECRET_PATTERNS = [
-  /-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----/,
-  /AKIA[0-9A-Z]{16}/,
-  /gh[pousr]_[A-Za-z0-9_]{30,}/,
-  /sk-[A-Za-z0-9_-]{20,}/,
-  /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
-  /(?:^|[;"'\s])(?:Password|Pwd)\s*=\s*[^;"'\s]{4,}/i,
-  /(?:api[_-]?key|secret|token)\s*[:=]\s*["']?[A-Za-z0-9_\-/+]{16,}/i,
-];
+// Sanitized AgentHUD projection of the live events (orchestrate/hud.mjs).
+const HUD_ROOT = resolve(process.env.ORCH_HUD_ROOT ?? join(STATE_ROOT, 'agenthud'));
 
 // Paths no implementation agent may change unless the approved task names
 // them in `protected_paths_override` (gates, CI, credentials, lockfiles).
@@ -171,6 +169,81 @@ function run(command, args, options = {}) {
   };
 }
 
+export const STREAM_MAX_BYTES = 256 * 1024 * 1024;
+
+/**
+ * `run()` for a long child whose output must be observable while it runs:
+ * stdout and stderr stream into `stdoutFile` / `stderrFile` (0600) and stdout
+ * chunks go to `onStdout`. The exit mapping is run()'s, unchanged: spawn
+ * error, timeout or output over `maxBytes` (spawnSync's ENOBUFS) → 127, a
+ * signal → 128, otherwise the child's own code. SIGINT/SIGTERM/SIGHUP to this
+ * process are passed to the child as SIGTERM (a second one sends SIGKILL), so
+ * the run still ends with a recorded result.
+ */
+export function runStreaming(command, args, {
+  input = '', env, cwd, timeout = 0, killSignal = 'SIGTERM', stdoutFile, stderrFile, maxBytes = STREAM_MAX_BYTES,
+  onStdout = () => {}, heartbeatMs = HEARTBEAT_MS, onHeartbeat = () => {},
+} = {}) {
+  return new Promise((resolvePromise) => {
+    const fds = { out: openSync(stdoutFile, 'w', 0o600), err: openSync(stderrFile, 'w', 0o600) };
+    const bytes = { out: 0, err: 0 };
+    const handlers = [];
+    let timedOut = false;
+    let overflow = false;
+    let interrupted = null;
+    let spawnError = null;
+    let settled = false;
+    let timer = null;
+    let beat = null;
+    let child = null;
+    const finish = (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(beat);
+      for (const [sig, handler] of handlers) process.off(sig, handler);
+      if (spawnError && bytes.err === 0) writeSync(fds.err, String(spawnError));
+      closeSync(fds.out);
+      closeSync(fds.err);
+      resolvePromise({
+        status: spawnError || timedOut || overflow ? 127 : code ?? (signal ? 128 : 1),
+        signal: signal ?? null, timedOut, overflow, interrupted,
+      });
+    };
+    try {
+      child = spawn(command, args, { env, cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    } catch (error) {
+      spawnError = error;
+      finish(null, null);
+      return;
+    }
+    child.on('error', (error) => { spawnError = error; if (child.pid === undefined) finish(null, null); });
+    child.on('close', (code, signal) => finish(code, signal));
+    const sink = (key, forward) => (chunk) => {
+      if (overflow) return;
+      bytes[key] += chunk.length;
+      if (bytes[key] > maxBytes) { overflow = true; child.kill(killSignal); return; }
+      writeSync(fds[key], chunk);
+      forward?.(chunk);
+    };
+    child.stdout.on('data', sink('out', onStdout));
+    child.stderr.on('data', sink('err'));
+    child.stdin.on('error', () => { /* the child may exit without reading its prompt */ });
+    child.stdin.end(input);
+    if (timeout > 0) timer = setTimeout(() => { timedOut = true; child.kill(killSignal); }, timeout);
+    beat = setInterval(onHeartbeat, heartbeatMs);
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+      const handler = () => {
+        if (interrupted) { child.kill('SIGKILL'); return; }
+        interrupted = sig;
+        child.kill('SIGTERM');
+      };
+      handlers.push([sig, handler]);
+      process.on(sig, handler);
+    }
+  });
+}
+
 // Hooks are disabled for every orchestrator Git call: Step 0 showed the Codex
 // sandbox can write the shared .git directory, so a planted hook would
 // otherwise run outside the sandbox on the next commit.
@@ -225,15 +298,6 @@ export function globToRegExp(glob) {
 
 export function matchesAny(path, globs) {
   return globs.some((glob) => globToRegExp(glob).test(path));
-}
-
-/** Returns `file:line` locations of secret-looking text, never the text. */
-export function scanSecrets(text, label) {
-  const hits = [];
-  text.split('\n').forEach((line, index) => {
-    if (SECRET_PATTERNS.some((pattern) => pattern.test(line))) hits.push(`${label}:${index + 1}`);
-  });
-  return hits;
 }
 
 export function sanitizedEnv(source = process.env) {
@@ -311,12 +375,46 @@ function loadState(task, digest) {
   const state = JSON.parse(readFileSync(file, 'utf8'));
   // Approval binds to content: an edited task file needs a new approval and a new run.
   if (state.task_digest !== digest) refuse('task file changed since prepare; re-approve and prepare a new task id');
+  // How much of the log this process saw: saveState appends only what it added.
+  Object.defineProperty(state, 'loadedLog', { value: state.log.length, writable: true, enumerable: false });
   return state;
 }
 
-function saveState(task, state) {
+/**
+ * Saves the sides this command changed (`sides`, plus top-level `top` keys)
+ * onto the state as it is on disk now, under a lock, atomically. Commands on
+ * different sides run concurrently (BE and FE implement take up to an hour
+ * each), so writing back the whole state loaded at start would erase the
+ * other side's steps.
+ */
+function saveState(task, state, { sides = Object.keys(state.sides), top = [] } = {}) {
   mkdirSync(stateDir(task), { recursive: true });
-  writeFileSync(join(stateDir(task), 'state.json'), `${JSON.stringify(state, null, 2)}\n`);
+  const file = join(stateDir(task), 'state.json');
+  try {
+    withLock(`${file}.lock`, () => {
+      const disk = state.loadedLog === undefined ? null : readJson(file);
+      let next = state;
+      if (disk) {
+        next = { ...disk, sides: { ...disk.sides }, log: [...disk.log, ...state.log.slice(state.loadedLog)] };
+        for (const side of sides) next.sides[side] = state.sides[side];
+        for (const key of top) next[key] = state[key];
+      }
+      writeJsonAtomic(file, next);
+      if (state.loadedLog !== undefined) state.loadedLog = state.log.length;
+    });
+  } catch (error) {
+    refuse(`cannot save ${file}: ${error.message}`);
+  }
+}
+
+function observe(task, state, side, command) {
+  const spec = task.sides[side];
+  const attempts = state.log.filter((e) => e.side === side && e.step === 'implement').length;
+  return new AgentObserver({
+    liveDir: join(stateDir(task), 'live'), hudRoot: HUD_ROOT, taskId: task.id, runId: state.run_id ?? `${task.id}@${state.prepared_at}`,
+    side, command, attempt: command === 'implement' ? attempts + 1 : Math.max(attempts, 1),
+    provider: 'codex', model: spec.model, effort: spec.effort, preparedAt: state.prepared_at,
+  });
 }
 
 function recordStep(state, side, step, data) {
@@ -461,7 +559,7 @@ function cmdPrepare(taskPath) {
   const drift = Object.keys(task.sides).flatMap((side) => checkInterfaces(REPOS[side], task.base_revision[side], side));
   if (drift.length) refuse(`base revisions do not provide what ORCH-P needs:\n  - ${drift.join('\n  - ')}`);
   if (existsSync(join(stateDir(task), 'state.json'))) refuse(`task ${task.id} already prepared; use a new task id for a new run`);
-  const state = { id: task.id, task_digest: digest, orch: orchRevision(), prepared_at: now(), sides: {}, log: [], review: null };
+  const state = { id: task.id, run_id: randomUUID(), task_digest: digest, orch: orchRevision(), prepared_at: now(), sides: {}, log: [], review: null };
   mkdirSync(stateDir(task), { recursive: true });
   writeFileSync(join(stateDir(task), 'task.json'), readFileSync(taskPath));
   for (const side of Object.keys(task.sides)) {
@@ -469,10 +567,17 @@ function cmdPrepare(taskPath) {
     const branch = `agent/${task.id.toLowerCase()}-${side}`;
     if (existsSync(worktree)) refuse(`worktree path ${worktree} already exists`);
     if (git(REPOS[side], ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]).status === 0) refuse(`branch ${branch} already exists in ${REPOS[side]}`);
+    const obs = observe(task, state, side, 'prepare');
+    obs.start('preparing');
     const add = git(REPOS[side], ['worktree', 'add', '-b', branch, worktree, task.base_revision[side]]);
     state.sides[side] = { worktree, branch, base: task.base_revision[side], steps: {} };
     recordStep(state, side, 'worktree', { exit: add.status });
-    if (add.status !== 0) { saveState(task, state); console.error(add.stderr.trim()); return add.status; }
+    if (add.status !== 0) {
+      saveState(task, state);
+      obs.finish('failed', `git worktree add failed (exit ${add.status})`);
+      console.error(add.stderr.trim());
+      return add.status;
+    }
     if (side === 'be') {
       // Codex has no network, so without this it can neither build nor test.
       // The restore runs in a verification container with egress — the same
@@ -492,8 +597,14 @@ function cmdPrepare(taskPath) {
       const install = run('pnpm', ['install', '--frozen-lockfile', '--prefer-offline'], { cwd: worktree });
       writeFileSync(log, `${install.stdout}\n${install.stderr}`);
       recordStep(state, side, 'install', { exit: install.status, log });
-      if (install.status !== 0) { saveState(task, state); return install.status; }
+      if (install.status !== 0) {
+        saveState(task, state);
+        obs.finish('failed', `pnpm install failed (exit ${install.status})`);
+        return install.status;
+      }
     }
+    const restoreFailed = side === 'be' && state.sides[side].steps.restore?.exit !== 0;
+    obs.finish('idle', `prepared at ${task.base_revision[side].slice(0, 12)}${restoreFailed ? '; offline package restore FAILED (Codex cannot build)' : ''}; next: implement`, { next: 'implement' });
   }
   saveState(task, state);
   console.log(`prepared ${task.id}: ${Object.values(state.sides).map((s) => s.worktree).join(', ')}`);
@@ -541,7 +652,7 @@ function renderPrompt(task, side, spec, s) {
   return template.replace(/\{\{(\w+)\}\}/g, (_, key) => values[key] ?? '');
 }
 
-function cmdImplement(taskPath, side) {
+async function cmdImplement(taskPath, side) {
   const { task, digest } = loadTask(taskPath);
   const state = loadState(task, digest);
   const { spec, s } = sideOf(task, state, side);
@@ -570,21 +681,53 @@ function cmdImplement(taskPath, side) {
   writeFileSync(join(dir, 'command.json'), `${JSON.stringify({ bin: CODEX, args, env: [...Object.keys(sanitizedEnv()), 'TMPDIR'] }, null, 2)}\n`);
   const timeout = (spec.timeout_minutes ?? 60) * 60_000;
   const metadataBefore = gitMetadataDigest(s.worktree);
-  const result = run(CODEX, args, { input: prompt, env: { ...sanitizedEnv(), TMPDIR: tmpDir }, timeout, killSignal: 'SIGTERM' });
+  // Live view: the raw events go to events.jsonl as they arrive (the evidence,
+  // scanned below exactly as before); observers get only their sanitized projection.
+  const obs = observe(task, state, side, 'implement');
+  obs.start('running');
+  const project = codexProjector({ worktree: s.worktree, inScope: (p) => matchesAny(p, spec.allowed_paths) });
+  const splitter = lineSplitter({
+    onLine: (line) => {
+      let event;
+      try { event = JSON.parse(line); } catch { obs.emit('stream.anomaly', { reason: 'malformed' }); return; }
+      let projected;
+      try { projected = project(event); } catch { projected = [{ kind: 'stream.anomaly', reason: 'unprojectable' }]; }
+      for (const { kind, ...data } of projected) obs.emit(kind, data);
+    },
+    onOversized: () => obs.emit('stream.anomaly', { reason: 'oversized' }),
+  });
+  const result = await runStreaming(CODEX, args, {
+    input: prompt, env: { ...sanitizedEnv(), TMPDIR: tmpDir }, timeout, killSignal: 'SIGTERM',
+    stdoutFile: join(dir, 'events.jsonl'), stderrFile: join(dir, 'stderr.log'),
+    onStdout: (chunk) => splitter.push(chunk), onHeartbeat: () => obs.heartbeat(),
+  });
+  splitter.end();
   const metadataChanged = gitMetadataDigest(s.worktree) !== metadataBefore;
-  writeFileSync(join(dir, 'events.jsonl'), result.stdout);
-  writeFileSync(join(dir, 'stderr.log'), result.stderr);
   const hits = ['events.jsonl', 'stderr.log', 'last-message.md']
     .filter((f) => existsSync(join(dir, f)))
     .flatMap((f) => scanSecrets(readFileSync(join(dir, f), 'utf8'), f));
-  const usage = result.stdout.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+  const usage = readFileSync(join(dir, 'events.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
     .filter((e) => e?.type === 'turn.completed' && e.usage).map((e) => e.usage).pop() ?? null;
   recordStep(state, side, 'implement', {
     exit: result.status, signal: result.signal, dir, model: spec.model, effort: spec.effort, usage, secret_hits: hits,
     git_metadata_changed: metadataChanged,
+    ...(result.timedOut ? { timed_out: true } : {}), ...(result.interrupted ? { interrupted: result.interrupted } : {}),
+    ...(result.overflow ? { output_limit: true } : {}),
   });
   if (hits.length || metadataChanged) state.sides[side].status = 'blocked';
-  saveState(task, state);
+  saveState(task, state, { sides: [side] });
+  obs.emit('process.exit', {
+    exit: result.status, signal: result.signal, timed_out: result.timedOut, interrupted: result.interrupted, overflow: result.overflow,
+  });
+  if (hits.length || metadataChanged) {
+    obs.finish('blocked', metadataChanged ? 'Codex changed Git metadata; inspect the repository before any Git command'
+      : `secret-like text in Codex output (${hits.length} locations); inspect locally`, { exit: result.status });
+  } else if (result.status !== 0) {
+    const why = `${result.timedOut ? ' (timed out)' : ''}${result.interrupted ? ` (interrupted by ${result.interrupted})` : ''}`;
+    obs.finish('failed', `codex exit ${result.status}${why}`, { exit: result.status });
+  } else {
+    obs.finish('idle', 'codex finished; next: check', { exit: 0, next: 'check' });
+  }
   if (metadataChanged) {
     console.error('Codex changed Git metadata (config, hooks, info or refs) — run blocked; inspect the repository before any further Git command');
     return result.status || 1;
@@ -601,6 +744,8 @@ function cmdCheck(taskPath, side) {
   const { task, digest } = loadTask(taskPath);
   const state = loadState(task, digest);
   const { spec, s } = sideOf(task, state, side);
+  const obs = observe(task, state, side, 'check');
+  obs.start('checking');
   const paths = changedPaths(s.worktree, s.base);
   const override = spec.protected_paths_override ?? [];
   const outOfScope = paths.filter((p) => !matchesAny(p, spec.allowed_paths));
@@ -621,7 +766,13 @@ function cmdCheck(taskPath, side) {
     exit: ok ? 0 : 1, tree: worktreeTree(s.worktree), changed: paths, out_of_scope: outOfScope, protected: protectedHits, secret_hits: secretHits,
   });
   if (!ok) state.sides[side].status = 'blocked';
-  saveState(task, state);
+  saveState(task, state, { sides: [side] });
+  obs.emit('check', { exit: ok ? 0 : 1, changed: paths.length, out_of_scope: outOfScope.length, protected: protectedHits.length, secret_hits: secretHits.length });
+  if (ok) obs.finish('idle', `check passed (${paths.length} changed paths); next: verify`, { next: 'verify' });
+  else {
+    obs.finish('blocked', `check FAILED: ${paths.length} changed, ${outOfScope.length} outside allowed_paths, `
+      + `${protectedHits.length} protected, ${secretHits.length} secret-like`);
+  }
   if (paths.length === 0) console.error('no changes to check');
   if (outOfScope.length) console.error(`outside allowed_paths: ${outOfScope.join(', ')}`);
   if (protectedHits.length) console.error(`protected paths changed: ${protectedHits.join(', ')}`);
@@ -644,6 +795,8 @@ function cmdVerify(taskPath, side) {
   if (s.steps.check?.exit !== 0) refuse(`check must pass before verify (side ${side})`);
   const treeBefore = worktreeTree(s.worktree);
   if (s.steps.check.tree !== treeBefore) refuse(`worktree changed since check; run check again (side ${side})`);
+  const obs = observe(task, state, side, 'verify');
+  obs.start('verifying');
   const dir = join(stateDir(task), `${side}-verify-${Date.now()}`);
   mkdirSync(dir, { recursive: true });
   const record = join(dir, 'container-record.json');
@@ -677,7 +830,12 @@ function cmdVerify(taskPath, side) {
     if (freshness && freshness.exit !== 0) found.push({ severity: 'blocking', source: 'gate', summary: `harness/task.mjs status failed (exit ${freshness.exit}): task evidence is not fresh` });
   }
   s.rework = [...reviewFindings, ...found];
-  saveState(task, state);
+  saveState(task, state, { sides: [side] });
+  obs.emit('gate', { exit, gate_exit: gate.status, tree: treeBefore.slice(0, 12), tree_changed: treeAfter !== treeBefore, findings: found.length });
+  if (exit === 0) obs.finish('idle', `gate passed on tree ${treeBefore.slice(0, 12)}; next: commit`, { next: 'commit' });
+  else if (found.length) obs.finish('rework_required', `gate exit ${gate.status}: ${found.length} findings for rework; next: implement, check, verify`, { next: 'implement' });
+  else if (gate.status === 70) obs.finish('failed', 'gate infrastructure failure (exit 70); fix the environment and verify again');
+  else obs.finish('failed', `verify exit ${exit}`);
   if (treeAfter !== treeBefore) console.error('the gate changed the worktree; evidence is not bound to a stable tree');
   console.log(`verify ${side}: gate exit ${gate.status}; tree ${treeBefore.slice(0, 12)}; evidence ${evidence ?? 'NOT FOUND'}`);
   if (found.length) console.log(`verify ${side}: ${found.length} gate findings recorded for rework — run implement, check and verify ${side} again`);
@@ -693,6 +851,8 @@ function cmdCommit(taskPath, side) {
   if (!verified || verified.exit !== 0) refuse(`verify must pass before commit (side ${side})`);
   if (!verified.evidence) refuse('verification evidence was not preserved; refusing to commit');
   if (worktreeTree(s.worktree) !== verified.tree) refuse('worktree changed since verification; run check and verify again');
+  const obs = observe(task, state, side, 'commit');
+  obs.start('committing');
   const implement = s.steps.implement ?? {};
   const message = [
     `feat(${spec.change}): ${spec.objective}`, '',
@@ -704,14 +864,22 @@ function cmdCommit(taskPath, side) {
   ].join('\n');
   for (const args of [['add', '-A'], ['commit', '-q', '-F', '-']]) {
     const r = git(s.worktree, args, { input: message });
-    if (r.status !== 0) { recordStep(state, side, 'commit', { exit: r.status }); saveState(task, state); console.error(r.stderr.trim()); return r.status; }
+    if (r.status !== 0) {
+      recordStep(state, side, 'commit', { exit: r.status });
+      saveState(task, state, { sides: [side] });
+      obs.finish('failed', `git ${args[0]} failed (exit ${r.status})`);
+      console.error(r.stderr.trim());
+      return r.status;
+    }
   }
   const commit = git(s.worktree, ['rev-parse', 'HEAD']).stdout.trim();
   const tree = git(s.worktree, ['rev-parse', 'HEAD^{tree}']).stdout.trim();
   if (tree !== verified.tree) refuse(`committed tree ${tree} differs from verified tree ${verified.tree}`);
   recordStep(state, side, 'commit', { exit: 0, commit, tree });
   state.sides[side].status = 'committed';
-  saveState(task, state);
+  saveState(task, state, { sides: [side] });
+  obs.emit('commit', { commit: commit.slice(0, 12), tree: tree.slice(0, 12) });
+  obs.finish('waiting_review', `committed ${commit.slice(0, 12)} locally (nothing pushed); next: Claude Code review`, { next: 'review' });
   console.log(`commit ${side}: ${commit} (local only; nothing pushed)`);
   return 0;
 }
@@ -770,7 +938,14 @@ function cmdReviewRecord(taskPath, reviewPath) {
   for (const [side, s] of Object.entries(state.sides)) {
     if (status === 'rework_required') s.rework = review.findings.filter((f) => !f.side || f.side === side);
   }
-  saveState(task, state);
+  saveState(task, state, { top: ['review'] });
+  for (const [side, s] of Object.entries(state.sides)) {
+    const sideBlocking = blocking.filter((f) => !f.side || f.side === side).length;
+    observe(task, state, side, 'review').once(status === 'ready_for_human_merge' ? 'completed' : 'rework_required',
+      status === 'ready_for_human_merge' ? 'review accepted; ready for human merge (a human pushes and merges)'
+        : `review: rework required (${sideBlocking} blocking findings for ${side}); next: implement, check, verify`,
+      { next: status === 'ready_for_human_merge' ? 'human_merge' : (s.rework?.length ? 'implement' : null) });
+  }
   console.log(`review: ${status} (${blocking.length} blocking findings)`);
   return status === 'ready_for_human_merge' ? 0 : 1;
 }
@@ -785,6 +960,7 @@ function cmdStatus(taskPath) {
       steps: Object.fromEntries(Object.entries(s.steps).map(([k, v]) => [k, v.exit])),
       commit: s.steps.commit?.commit ?? null,
       gate_rework: (s.rework ?? []).filter((f) => f.source === 'gate').length,
+      live: deriveLive(readJson(snapshotPath(join(stateDir(task), 'live'), side))),
     }])),
     contract: state.contract ? state.contract.exit : null,
     review: state.review?.status ?? 'missing',
@@ -821,9 +997,10 @@ function cmdCleanup(taskPath, side, { preserve = false } = {}) {
     for (const name of unpreserved) cpSync(join(runsDir, name), join(stateDir(task), `${t}-preserved`, name), { recursive: true });
     const removed = git(REPOS[t], ['worktree', 'remove', s.worktree]);
     recordStep(state, t, 'cleanup', { exit: removed.status, preserved: unpreserved });
+    observe(task, state, t, 'cleanup').once(null, removed.status === 0 ? 'worktree removed; branch and evidence kept' : `worktree removal failed (exit ${removed.status})`);
     if (removed.status !== 0) { console.error(removed.stderr.trim()); exit = removed.status; }
   }
-  saveState(task, state);
+  saveState(task, state, { sides: targets });
   console.log(`cleanup: ${exit === 0 ? 'done (branches kept)' : 'incomplete'}`);
   return exit;
 }
@@ -849,8 +1026,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.exit(2);
   }
   try {
-    process.exitCode = COMMANDS[command](rest);
+    process.exitCode = await COMMANDS[command](rest);
   } catch (error) {
     if (error instanceof Refusal) { console.error(`refused: ${error.message}`); process.exitCode = 2; } else throw error;
+  } finally {
+    // A command that ended without a result (refusal, crash) leaves its side's state as it was.
+    for (const obs of [...openObservers]) obs.abort(`${command} ended without a result (exit ${process.exitCode ?? 'unknown'})`);
   }
 }

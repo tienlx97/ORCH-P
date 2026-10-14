@@ -8,5 +8,6 @@ Start with [AGENTS.md](AGENTS.md) and [docs/orchestration.md](docs/orchestration
 node verify-container/run-gate.mjs build-image   # once, and after Dockerfile changes
 node orchestrate/step0-probe.mjs                 # must report READY before real runs
 node orchestrate/orchestrate.mjs validate task.json
+node orchestrate/hud.mjs                         # live agent view (AgentHUD; install: npm ci --ignore-scripts --prefix tools/agenthud)
 ./harness/verify.sh                              # this repository's gate
 ```

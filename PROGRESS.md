@@ -2,6 +2,17 @@
 
 Newest first. Evidence directories under `runs/` are local (gitignored).
 
+## 2026-10-14 — Live agent observability (plan.md Phase 1) with AgentHUD
+
+Phase 0 found: `implement` ran Codex through `spawnSync` and wrote `events.jsonl` after exit (no live view); raw events hold full command lines, command output and model text; Codex events carry no timestamps and report usage only at turn end; `--ephemeral` means Codex writes no session files, so AgentHUD alone shows nothing of ORCH-P runs (0 rollouts with an `orch-worktrees` cwd); `state.json` was read at start and written whole at the end of each command, so concurrent BE/FE `implement` lost one side's steps; a timeout returned 127 (spawnSync ETIMEDOUT), kept as is.
+
+- `implement` streams Codex (`runStreaming`: same args, sanitized env, prompt on stdin, timeout, exit mapping incl. 127 for timeout/overflow/spawn error; SIGINT/SIGTERM forwarded and the run recorded as `interrupted`). Raw events still go to `events.jsonl` (now 0600) and are scanned after exit exactly as before.
+- Sanitized projection (`orchestrate/lib/event-stream.mjs`): allowlisted kinds, program names only, worktree-relative paths with scope flag, exit codes, counts, usage; `safeText` strips ANSI/OSC/C1/bidi and redacts secret-like text. Per-invocation streams and atomic per-side snapshots under `runs/orch-<ID>/live/`; `status` reports `live` (RUNNING / STALLED / ORPHANED / IDLE / UNKNOWN, pid + kernel start time). Every command emits lifecycle events.
+- AgentHUD 0.19.0 (MIT, audited: no network, no install scripts, LLM only in `summary`, git only on a session's cwd) pinned in `tools/agenthud` with lockfile; `orchestrate/hud.mjs` runs it on the projection only (isolated HOME and session dirs, allowlisted env, live view only). Found during validation: AgentHUD routes files by path prefix and treats the parent of `KIRO_IDE_SESSIONS_DIR` as Kiro's root — each unused provider now has its own nested empty dir (regression test).
+- `state.json` saves merge only the command's own sides under a lock, atomically.
+- Validation (local, no model calls): `./harness/verify.sh` PASSED in WSL against this checkout (`runs/20261014-124250-255563/`; tests 62 = 42 existing unchanged + 20 new). Gate run from WSL on the Windows checkout needs `core.autocrlf=true` (else CRLF reads as trailing whitespace in untouched files). AgentHUD `--once` renders `[running] … · be · implement #2 · codex gpt-5.6-sol/high`; its `report` parses the projected activity as Codex.
+- Not yet observed: a real `codex exec --json` streaming into the monitor (needs one approved Codex run); the WSL execution clone is still on `main` 9632751.
+
 ## 2026-10-14 — Gate rework on the same worktree, offline BE builds for Codex, toolchain check
 
 Gaps found by the first real run (ORCH-PORTS-EDIT-DELETE): a CS0104 in one test file needed a new task id and a full Codex rerun; Codex could not compile at all; Step 0 failed with an unexplained `bwrap: execvp` because Codex lived under the denied `~/.asdf`.

@@ -26,11 +26,13 @@ siblings; override with `ORCH_BE_REPO` / `ORCH_FE_REPO`). Run state goes to `ORC
 | `commit` | Local commit with `Verified-Tree` / `Verification-Evidence` trailers | Gate not passed; evidence missing; tree changed since verification |
 | `contract` | Disabled: the contract-read check would build and serve agent code on the host. A task with `contract_check: true` cannot reach `ready_for_human_merge`; run [pilot.md](../../BE-P/docs/coordination/pilot.md) manually after review | Always |
 | `review-record` | Stores Claude Code's `review.json` with execution provenance | Not run from a Claude Code process; a Codex process in the ancestry; commits differ from the verified commits |
-| `status` | `in_progress`, `blocked`, `rework_required` (review or gate findings pending) or `ready_for_human_merge` | — |
+| `status` | `in_progress`, `blocked`, `rework_required` (review or gate findings pending) or `ready_for_human_merge`; per side `live` ([Live observability](#live-observability)) | — |
 | `cleanup` | Removes worktrees, keeps branches and evidence | Uncommitted changes; unpreserved evidence (unless `--preserve`) |
 
 Exit codes: a child's real exit code is returned (gate, Codex, task status); refusals exit 2.
-Nothing in the tool pushes, merges, deploys or opens pull requests; tests assert it.
+`implement` maps like `spawnSync` did: a timeout, an output over 256 MB or a spawn error → 127, a
+signal → 128. Ctrl-C / SIGTERM during `implement` is passed to Codex and the run is still recorded
+(`interrupted`). Nothing in the tool pushes, merges, deploys or opens pull requests; tests assert it.
 
 **Rework.** Findings reach Codex through the prompt's rework section on the same worktree, so
 a failed gate no longer needs a new task id. Gate findings are compiler errors (`file:line CODE
@@ -49,6 +51,59 @@ listed). `dotnet test` cannot run in the sandbox: the vstest host needs a loopba
 sandbox has no network at all; tests run only in the gate. The package dir is writable by Codex,
 like its `TMPDIR`; nothing outside the sandbox uses it (the gate restores into its own scratch
 dir). A failed restore does not stop `prepare`; the prompt then says compiling is impossible.
+
+## Live observability
+
+What each agent is doing, while it does it, without giving observers raw model output.
+
+```text
+codex exec --json ──► events.jsonl (raw evidence, 0600, scanned after exit as before)
+        │
+        └─► sanitized projection (orchestrate/lib/event-stream.mjs)
+               ├─► runs/orch-<ID>/live/streams/<time>-<pid>-<command>-<side>.ndjson   one writer per file
+               ├─► runs/orch-<ID>/live/agents/<side>.json        atomic snapshot → `status` .sides.<side>.live
+               └─► runs/agenthud/codex/…/rollout-…-<ID>-<side>.jsonl ──► AgentHUD (orchestrate/hud.mjs)
+prepare / check / verify / commit / review-record / cleanup ──► the same three, as lifecycle events
+```
+
+- **What observers get.** Event kinds, item ids, the *program* of a command (`dotnet build`, `rg`,
+  `shell loop`, else `other`; never arguments), changed paths relative to the worktree with an
+  in-scope flag (anything outside the worktree is `<outside-worktree>`), exit codes, counts, the
+  todo-list progress as numbers, usage as reported at turn end, Codex error messages, and the
+  orchestrator's own results (check counts, gate exit and finding count, commit, review verdict).
+  Never: prompts, command lines, command output, file contents, agent messages (length only).
+  Every string passes `safeText`: ANSI/OSC/C1 controls and bidi characters stripped, secret-like
+  text replaced by `[redacted]`, length capped. Lines are capped at 4 KB, each stream at 8 MB
+  (the exit is written past the cap); raw lines over 1 MiB are skipped (counted as anomalies).
+- **States** (`status` → `sides.<side>.live`): `state` is where the side stands — `preparing`,
+  `running`, `checking`, `verifying`, `committing`, `idle` (with `next`), `rework_required`,
+  `blocked`, `failed`, `waiting_review`, `completed` (ready for human merge). `status` says
+  whether that is current: `RUNNING`, `STALLED` (no orchestrator heartbeat for 20 s, or no agent
+  event during `implement` for `ORCH_STALL_MINUTES`, default 10), `ORPHANED` (the orchestrator
+  process is gone; checked by pid and kernel start time), `IDLE`, `UNKNOWN` (no snapshot: runs
+  prepared before this, or observability failed). There is no queue and approval happens before
+  `prepare`, so `queued` / `waiting_approval` do not exist. Usage exists only after Codex ends a
+  turn; it is `null` until then.
+- **AgentHUD** ([agenthud](https://github.com/neochoon/agenthud), MIT, a third-party TUI) is the
+  live view: `npm ci --ignore-scripts --prefix tools/agenthud` once (version pinned in
+  `tools/agenthud/package.json`, integrity in its lockfile, no install scripts), then
+  `node orchestrate/hud.mjs` in WSL next to the run. Each task is a project (`/orch-p/<ID>`), each
+  side a session titled `[state] <ID> · side · stage · codex model/effort`; its activity lists
+  program-level tool calls and the notes above. Codex itself writes no session files
+  (`--ephemeral`), so AgentHUD sees ORCH-P runs only through this projection.
+  `hud.mjs` runs AgentHUD with an allowlisted environment whose HOME and every session directory
+  point into `runs/agenthud/` (it never reads `~/.codex`, `~/.claude`, Kiro or opencode
+  sessions) and allows only the live view (`--once`, `--help`, `--version`): `summary` would pipe
+  activity into an LLM CLI (quota; data leaves the machine). AgentHUD makes no network calls; in
+  the live view it runs `git log` / `git show` in a session's cwd, which is a logical path that
+  does not exist. Its recency (`[hot]`) follows the file's mtime, which the orchestrator touches
+  every 5 s while a command runs; ORPHANED/STALLED are only in `status`.
+- **Not a control.** Observability never decides anything. A failure there prints one warning and
+  turns it off for that command; gates, scope checks, evidence and exit codes are unchanged. Live
+  files are 0600 in 0700 directories; nothing listens on the network.
+- **Concurrency.** `state.json` is written under a lock (`state.json.lock`, removed when its owner
+  process is gone) by merging only the sides a command changed onto the current file, atomically:
+  BE and FE `implement` can run at the same time. Run one command per side at a time.
 
 ## Task file
 
