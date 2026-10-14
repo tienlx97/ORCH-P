@@ -1,8 +1,11 @@
 # Lightweight orchestration (AI-AGENTS.md §7.4)
 
 Codex implements one side of an approved task in an isolated Git worktree; the existing
-BE/FE gates verify it; Claude Code reviews it; a human pushes and merges. No orchestration
-framework is involved ([Ruflo: not adopted](ruflo-evaluation.md)). Policy: [BE-P coordination](../../BE-P/docs/coordination/README.md).
+BE/FE gates verify it; Claude Code reviews it; a human pushes and merges. **Omnigent is the hub**
+where the agents run, are coordinated and share their history ([Omnigent hub](#omnigent-hub),
+[evaluation](omnigent-evaluation.md); pinned, not installed until O1 is approved). ORCH-P stays
+the policy and gate engine: sandbox profile, approvals, scope, gates, evidence. Ruflo is
+[not adopted](ruflo-evaluation.md). Policy: [BE-P coordination](../../BE-P/docs/coordination/README.md).
 
 ```text
 human approves task.json ──► prepare ──► implement (Codex, sandboxed) ──► check ──► verify (gate)
@@ -20,7 +23,7 @@ siblings; override with `ORCH_BE_REPO` / `ORCH_FE_REPO`). Run state goes to `ORC
 |---|---|---|
 | `validate` | Prints the resolved plan (bases, model, effort) | Task not approved; base not a full SHA that is a commit; model/effort not in `codex debug models` |
 | `prepare` | Worktree per side at `base_revision` on `agent/<id>-<side>` under `~/orch-worktrees`; BE package restore for offline builds (`run-gate.mjs restore`, below); FE `pnpm install --frozen-lockfile --prefer-offline` | Already prepared; worktree path or branch exists |
-| `implement` | `codex exec` with the generated sandbox profile, model, effort, allowlisted environment and private `TMPDIR`; prompt from `prompt.md` + task fields + pending rework findings | Step 0 not READY; task file edited since prepare; secret-like text in the prompt; `codex`, `node` or (BE) `dotnet` resolves under a path the profile denies |
+| `implement` | `runner: omnigent` (default): a Codex session in Omnigent ([below](#omnigent-hub)); `runner: codex-exec`: `codex exec` directly. Both use the generated sandbox profile, model, effort and a prompt from `prompt.md` + task fields + pending rework findings; `codex-exec` also gets the allowlisted environment and private `TMPDIR` | Step 0 not READY; task file edited since prepare; secret-like text in the prompt; `codex`, `node` or (BE) `dotnet` resolves under a path the profile denies; `omnigent`: pin not approved, server not loopback |
 | `check` | Changed paths ⊆ `allowed_paths`, no protected paths, secret scan of diff and new files; binds the result to the tree hash | — (fails with exit 1) |
 | `verify` | The repository's own gate in a verification container (`verify-container/run-gate.mjs`), FE `task.mjs status`; preserves evidence and the container record; binds both to the tree hash. A failed gate (not exit 70) records its findings as rework: run `implement`, `check`, `verify` again on the same worktree | `check` did not pass, or the tree changed since `check` |
 | `commit` | Local commit with `Verified-Tree` / `Verification-Evidence` trailers | Gate not passed; evidence missing; tree changed since verification |
@@ -54,16 +57,20 @@ dir). A failed restore does not stop `prepare`; the prompt then says compiling i
 
 ## Live observability
 
-What each agent is doing, while it does it, without giving observers raw model output.
+What each agent is doing, while it does it, without giving observers raw model output. With
+Omnigent as the hub, **the Omnigent web UI is the live view**: every Codex implementer, the
+coordinator and the reviewer are sessions there, with their conversation, tool calls, files and
+terminal, and that history is shared and kept. ORCH-P keeps its own sanitized state for `status`
+and for agents that read it:
 
 ```text
-codex exec --json ──► events.jsonl (raw evidence, 0600, scanned after exit as before)
-        │
-        └─► sanitized projection (orchestrate/lib/event-stream.mjs)
-               ├─► runs/orch-<ID>/live/streams/<time>-<pid>-<command>-<side>.ndjson   one writer per file
-               ├─► runs/orch-<ID>/live/agents/<side>.json        atomic snapshot → `status` .sides.<side>.live
-               └─► runs/agenthud/codex/…/rollout-…-<ID>-<side>.jsonl ──► AgentHUD (orchestrate/hud.mjs)
-prepare / check / verify / commit / review-record / cleanup ──► the same three, as lifecycle events
+implement (codex-exec): codex exec --json ──► events.jsonl (raw evidence, 0600, scanned after exit)
+        │                                        └─► sanitized projection (lib/event-stream.mjs) ─┐
+implement (omnigent): session status polls ──► heartbeat / agent activity ─────────────────────────┤
+prepare / check / verify / commit / review-record / cleanup ──► lifecycle events ──────────────────┤
+                                                                                                   ▼
+                     runs/orch-<ID>/live/streams/<time>-<pid>-<command>-<side>.ndjson   one writer per file
+                     runs/orch-<ID>/live/agents/<side>.json   atomic snapshot → `status` .sides.<side>.live
 ```
 
 - **What observers get.** Event kinds, item ids, the *program* of a command (`dotnet build`, `rg`,
@@ -75,35 +82,69 @@ prepare / check / verify / commit / review-record / cleanup ──► the same t
   Every string passes `safeText`: ANSI/OSC/C1 controls and bidi characters stripped, secret-like
   text replaced by `[redacted]`, length capped. Lines are capped at 4 KB, each stream at 8 MB
   (the exit is written past the cap); raw lines over 1 MiB are skipped (counted as anomalies).
+  For `runner: omnigent` the per-tool detail is in the Omnigent session; ORCH-P records state,
+  heartbeat and agent activity (the session is busy).
 - **States** (`status` → `sides.<side>.live`): `state` is where the side stands — `preparing`,
   `running`, `checking`, `verifying`, `committing`, `idle` (with `next`), `rework_required`,
   `blocked`, `failed`, `waiting_review`, `completed` (ready for human merge). `status` says
   whether that is current: `RUNNING`, `STALLED` (no orchestrator heartbeat for 20 s, or no agent
-  event during `implement` for `ORCH_STALL_MINUTES`, default 10), `ORPHANED` (the orchestrator
-  process is gone; checked by pid and kernel start time), `IDLE`, `UNKNOWN` (no snapshot: runs
-  prepared before this, or observability failed). There is no queue and approval happens before
-  `prepare`, so `queued` / `waiting_approval` do not exist. Usage exists only after Codex ends a
-  turn; it is `null` until then.
-- **AgentHUD** ([agenthud](https://github.com/neochoon/agenthud), MIT, a third-party TUI) is the
-  live view: `npm ci --ignore-scripts --prefix tools/agenthud` once (version pinned in
-  `tools/agenthud/package.json`, integrity in its lockfile, no install scripts), then
-  `node orchestrate/hud.mjs` in WSL next to the run. Each task is a project (`/orch-p/<ID>`), each
-  side a session titled `[state] <ID> · side · stage · codex model/effort`; its activity lists
-  program-level tool calls and the notes above. Codex itself writes no session files
-  (`--ephemeral`), so AgentHUD sees ORCH-P runs only through this projection.
-  `hud.mjs` runs AgentHUD with an allowlisted environment whose HOME and every session directory
-  point into `runs/agenthud/` (it never reads `~/.codex`, `~/.claude`, Kiro or opencode
-  sessions) and allows only the live view (`--once`, `--help`, `--version`): `summary` would pipe
-  activity into an LLM CLI (quota; data leaves the machine). AgentHUD makes no network calls; in
-  the live view it runs `git log` / `git show` in a session's cwd, which is a logical path that
-  does not exist. Its recency (`[hot]`) follows the file's mtime, which the orchestrator touches
-  every 5 s while a command runs; ORPHANED/STALLED are only in `status`.
+  activity during `implement` for `ORCH_STALL_MINUTES`, default 10), `ORPHANED` (the orchestrator
+  process is gone; checked by pid and kernel start time; not decidable from another pid
+  namespace, e.g. an Omnigent sandbox, where only the heartbeat counts), `IDLE`, `UNKNOWN` (no
+  snapshot: runs prepared before this, or observability failed). Usage exists only after Codex
+  ends a turn; it is `null` until then.
 - **Not a control.** Observability never decides anything. A failure there prints one warning and
   turns it off for that command; gates, scope checks, evidence and exit codes are unchanged. Live
-  files are 0600 in 0700 directories; nothing listens on the network.
+  files are 0600 in 0700 directories; ORCH-P itself listens on no port.
 - **Concurrency.** `state.json` is written under a lock (`state.json.lock`, removed when its owner
   process is gone) by merging only the sides a command changed onto the current file, atomically:
   BE and FE `implement` can run at the same time. Run one command per side at a time.
+
+## Omnigent hub
+
+```text
+user ⇄ Omnigent web UI (127.0.0.1:6767) — every session below, live, with shared history
+  ├─ orch-coordinator (Claude)  plans, writes runs/proposals/<ID>.json, reads status
+  │      └─ runs/requests/<id>.json ──(ASK: user approves in the UI)──► orchestrate/runner.mjs
+  │                                                     └─► orchestrate.mjs prepare|implement|check|verify|commit|stop
+  ├─ <ID> · be|fe · implement #n (Codex)   created by `implement` with the Step 0 profile
+  └─ orch-reviewer (Claude)     git show/diff, writes runs/reviews/<ID>.json, runs review-record
+human: approves task files (status "approved") in the terminal; pushes and merges
+```
+
+- **Start:** `node orchestrate/cockpit.mjs start` (coordinator) or `start reviewer`, and
+  `node orchestrate/runner.mjs` in another WSL terminal. `cockpit.mjs` refuses until
+  `omnigent/pin.json` is approved, the installed version equals the pin and
+  `~/.omnigent/config.yaml` sets `telemetry: false`; it passes only an allowlisted environment
+  with `OMNIGENT_ANALYTICS=0`, `DO_NOT_TRACK=1`, `OMNIGENT_NO_UPDATE_CHECK=1`.
+- **Implementers.** `implement` (`runner: omnigent`) creates a top-level `codex-native-ui`
+  session through the loopback REST API (`ORCH_OMNIGENT_URL`, default `http://127.0.0.1:6767`;
+  anything else is refused) on the side's worktree, with launch args = the Step 0 permission
+  profile, `approval_policy="never"`, model and effort. It refuses if the server returns other
+  launch args. Session policies are attached before the prompt (writes only in the worktree,
+  no push or destructive command, tool cap, loop guard); any that fails stops the session. It
+  waits for the session to go idle (timeout → interrupt, 127; Ctrl-C / SIGTERM → interrupt, 128),
+  then exports the session history to the run directory (`session-items.jsonl`, `session.json`,
+  `last-message.md`, 0600), secret-scans it and checks Git metadata as for `codex exec`. **A
+  permission change made in the UI during the run** (the Codex approval-mode label or an
+  approval-mode-change item) **blocks the side**: the Step 0 profile no longer held. Sub-agent
+  dispatch is not used: Omnigent gives dispatched Codex workers a full bypass by default and
+  ignores custom launch args.
+- **Requests (`orchestrate/runner.mjs`).** The coordinator cannot run steps itself (its sandbox has
+  no worktrees, state or Docker). Its write to `runs/requests/<id>.json` triggers an ASK in the
+  UI; the runner, started by the user, runs approved requests: `prepare`, `implement`, `check`,
+  `verify`, `commit`, `status`, `stop`. Each request names the task file inside the workspace and
+  its `task_sha256` (printed by `validate`), which must still match; the task must be approved.
+  One step per task side at a time; `stop` sends SIGTERM to it. Results go to
+  `<id>.result.json` (exit code, sanitized output tail) and `audit.jsonl`. Never through a
+  request: approving or editing a task, `cleanup`, `review-record`, push, merge.
+- **Coordinator and reviewer** are `claude-native` sessions in Omnigent's `linux_bwrap` sandbox
+  ($HOME not mounted, workspace read-only, dot-paths masked) with a CEL tool allowlist; see
+  `omnigent/*/config.yaml`. `cockpit.mjs lint` (in `harness/verify.sh`) rejects any bypass,
+  `sandbox: none`, other harnesses, sub-agents, credential pass-through, push/PR instructions,
+  a changed shell allowlist or write path, and unknown agents.
+- **Status inside a sandbox** uses the cached Codex model catalog (`runs/model-catalog.json`,
+  written whenever `codex debug models` runs) because the `codex` binary is not visible there.
 
 ## Task file
 
@@ -112,7 +153,8 @@ See `orchestrate/task.example.json`. `status` must be `approved` with an
 SHAs are refused, and `origin/main` is never assumed). Per side: `change`, `objective`,
 `allowed_paths`, `acceptance_criteria`, `model`, and `effort` or `complexity`
 (`simple` → low, `normal` → medium, `complex` → high), checked against the model's
-supported efforts. The task file's digest is bound at `prepare`: editing it requires a new id.
+supported efforts. Optional `runner`: `omnigent` (default; needs the approved Omnigent pin) or
+`codex-exec`. The task file's digest is bound at `prepare`: editing it requires a new id.
 
 ## Security controls
 

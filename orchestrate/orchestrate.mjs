@@ -26,6 +26,10 @@ import {
   AgentObserver, deriveLive, HEARTBEAT_MS, openObservers, readJson, snapshotPath, withLock, writeJsonAtomic,
 } from './lib/agent-state.mjs';
 import { codexProjector, lineSplitter } from './lib/event-stream.mjs';
+import { readPin } from './lib/omnigent.mjs';
+import {
+  codexLaunchArgs, lastAssistantText, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
+} from './lib/omnigent-runner.mjs';
 import { scanSecrets } from './lib/secrets.mjs';
 
 export { scanSecrets };
@@ -45,8 +49,10 @@ const CODEX = process.env.ORCH_CODEX_BIN ?? 'codex';
 // Agent-written code is verified only inside containers (harness/verify-container).
 const GATE_RUNNER = process.env.ORCH_GATE_RUNNER ?? join(HERE, '..', 'verify-container', 'run-gate.mjs');
 const REPOS = { be: BE_REPO, fe: FE_REPO };
-// Sanitized AgentHUD projection of the live events (orchestrate/hud.mjs).
-const HUD_ROOT = resolve(process.env.ORCH_HUD_ROOT ?? join(STATE_ROOT, 'agenthud'));
+// Implementers run as Omnigent sessions (the hub, docs/omnigent-evaluation.md);
+// `codex-exec` is the direct `codex exec` path, kept until O1 approves Omnigent.
+const RUNNERS = ['omnigent', 'codex-exec'];
+const OMNIGENT_BUNDLE = resolve(process.env.ORCH_OMNIGENT_BUNDLE ?? join(ORCH_REPO, 'omnigent'));
 
 // Paths no implementation agent may change unless the approved task names
 // them in `protected_paths_override` (gates, CI, credentials, lockfiles).
@@ -307,11 +313,20 @@ export function sanitizedEnv(source = process.env) {
 }
 
 // ── task and state ───────────────────────────────────────────────────────
+// The last catalog read from Codex. Agents in Omnigent sandboxes run `status`
+// and `validate` without the codex binary (HOME is not mounted), so they read
+// this copy; steps that start Codex run where the binary is.
+const CATALOG_CACHE = join(STATE_ROOT, 'model-catalog.json');
+
 function loadCatalog() {
   if (process.env.ORCH_MODEL_CATALOG) return JSON.parse(readFileSync(process.env.ORCH_MODEL_CATALOG, 'utf8'));
   const result = run(CODEX, ['debug', 'models', '--bundled']);
-  if (result.status !== 0) refuse('cannot read the Codex model catalog (`codex debug models --bundled`)');
-  return JSON.parse(result.stdout);
+  if (result.status === 0) {
+    try { mkdirSync(STATE_ROOT, { recursive: true }); writeFileSync(CATALOG_CACHE, result.stdout, { mode: 0o600 }); } catch { /* read-only view */ }
+    return JSON.parse(result.stdout);
+  }
+  if (existsSync(CATALOG_CACHE)) return JSON.parse(readFileSync(CATALOG_CACHE, 'utf8'));
+  refuse('cannot read the Codex model catalog (`codex debug models --bundled`) and no cached copy exists');
 }
 
 function catalogEfforts(catalog, model) {
@@ -353,6 +368,8 @@ export function validateTask(task, { resolveCommit = true } = {}) {
       else if (!efforts.includes(effort)) problems.push(`sides.${side}: model ${spec.model} supports ${efforts.join(', ')}, not ${effort}`);
     }
     spec.effort = effort;
+    spec.runner ??= 'omnigent';
+    if (!RUNNERS.includes(spec.runner)) problems.push(`sides.${side}.runner must be ${RUNNERS.join(' or ')}`);
   }
   if (problems.length) refuse(`task is not runnable:\n  - ${problems.join('\n  - ')}`);
   return task;
@@ -411,9 +428,9 @@ function observe(task, state, side, command) {
   const spec = task.sides[side];
   const attempts = state.log.filter((e) => e.side === side && e.step === 'implement').length;
   return new AgentObserver({
-    liveDir: join(stateDir(task), 'live'), hudRoot: HUD_ROOT, taskId: task.id, runId: state.run_id ?? `${task.id}@${state.prepared_at}`,
+    liveDir: join(stateDir(task), 'live'), taskId: task.id, runId: state.run_id ?? `${task.id}@${state.prepared_at}`,
     side, command, attempt: command === 'implement' ? attempts + 1 : Math.max(attempts, 1),
-    provider: 'codex', model: spec.model, effort: spec.effort, preparedAt: state.prepared_at,
+    provider: 'codex', model: spec.model, effort: spec.effort,
   });
 }
 
@@ -673,6 +690,7 @@ async function cmdImplement(taskPath, side) {
     refuse(`the sandbox profile hides ${hidden.map((h) => `${h.name} (${h.path}, under denied ${h.denied_by})`).join(', ')}; `
       + 'install it under an allowed toolchain (~/.nvm, ~/.dotnet, ~/.local/bin) or put that one first on PATH');
   }
+  if (spec.runner === 'omnigent') return implementViaOmnigent({ task, state, side, spec, s, dir, prompt, policy });
   const args = [
     'exec', '-C', s.worktree, ...profileArgs(policy), '-m', spec.model,
     '-c', `model_reasoning_effort="${spec.effort}"`, '--ignore-user-config', '--ephemeral',
@@ -702,42 +720,103 @@ async function cmdImplement(taskPath, side) {
     onStdout: (chunk) => splitter.push(chunk), onHeartbeat: () => obs.heartbeat(),
   });
   splitter.end();
-  const metadataChanged = gitMetadataDigest(s.worktree) !== metadataBefore;
-  const hits = ['events.jsonl', 'stderr.log', 'last-message.md']
-    .filter((f) => existsSync(join(dir, f)))
-    .flatMap((f) => scanSecrets(readFileSync(join(dir, f), 'utf8'), f));
   const usage = readFileSync(join(dir, 'events.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
     .filter((e) => e?.type === 'turn.completed' && e.usage).map((e) => e.usage).pop() ?? null;
-  recordStep(state, side, 'implement', {
-    exit: result.status, signal: result.signal, dir, model: spec.model, effort: spec.effort, usage, secret_hits: hits,
-    git_metadata_changed: metadataChanged,
-    ...(result.timedOut ? { timed_out: true } : {}), ...(result.interrupted ? { interrupted: result.interrupted } : {}),
-    ...(result.overflow ? { output_limit: true } : {}),
-  });
-  if (hits.length || metadataChanged) state.sides[side].status = 'blocked';
-  saveState(task, state, { sides: [side] });
   obs.emit('process.exit', {
     exit: result.status, signal: result.signal, timed_out: result.timedOut, interrupted: result.interrupted, overflow: result.overflow,
   });
-  if (hits.length || metadataChanged) {
-    obs.finish('blocked', metadataChanged ? 'Codex changed Git metadata; inspect the repository before any Git command'
-      : `secret-like text in Codex output (${hits.length} locations); inspect locally`, { exit: result.status });
-  } else if (result.status !== 0) {
-    const why = `${result.timedOut ? ' (timed out)' : ''}${result.interrupted ? ` (interrupted by ${result.interrupted})` : ''}`;
-    obs.finish('failed', `codex exit ${result.status}${why}`, { exit: result.status });
-  } else {
-    obs.finish('idle', 'codex finished; next: check', { exit: 0, next: 'check' });
+  return finishImplement({
+    task, state, side, spec, s, obs, dir, metadataBefore, status: result.status,
+    evidence: ['events.jsonl', 'stderr.log', 'last-message.md'],
+    record: {
+      signal: result.signal, usage,
+      ...(result.timedOut ? { timed_out: true } : {}), ...(result.interrupted ? { interrupted: result.interrupted } : {}),
+      ...(result.overflow ? { output_limit: true } : {}),
+    },
+    why: `${result.timedOut ? ' (timed out)' : ''}${result.interrupted ? ` (interrupted by ${result.interrupted})` : ''}`,
+  });
+}
+
+/** Shared end of `implement`: evidence scan, Git metadata check, state and live status. */
+function finishImplement({ task, state, side, spec, s, obs, dir, metadataBefore, status, evidence, record, why = '', blockedBy = null }) {
+  const metadataChanged = gitMetadataDigest(s.worktree) !== metadataBefore;
+  const hits = evidence.filter((f) => existsSync(join(dir, f))).flatMap((f) => scanSecrets(readFileSync(join(dir, f), 'utf8'), f));
+  recordStep(state, side, 'implement', {
+    exit: status, dir, runner: spec.runner, model: spec.model, effort: spec.effort, secret_hits: hits,
+    git_metadata_changed: metadataChanged, ...record,
+  });
+  const blocked = metadataChanged ? 'Codex changed Git metadata (config, hooks, info or refs); inspect the repository before any Git command'
+    : hits.length ? `secret-like text in Codex output at ${hits.join(', ')}; inspect locally, do not share the run directory`
+      : blockedBy;
+  if (blocked) state.sides[side].status = 'blocked';
+  saveState(task, state, { sides: [side] });
+  if (blocked) {
+    obs.finish('blocked', blocked, { exit: status });
+    console.error(`implement ${side}: run blocked — ${blocked}`);
+    return status || 1;
   }
-  if (metadataChanged) {
-    console.error('Codex changed Git metadata (config, hooks, info or refs) — run blocked; inspect the repository before any further Git command');
-    return result.status || 1;
+  if (status !== 0) obs.finish('failed', `codex exit ${status}${why}`, { exit: status });
+  else obs.finish('idle', 'codex finished; next: check', { exit: 0, next: 'check' });
+  console.log(`implement ${side}: codex exit ${status}; evidence ${dir}`);
+  return status;
+}
+
+/** `implement` as a Codex session in Omnigent (lib/omnigent-runner.mjs). */
+async function implementViaOmnigent({ task, state, side, spec, s, dir, prompt: basePrompt, policy }) {
+  // An Omnigent session has no --output-schema: the schema goes into the prompt (and its evidence copy).
+  const prompt = `${basePrompt}\n\nThe JSON report is your last message and must match this JSON Schema:\n${readFileSync(join(HERE, 'report.schema.json'), 'utf8')}`;
+  writeFileSync(join(dir, 'prompt.md'), prompt);
+  const { pin, problems } = readPin(OMNIGENT_BUNDLE);
+  if (problems.length || pin?.status !== 'approved') {
+    refuse('the Omnigent runner is not approved yet (omnigent/pin.json, docs/omnigent-evaluation.md); set "runner": "codex-exec" for this side until O1 passes');
   }
-  if (hits.length) {
-    console.error(`secret-like text in Codex output at ${hits.join(', ')} — run blocked; inspect locally, do not share the run directory`);
-    return result.status || 1;
+  let base;
+  try { base = loopbackUrl(process.env.ORCH_OMNIGENT_URL ?? undefined); } catch (error) { refuse(error.message); }
+  const attempt = state.log.filter((e) => e.side === side && e.step === 'implement').length + 1;
+  const launchArgs = codexLaunchArgs({ profile: profileArgs(policy), model: spec.model, effort: spec.effort });
+  const policies = sessionPolicies(s.worktree);
+  const agentName = process.env.ORCH_OMNIGENT_CODEX_AGENT ?? 'codex-native-ui';
+  writeFileSync(join(dir, 'command.json'), `${JSON.stringify({ runner: 'omnigent', server: base, agent: agentName, launch_args: launchArgs, policies }, null, 2)}\n`);
+  const metadataBefore = gitMetadataDigest(s.worktree);
+  const obs = observe(task, state, side, 'implement');
+  obs.start('running');
+  const controller = new AbortController();
+  const onSignal = (sig) => controller.abort(sig);
+  for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, onSignal);
+  let result;
+  try {
+    result = await runCodexSession({
+      client: omnigentClient(base), agentName, hostId: process.env.ORCH_OMNIGENT_HOST, worktree: s.worktree,
+      title: `${task.id} · ${side} · implement #${attempt}`, launchArgs, policies, prompt,
+      timeoutMs: (spec.timeout_minutes ?? 60) * 60_000, pollMs: Number(process.env.ORCH_OMNIGENT_POLL_MS ?? 2000),
+      signal: controller.signal, onHeartbeat: () => obs.heartbeat(),
+      onStatus: (status) => { if (['launching', 'running', 'waiting'].includes(status)) obs.agentActive(); },
+    });
+  } catch (error) {
+    recordStep(state, side, 'implement', { exit: 1, dir, runner: 'omnigent', session_id: error.sessionId ?? null, error: error.message });
+    saveState(task, state, { sides: [side] });
+    obs.finish('failed', `Omnigent: ${error.message}`, { exit: 1 });
+    console.error(`implement ${side}: Omnigent session not run — ${error.message}`);
+    return 1;
+  } finally {
+    for (const sig of ['SIGINT', 'SIGTERM']) process.off(sig, onSignal);
   }
-  console.log(`implement ${side}: codex exit ${result.status}; evidence ${dir}`);
-  return result.status;
+  const write = (name, text) => writeFileSync(join(dir, name), text, { mode: 0o600 });
+  write('session-items.jsonl', result.items.map((i) => JSON.stringify(i)).join('\n') + (result.items.length ? '\n' : ''));
+  write('session.json', `${JSON.stringify(result.session, null, 2)}\n`);
+  write('last-message.md', lastAssistantText(result.items) ?? '');
+  obs.emit('process.exit', { exit: result.status, signal: null, timed_out: result.timedOut, interrupted: result.interrupted, overflow: false });
+  return finishImplement({
+    task, state, side, spec, s, obs, dir, metadataBefore, status: result.status,
+    evidence: ['session-items.jsonl', 'session.json', 'last-message.md'],
+    record: {
+      session_id: result.sessionId, permission_changed: result.permissionChanged,
+      ...(result.timedOut ? { timed_out: true } : {}), ...(result.interrupted ? { interrupted: result.interrupted } : {}),
+      ...(result.note ? { note: result.note } : {}),
+    },
+    why: `${result.timedOut ? ' (timed out)' : ''}${result.interrupted ? ` (interrupted by ${result.interrupted})` : ''}${result.note ? ` (${result.note})` : ''}`,
+    blockedBy: result.permissionChanged ? 'the Codex permission mode was changed in Omnigent during the run; the Step 0 profile no longer held' : null,
+  });
 }
 
 function cmdCheck(taskPath, side) {

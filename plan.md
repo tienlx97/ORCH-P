@@ -3,7 +3,7 @@
 **Status:** PROPOSED — NOT APPROVED FOR IMPLEMENTATION  
 **Scope:** ORCH-P orchestration layer; BE-P (.NET) and FE-P (Next.js) remain governed by their existing harnesses  
 **Language:** English  
-**Target:** A small, observable, secure, token-efficient multi-agent system using existing ChatGPT/Codex and Claude subscriptions, without Ruflo or new paid API dependencies
+**Target:** A small, observable, secure, token-efficient multi-agent system using existing ChatGPT/Codex and Claude subscriptions, without Ruflo, unevaluated third-party platforms, or new paid API dependencies
 
 ## 1. Goal and non-goals
 
@@ -17,7 +17,8 @@
 
 ### Non-goals
 
-- No Ruflo installation, agent swarm framework, paid API key, autonomous deployment, push, merge, or PR creation.
+- No Ruflo installation (evaluated, not adopted), paid API key, autonomous deployment, push, merge, or PR creation.
+- No third-party orchestration platform or agent framework unless it passes the adoption criteria in AGENTS.md rule 7 and the user approves it in writing.
 - No redesign of BE-P or FE-P applications or harnesses unless a specific compatibility gap is demonstrated and separately approved.
 - No attempt to reveal hidden model reasoning or promise exact live token costs when a provider does not expose them.
 - No agent-controlled change to its own permissions, sandbox, container security policy, approval rules, or verification gates.
@@ -42,7 +43,7 @@ The following baseline is drawn from ORCH-P's reviewed `main` source and `docs/o
 | Role | Provider / model preference | Default effort | Activation | Responsibility |
 |---|---|---|---|---|
 | Deterministic executor | Node.js ORCH-P; **no LLM** | N/A | Every task | Approvals, policy validation, state transitions, worktrees, gates, audit |
-| AI Planner / Coordinator | Claude Code / supported Sonnet model | Medium; High only for complex architecture | On demand | Produce a constrained task DAG, route providers, effort and dependencies; suggest recovery |
+| AI Planner / Coordinator | Claude Code / supported Sonnet model | Medium; High only for complex architecture | On demand (the user-driven coordinator session in the Omnigent hub, §10) | Produce a constrained task DAG, route providers, effort and dependencies; suggest recovery; writes proposals and step requests only |
 | Backend Engineer | Codex CLI / `gpt-6.1-sol` **if available locally** | Medium; High for complex changes | BE tasks only | .NET APIs, domain/application logic, EF Core, BE tests |
 | UI/UX Engineer | Claude Code / supported Sonnet model | Medium; High for complex redesign | UI-design tasks only | Visual components, layouts, responsive behavior, accessibility |
 | Frontend Engineer | Codex CLI / `gpt-6.1-sol` **if available locally** | Medium | FE logic tasks only | Next.js data flow, API adapters, state, hooks, validation, FE tests |
@@ -127,8 +128,8 @@ Tasks:
 4. Introduce a provider-independent **sanitized event schema**; emit only allowlisted fields needed by observers. Treat raw model output, prompts, file contents and tool arguments as sensitive.
 5. Persist a live event stream and an atomic current-state snapshot **under `ORCH-P/runs/` (gitignored)**, keyed by unique task/run/agent/attempt IDs. Keep existing evidence files compatible.
 6. Track lifecycle states: `queued`, `preparing`, `running`, `checking`, `verifying`, `reviewing`, `rework_required`, `blocked`, `failed`, `waiting_approval`, `completed`. Include timestamp, last heartbeat/event, stage, role, provider, repo, model, effort, and usage only if actually reported.
-7. Build a **read-only terminal monitor** supporting task list, active BE/FE agents, event timeline, current stage, last safe tool/file summary and gate results. Distinguish `UNKNOWN`, `IDLE`, and `STALLED` from completed or failed.
-8. Do not expose a network listener by default. Prefer local filesystem reads for the first monitor. Ensure sanitized outputs, restrictive evidence permissions, log rotation/size limits and safe terminal escaping.
+7. Build a **read-only terminal monitor** supporting task list, active BE/FE agents, event timeline, current stage, last safe tool/file summary and gate results. Distinguish `UNKNOWN`, `IDLE`, and `STALLED` from completed or failed. *(Delivered as `status` live state; AgentHUD was used then removed — the live view is the Omnigent hub, §10.)*
+8. ORCH-P exposes no network listener; the only listener is the Omnigent server on loopback (Phase 5). Prefer local filesystem reads for the first monitor. Ensure sanitized outputs, restrictive evidence permissions, log rotation/size limits and safe terminal escaping.
 9. Emit gate, check, handoff, rework, review and approval events from the Node.js lifecycle even when they are not Codex JSON events.
 
 ### Deliverables (suggested paths; adjust after audit)
@@ -235,15 +236,42 @@ This is a **proposal schema**, not an existing ORCH-P schema. Model output is un
 
 **Acceptance criteria:** a single BE fix triggers only Backend Codex; a UI-only change triggers only Claude UI; full-stack tasks activate the minimum dependent roles; no unnecessary review/plan reruns after unchanged verified evidence.
 
-## 10. Optional Phase 5 — Local web dashboard (P2, separate approval)
+## 10. Phase 5 — Omnigent hub (P1, staged approvals)
 
-Only after the terminal monitor and event schema are stable:
+Omnigent is the hub where every agent runs, is coordinated and shares its history; its loopback
+web UI is the dashboard ([evaluation](docs/omnigent-evaluation.md), [how it works](docs/orchestration.md#omnigent-hub)).
+ORCH-P stays the policy and gate engine and the only source of truth for approvals, state and
+evidence. AgentHUD was removed.
 
-- Build a local read-only dashboard **within ORCH-P**, not in production FE-P.
-- Timeline, per-role status, event filters, diff summary, gate evidence, review status, token usage when reported, and rework history.
-- Bind to loopback by default; implement authentication/authorization before remote access.
-- Reuse the sanitized events generated in Phase 1. Do not create a second source of truth or re-stream raw LLM logs.
-- Pause/cancel/retry/approve buttons are **out of scope** until independently designed with authorization, CSRF protection, idempotency, and durable audit records.
+```text
+user ⇄ Omnigent web UI (127.0.0.1:6767): all sessions live, shared history, ASK approvals, stop
+  ├─ orch-coordinator (Claude, linux_bwrap, tool allowlist)
+  │     proposals ─► runs/proposals/      requests ─(ASK)─► orchestrate/runner.mjs ─► orchestrate.mjs steps
+  ├─ Codex implementer sessions — created by `implement` (runner: omnigent) with the Step 0
+  │     profile as launch args, session policies, history exported as run evidence
+  └─ orch-reviewer (Claude) — git show/diff, review-record (provenance: Claude, not Codex)
+human: approves task files in the terminal; pushes and merges
+```
+
+Why implementers are created by ORCH-P and not dispatched by an Omnigent orchestrator: Omnigent
+gives dispatched Codex workers `--dangerously-bypass-approvals-and-sandbox` by default and ignores
+custom launch args for them; its own bwrap cannot host Codex's sandbox (no new namespaces).
+A top-level session accepts the Step 0 profile as launch args, so Codex keeps its proven sandbox.
+
+| Stage | Scope | Approval gate |
+|---|---|---|
+| O0 — Static evaluation and integration code | Evaluation; `omnigent/` bundle (coordinator, reviewer); `cockpit.mjs`; `implement` runner `omnigent`; `runner.mjs`; lint and stub tests in the gate | Done 2026-10-14 (not installed, nothing run) |
+| O1 — Pinned install + probe | Hashed install into `tools/omnigent/.venv`; answer every open question in the evaluation with evidence, including a Step 0 run **through** an Omnigent Codex session (canary, credentials, network denied) | User approves install and probe; any failed answer = BLOCKED, never a weaker config |
+| O2 — Hub in use | Record approval in `omnigent/pin.json`; tasks default to `runner: omnigent`; coordinator, runner and reviewer used on a small pilot task (plan.md §14) | User's written approval |
+| O3 — More agents | Claude UI implementer sessions (Phase 2), cross-provider review, planner DAGs (Phase 3) on the same hub | Separate approval each |
+
+Never from the hub: approving or editing a task, `cleanup`, push, merge, deploy, PR creation,
+changing allowed paths, sandbox, gates, policies or the Omnigent pin. A permission change made in
+the UI during a Codex session blocks that side.
+
+**Fallback:** if O1 is BLOCKED, tasks keep `runner: codex-exec` and the live view is `status`;
+a local dashboard inside ORCH-P (loopback, per-start token, CSRF and `Host`/`Origin` checks, the
+same request controls) would need its own approval.
 
 ## 11. Security and privacy invariants
 
@@ -284,7 +312,7 @@ For automated tests, use fake Codex/Claude executables and mocked JSONL streams.
 | M2 — Claude + Codex adapters | Provider routing, verified Claude execution restrictions, tests | Explicit approval before unattended Claude run |
 | M3 — AI planning | Structured planner proposal + strict executor validation | Explicit approval before first AI-planned code task |
 | M4 — Adaptive routing | Rules, bounded recovery, measurement report | End-to-end BE/UI/FE pilot verified |
-| M5 — Dashboard (optional) | Local read-only web UI | Separate approval |
+| M5 — Omnigent hub | O1–O3 (§10), or the codex-exec fallback | One approval per stage; security review of the agent configs, the Omnigent runner and `runner.mjs` |
 
 For each milestone, return: files changed; purpose; security-impact summary; commands and exit codes; evidence paths; current provider/model/effort actually observed; remaining UNKNOWNs; budget/quota observations; what is waiting for user approval. Keep changes local; no automatic push or merge.
 
@@ -313,7 +341,9 @@ This project is complete when a user can open a local monitor during an approved
 - What usage was reported by the providers, and what data remains UNKNOWN?
 - Was independent review completed, and is the run ready for **human** merge approval?
 
-All of the above must work without Ruflo, without an always-on LLM coordinator, without bypassing the sandbox/container gates, and without automatic push, merge or deployment.
+In the Omnigent hub a user can also see every agent session live with its history, talk to the coordinator, approve or refuse each requested step of an approved task, and stop a running step, with each action in the run evidence.
+
+All of the above must work without Ruflo, without an unevaluated third-party platform, without an always-on LLM coordinator, without bypassing the sandbox/container gates, and without automatic push, merge or deployment.
 
 ---
 

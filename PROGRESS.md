@@ -2,6 +2,18 @@
 
 Newest first. Evidence directories under `runs/` are local (gitignored).
 
+## 2026-10-14 — Omnigent as the agent hub; AgentHUD removed
+
+- Rules: AGENTS.md rule 7 admits a third-party platform only after a written static evaluation and the user's written approval. The user then chose Omnigent as the hub that runs, coordinates and keeps the shared history of every agent.
+- Evaluated `omnigent==0.18.0` (tag `v0.18.0` = `a8676d23e88d`) statically; not installed, nothing run. Key findings: its Codex dispatch gives sub-agents a full sandbox bypass by default and ignores their launch args; top-level sessions accept launch args and pass `default_permissions` profiles; its bwrap cannot host Codex's sandbox; loopback single-user API is unauthenticated; telemetry opt-outs prevent the remote config fetch. Details and the O1 questions: `docs/omnigent-evaluation.md`.
+- `implement` has `runner: omnigent` (default) — a `codex-native-ui` session created over the loopback API with the Step 0 profile as launch args, session policies before the prompt, history exported as evidence (0600), and a permission change in the UI blocks the side — and `runner: codex-exec` (the previous path, kept as fallback; shared `finishImplement`).
+- `orchestrate/runner.mjs`: runs step requests the coordinator writes and the user approves in the Omnigent UI (prepare/implement/check/verify/commit/status/stop), bound to the task's sha256; results and audit log.
+- `omnigent/`: pin, required `~/.omnigent` setting, `orch-coordinator` (proposals, requests with ASK, status) and `orch-reviewer` (read-only git, review-record), both `claude-native` in `linux_bwrap` with CEL allowlists; `cockpit.mjs lint|check|start [coordinator|reviewer]`.
+- `status` inside a sandbox: owner pids from another pid namespace are UNKNOWN (heartbeat decides, never ORPHANED); the Codex model catalog is cached in `runs/model-catalog.json`.
+- AgentHUD removed (`tools/agenthud`, `hud.mjs`, `lib/agenthud.mjs`, its tests); the Omnigent UI is the live view.
+- Gate: 85 tests (stub `omnigent` binary and loopback REST stub; runner with stub CLI) and the `omnigent-bundle` lint step; `./harness/verify.sh` PASSED.
+- Not done (needs approval): O1 install and probe — including a Step 0 run through an Omnigent Codex session; the CEL expressions are not compiled by cel-python yet; REST list envelopes and status transitions are from source, not observed.
+
 ## 2026-10-14 — Live agent observability (plan.md Phase 1) with AgentHUD
 
 Phase 0 found: `implement` ran Codex through `spawnSync` and wrote `events.jsonl` after exit (no live view); raw events hold full command lines, command output and model text; Codex events carry no timestamps and report usage only at turn end; `--ephemeral` means Codex writes no session files, so AgentHUD alone shows nothing of ORCH-P runs (0 rollouts with an `orch-worktrees` cwd); `state.json` was read at start and written whole at the end of each command, so concurrent BE/FE `implement` lost one side's steps; a timeout returned 127 (spawnSync ETIMEDOUT), kept as is.

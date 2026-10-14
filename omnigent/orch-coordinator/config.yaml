@@ -1,0 +1,118 @@
+# ORCH-P coordinator in the Omnigent hub (plan.md §10, docs/omnigent-evaluation.md).
+# Started only through `node ORCH-P/orchestrate/cockpit.mjs start` from the
+# workspace root, after the pin in omnigent/pin.json is approved. Checked by
+# `cockpit.mjs lint` (harness/verify.sh): do not loosen the sandbox, the
+# permission mode or the guardrails to make a session work; report the blocker.
+spec_version: 1
+name: orch-coordinator
+description: >-
+  Plans BE-P / FE-P work with the user, writes task proposals, asks ORCH-P to
+  run steps of approved tasks (each request needs the user's approval in the
+  UI) and reports status. Writes no code and approves no task; Codex
+  implementers run as their own Omnigent sessions, started by ORCH-P.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-native
+    permission_mode: default
+
+prompt: |
+  You are the ORCH-P coordinator. The workspace root is your working directory:
+  ORCH-P (orchestrator), BE-P (.NET backend) and FE-P (Next.js frontend).
+  Read AI-AGENTS.md, ORCH-P/AGENTS.md and ORCH-P/docs/orchestration.md first.
+
+  What you do:
+  - Help the user turn a goal into one ORCH-P task: which sides (be/fe), the
+    objective, allowed_paths, acceptance criteria, inputs, complexity and a
+    model from the Codex catalog. Follow ORCH-P/orchestrate/task.example.json.
+  - Write it as ORCH-P/runs/proposals/<ID>.json with "status": "proposed" and
+    "approval": null. Only the user approves a task, outside this session.
+  - Check a proposal with
+    `node ORCH-P/orchestrate/orchestrate.mjs validate <path>`; until the user
+    approves it, the only expected problem is the status line.
+  - Once the user has approved a task file, ask ORCH-P to run its steps in
+    order: prepare, then per side implement, check, verify, commit. Write one
+    request per step as ORCH-P/runs/requests/<request-id>.json:
+    {"id": "<request-id>", "task": "<task path from the workspace root>",
+     "task_sha256": "<digest printed by validate>", "command": "<step>",
+     "side": "be" | "fe"}   (no side for prepare and status).
+    The user approves each request in this UI; the ORCH-P runner then runs it
+    and writes ORCH-P/runs/requests/<request-id>.result.json. Read the result
+    before the next step. To stop a running step, request "stop" for its side.
+    Each implement step appears in this UI as its own Codex session.
+  - Report progress with
+    `node ORCH-P/orchestrate/orchestrate.mjs status <task file>`: which side is
+    running, its state (RUNNING / STALLED / ORPHANED / IDLE / UNKNOWN), steps,
+    rework and review. Say UNKNOWN when status does not show something.
+  - After both sides are committed, tell the user to start a review session
+    with the orch-reviewer agent.
+
+  What you never do: edit code, docs or task files outside
+  ORCH-P/runs/proposals and ORCH-P/runs/requests; mark a task approved; run any
+  other command; read run evidence under runs/; fetch from the web; start
+  sub-agents; push, merge, deploy or open pull requests. Policies enforce
+  this. When one blocks you, tell the user what you needed and stop; do not
+  look for another way.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_bwrap
+    write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests"]
+
+guardrails:
+  policies:
+    # Tool allowlist. Abstains ({}) when a call is allowed so the limits below
+    # still apply; asks the user before every ORCH-P request; denies every tool
+    # not named here, including Omnigent's own.
+    orch_tool_allowlist:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.builtins.cel.cel_policy
+        arguments:
+          reason: "Not allowed for the ORCH-P coordinator."
+          expression: |
+            event.type != "tool_call" ? {} :
+            event.data.name == "TodoWrite" ? {} :
+            event.data.name == "Bash" ?
+              (has(event.data.arguments.command)
+                && event.data.arguments.command.matches(r'^node ORCH-P/orchestrate/orchestrate\.mjs (status|validate) [A-Za-z0-9._/-]+\.json$')
+                && !event.data.arguments.command.contains("..")
+                ? {} : {"result": "DENY", "reason": "Only `node ORCH-P/orchestrate/orchestrate.mjs status|validate <task.json>` may run."}) :
+            event.data.name == "Read" ?
+              (has(event.data.arguments.file_path)
+                && !event.data.arguments.file_path.matches(r'(^|/)(\.\.|\.[^/]+)(/|$)')
+                && (!event.data.arguments.file_path.matches(r'(^|/)runs(/|$)')
+                    || event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/(proposals|requests)/[A-Za-z0-9._-]+\.json$'))
+                ? {} : {"result": "DENY", "reason": "Read is limited to workspace files outside runs/ and dot-paths (proposals and request results excepted)."}) :
+            event.data.name in ["Grep", "Glob"] ?
+              (has(event.data.arguments.path)
+                && !event.data.arguments.path.matches(r'(^|/)(\.\.|\.[^/]+|runs)(/|$)')
+                && event.data.arguments.path.matches(r'(^|/)(ORCH-P|BE-P|FE-P)(/|$)')
+                ? {} : {"result": "DENY", "reason": "Search needs an explicit path inside ORCH-P, BE-P or FE-P, outside runs/ and dot-paths."}) :
+            event.data.name in ["Write", "Edit", "MultiEdit"] ?
+              (!has(event.data.arguments.file_path) || event.data.arguments.file_path.contains("..")
+                ? {"result": "DENY", "reason": "Writes need a plain path."} :
+              event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/proposals/[A-Za-z0-9._-]+\.json$') ? {} :
+              event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/requests/[A-Za-z0-9_-]+\.json$')
+                ? {"result": "ASK", "reason": "Run this ORCH-P step? Check the command, task and side in the request."} :
+              {"result": "DENY", "reason": "Writes are limited to ORCH-P/runs/proposals/<ID>.json and ORCH-P/runs/requests/<id>.json."}) :
+            {"result": "DENY", "reason": "Tool not on the ORCH-P coordinator allowlist."}
+    tool_cap:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.builtins.safety.max_tool_calls_per_session
+        arguments:
+          limit: 150
+    loop_guard:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.builtins.safety.detect_loop
+        arguments:
+          window: 10
+          threshold: 3

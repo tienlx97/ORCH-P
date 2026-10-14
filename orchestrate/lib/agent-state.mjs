@@ -6,11 +6,10 @@
 // turns the observer off; gates, scope checks, exit codes and evidence are
 // unaffected.
 import {
-  closeSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync,
+  closeSync, mkdirSync, openSync, readFileSync, readlinkSync, renameSync, rmSync, statSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
 
-import { AgentHudProjection } from './agenthud.mjs';
 import { LiveWriter, safeText } from './event-stream.mjs';
 
 /** Kernel start time of a process (/proc), to tell a live owner from a reused pid. */
@@ -23,12 +22,19 @@ export function processStartTime(pid) {
   }
 }
 
-export function currentOwner() {
-  return { pid: process.pid, start_time: processStartTime(process.pid) };
+/** This process's pid namespace; pids from another namespace (an Omnigent sandbox) cannot be checked. */
+export function pidNamespace() {
+  try { return readlinkSync('/proc/self/ns/pid'); } catch { return null; }
 }
 
-export function processAlive(owner) {
+export function currentOwner() {
+  return { pid: process.pid, start_time: processStartTime(process.pid), pid_ns: pidNamespace() };
+}
+
+/** true / false, or null when the owner lives in another pid namespace and cannot be checked from here. */
+export function processAlive(owner, ns = pidNamespace()) {
   if (!Number.isInteger(owner?.pid) || owner.pid <= 0) return false;
+  if (owner.pid_ns && ns && owner.pid_ns !== ns) return null;
   try { process.kill(owner.pid, 0); } catch (error) { if (error.code !== 'EPERM') return false; }
   const start = processStartTime(owner.pid);
   return !(owner.start_time && start && owner.start_time !== start);
@@ -65,7 +71,7 @@ export function withLock(lockPath, fn, { waitMs = 60_000 } = {}) {
       let age = 0;
       try { age = Date.now() - statSync(lockPath).mtimeMs; } catch { continue; }
       // Gone owner, or a lock file that never got its content (writer died between create and write).
-      if ((holder && !processAlive(holder)) || (!holder && age > 5_000)) {
+      if ((holder && processAlive(holder) === false) || (!holder && age > 5_000)) {
         if (JSON.stringify(readJson(lockPath)) === JSON.stringify(holder)) rmSync(lockPath, { force: true });
         continue;
       }
@@ -97,7 +103,7 @@ export function deriveLive(snapshot, { now = Date.now(), alive = processAlive, s
     next: snapshot.next, summary: snapshot.summary,
   };
   if (!snapshot.active) return { status: 'IDLE', ...view };
-  if (!alive(snapshot.owner)) return { status: 'ORPHANED', reason: 'orchestrator process is gone; the command did not record a result', ...view };
+  if (alive(snapshot.owner) === false) return { status: 'ORPHANED', reason: 'orchestrator process is gone; the command did not record a result', ...view };
   const ago = (iso) => now - (Date.parse(iso ?? '') || 0);
   if (ago(snapshot.heartbeat_at) > HEARTBEAT_STALE_MS) return { status: 'STALLED', reason: 'no orchestrator heartbeat', ...view };
   if (snapshot.stage === 'implement' && ago(snapshot.last_agent_event_at ?? snapshot.since) > stallMs) {
@@ -119,11 +125,11 @@ export const openObservers = new Set();
 
 /**
  * Publishes one orchestrator command on one side: the sanitized stream, the
- * side's snapshot and the AgentHUD projection. Usage:
+ * side's snapshot. Usage:
  *   const obs = new AgentObserver({...}); obs.start('running'); obs.emit(kind, data); obs.finish('idle', summary)
  */
 export class AgentObserver {
-  constructor({ liveDir, hudRoot, taskId, runId, side, command, attempt, provider, model, effort, preparedAt, warn = (m) => console.error(m) }) {
+  constructor({ liveDir, taskId, runId, side, command, attempt, provider, model, effort, warn = (m) => console.error(m) }) {
     this.warn = warn;
     this.failed = false;
     this.liveDir = liveDir;
@@ -133,7 +139,6 @@ export class AgentObserver {
       mkdirSync(join(liveDir, 'agents'), { recursive: true, mode: 0o700 });
       const previous = readJson(snapshotPath(liveDir, side));
       this.writer = new LiveWriter({ dir: liveDir, base });
-      this.hud = hudRoot ? new AgentHudProjection({ root: hudRoot, taskId, side, startedAt: preparedAt, model }) : null;
       this.snapshot = {
         ...(previous ?? {}),
         v: 1, run_id: runId, task_id: taskId, side, role: base.role, provider, model, effort, attempt,
@@ -171,7 +176,6 @@ export class AgentObserver {
     const at = new Date().toISOString();
     Object.assign(this.snapshot, { state, summary: summary ? safeText(summary, 240) : null, since: at, last_event_at: at, ...extra });
     const event = this.writer.emit('lifecycle', { from, to: state, summary: this.snapshot.summary, title: this.title(state) });
-    this.hud?.event({ kind: 'lifecycle', data: { title: this.title(state), summary: this.snapshot.summary } });
     this.save();
     return event;
   }
@@ -209,7 +213,15 @@ export class AgentObserver {
       if (kind === 'agent.message') s.counts.messages += 1;
       if (kind === 'stream.anomaly') s.counts.anomalies += 1;
       if (kind === 'usage' && data.usage) s.usage = data.usage;
-      this.hud?.event(event);
+      this.save();
+    });
+  }
+
+  /** The agent is working but reports no events here (an Omnigent session): keeps STALLED meaningful. */
+  agentActive() {
+    this.guard(() => {
+      const now = new Date().toISOString();
+      Object.assign(this.snapshot, { heartbeat_at: now, last_agent_event_at: now });
       this.save();
     });
   }
@@ -218,7 +230,6 @@ export class AgentObserver {
     this.guard(() => {
       this.snapshot.heartbeat_at = new Date().toISOString();
       this.save();
-      this.hud?.touch();
     });
   }
 
@@ -245,6 +256,5 @@ export class AgentObserver {
   close() {
     openObservers.delete(this);
     this.writer?.close();
-    this.hud?.close();
   }
 }

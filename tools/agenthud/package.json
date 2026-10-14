@@ -1,8 +1,0 @@
-{
-  "name": "orch-p-agenthud",
-  "private": true,
-  "description": "Pinned AgentHUD for orchestrate/hud.mjs. Install with: npm ci --ignore-scripts --prefix tools/agenthud",
-  "dependencies": {
-    "agenthud": "0.19.0"
-  }
-}

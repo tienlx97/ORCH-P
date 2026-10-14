@@ -1,0 +1,5 @@
+# Required content of ~/.omnigent/config.yaml for the ORCH-P cockpit
+# (docs/omnigent-evaluation.md). The local server reads that file, not this one;
+# orchestrate/cockpit.mjs refuses to start unless it sets the line below, and
+# also sets OMNIGENT_ANALYTICS=0, DO_NOT_TRACK=1 and OMNIGENT_NO_UPDATE_CHECK=1.
+telemetry: false

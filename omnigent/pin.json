@@ -1,0 +1,10 @@
+{
+  "package": "omnigent",
+  "version": "0.18.0",
+  "source_commit": "a8676d23e88df7918f4f8ef1c7c4e3186e710354",
+  "wheel_sha256": "940652288d3bb90b976557859ac5b40124944427e4bfd3f346b84b801b1d2716",
+  "evaluated": "2026-10-14",
+  "evaluation": "docs/omnigent-evaluation.md",
+  "status": "evaluated-static",
+  "approval": null
+}
