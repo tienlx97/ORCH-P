@@ -34,6 +34,12 @@ prompt: |
      unless the criterion cannot be tested in that repository (e.g. browser
      evidence); then say so in a minor finding. The gate ran the tests; you
      judge only whether they cover the criteria.
+     Severity: blocking only for a defect (wrong behaviour, data loss, a broken
+     contract), a security problem, a change outside the objective, or a
+     testable criterion with no test. Style, naming, refactoring ideas, extra
+     tests beyond the criteria and documentation wording are minor. Verdict
+     "accept" when no finding is blocking: every rework round costs a Codex
+     run.
   4. Write ORCH-P/runs/reviews/<task id>.json:
      {"commits": {"be": "<sha>", "fe": "<sha>"}, "verdict": "accept" | "rework_required",
       "acceptance": [{"side": "be", "criterion": "<text>", "tests": ["<path>::<test name>"],
@@ -91,8 +97,10 @@ guardrails:
               (has(event.data.arguments.file_path)
                 && !event.data.arguments.file_path.matches(r'(^|/)(\.\.|\.[^/]+)(/|$)')
                 && (!event.data.arguments.file_path.matches(r'(^|/)runs(/|$)')
-                    || event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/reviews/[A-Za-z0-9_-]+\.json$'))
-                ? {} : {"result": "DENY", "reason": "Read is limited to workspace files outside runs/ and dot-paths (reviews excepted)."}) :
+                    || event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/reviews/[A-Za-z0-9_-]+\.json$')
+                    || event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/proposals/[A-Za-z0-9_-]+\.json$')
+                    || event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/autopilot/[A-Z0-9-]+/tasks/[A-Z0-9-]+\.json$'))
+                ? {} : {"result": "DENY", "reason": "Read is limited to workspace files outside runs/ and dot-paths (task files and reviews excepted)."}) :
             event.data.name in ["Grep", "Glob"] ?
               (has(event.data.arguments.path)
                 && !event.data.arguments.path.matches(r'(^|/)(\.\.|\.[^/]+|runs)(/|$)')

@@ -417,6 +417,8 @@ test('coordinator CEL allowlist compiles and decides as intended', { skip: !celP
     [tool('Bash', { command: 'node ORCH-P/orchestrate/orchestrate.mjs status ../x.json' }), 'DENY'],
     [tool('Bash', { command: 'curl http://127.0.0.1:6767/v1/sessions' }), 'DENY'],
     [tool('Bash', { command: 'node ORCH-P/orchestrate/orchestrate.mjs implement T.json be' }), 'DENY'],
+    [tool('Bash', { command: 'node ORCH-P/orchestrate/autopilot.mjs check ORCH-P/runs/proposals/P.plan.json' }), 'ALLOW'],
+    [tool('Bash', { command: 'node ORCH-P/orchestrate/autopilot.mjs run ORCH-P/runs/proposals/P.plan.json' }), 'DENY'],
     [tool('Read', { file_path: '/w/LOG/ORCH-P/AGENTS.md' }), 'ALLOW'],
     [tool('Read', { file_path: '/w/LOG/BE-P/.env' }), 'DENY'],
     [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/orch-T/state.json' }), 'DENY'],
@@ -432,7 +434,7 @@ test('coordinator CEL allowlist compiles and decides as intended', { skip: !celP
     [{ type: 'request', data: { user_content: 'hi' } }, 'ALLOW'],
   ];
   assert.deepEqual(decide('orch-coordinator', cases.map(([e]) => e)), cases.map(([, d]) => d));
-  const r = spawnSync(celPython, ['-I', join(REPO, 'tests', 'cel_check.py'), join(BUNDLE, 'orch-coordinator', 'config.yaml')], { input: JSON.stringify([cases[11][0]]), encoding: 'utf8' });
+  const r = spawnSync(celPython, ['-I', join(REPO, 'tests', 'cel_check.py'), join(BUNDLE, 'orch-coordinator', 'config.yaml')], { input: JSON.stringify([cases[13][0]]), encoding: 'utf8' });
   assert.ok(JSON.parse(r.stdout)[0].reason.includes('"command": "implement"') || JSON.parse(r.stdout)[0].reason.includes('"command":"implement"'), 'the ASK shows the request');
 });
 
@@ -447,6 +449,10 @@ test('reviewer CEL allowlist compiles and decides as intended', { skip: !celPyth
     [tool('Write', { file_path: '/w/LOG/ORCH-P/runs/reviews/T.json', content: '{}' }), 'ALLOW'],
     [tool('Write', { file_path: '/w/LOG/ORCH-P/runs/orch-T/state.json', content: '{}' }), 'DENY'],
     [tool('Read', { file_path: '/w/LOG/BE-P/.git/config' }), 'DENY'],
+    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/proposals/SHIPDOC-01.json' }), 'ALLOW'],
+    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/autopilot/SHIPDOC/tasks/SHIPDOC-02.json' }), 'ALLOW'],
+    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/autopilot/SHIPDOC/state.json' }), 'DENY'],
+    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/orch-SHIPDOC-01/state.json' }), 'DENY'],
   ];
   assert.deepEqual(decide('orch-reviewer', cases.map(([e]) => e)), cases.map(([, d]) => d));
 });

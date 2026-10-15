@@ -17,6 +17,7 @@
       "allowed_paths": ["src/**", "tests/**", "docs/api/**", "requests/**", "openspec/changes/<slug>/**"],
       "acceptance_criteria": ["Observable behavior 1", "Tests that prove it"],
       "inputs": ["openspec/changes/<slug>/proposal.md"],
+      "context": "Optional: the part of the approved spec this side needs (Codex sees only its worktree)",
       "timeout_minutes": 60
     },
     "fe": {

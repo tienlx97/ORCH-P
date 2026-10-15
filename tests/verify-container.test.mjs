@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { containerArgs, dockerfileDigest, restoreInputChanges } from '../verify-container/run-gate.mjs';
+import { containerArgs, dockerfileDigest, orphanRunIds, restoreInputChanges } from '../verify-container/run-gate.mjs';
 
 const RUNNER = join(dirname(fileURLToPath(import.meta.url)), '..', 'verify-container', 'run-gate.mjs');
 const GIT_ENV = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith('GIT_')));
@@ -231,4 +231,9 @@ test('agent restore: refused on changed restore inputs, without --packages, or a
   assert.equal(runner(ctx, ['restore', ctx.wt, '--base', ctx.base.slice(0, 7), '--packages', join(ctx.dir, 'p')]).status, 2);
   r = runner(ctx, ['restore', ctx.wt, '--base', ctx.base, '--packages', join(ctx.dir, 'p')], { STUB_RESTORE_EXIT: '4' });
   assert.equal(r.status, 4);
+});
+
+test('reap removes only runs whose gate process is gone', () => {
+  const alive = (pid) => pid === 409710;
+  assert.deepEqual(orphanRunIds(['be-1792058181741-409710', 'be-1792058370601-416458', 'be-1792058370601-416458', 'fe-1-x', 'junk'], alive), ['be-1792058370601-416458']);
 });

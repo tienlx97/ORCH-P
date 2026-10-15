@@ -24,7 +24,7 @@ step() {
 SECRET_PATTERN='-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9]{20,}'
 
 step "syntax" bash -c 'for f in $(git ls-files "*.mjs"); do node --check "$f" || exit 1; done'
-step "tests" node --test tests/orchestrate.test.mjs tests/verify-container.test.mjs tests/observability.test.mjs tests/omnigent.test.mjs tests/runner.test.mjs
+step "tests" node --test tests/orchestrate.test.mjs tests/verify-container.test.mjs tests/observability.test.mjs tests/omnigent.test.mjs tests/runner.test.mjs tests/autopilot.test.mjs
 step "omnigent-bundle" node orchestrate/cockpit.mjs lint
 step "secret-scan" bash -c "! git grep -nE -- '$SECRET_PATTERN' -- . ':!harness/verify.sh'"
 step "whitespace" bash -c 'git diff --check HEAD && git diff --check --cached'

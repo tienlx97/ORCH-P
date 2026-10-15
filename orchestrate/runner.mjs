@@ -16,10 +16,16 @@
 // sha256 the coordinator saw; never approval, cleanup, review-record, push or
 // merge. `stop` sends SIGTERM to the running step of that task side
 // (implement forwards it to Codex or interrupts the Omnigent session).
+//
+// `autopilot` names a plan instead of a task ({"plan", "plan_sha256"}):
+// approving it is the one approval of every task in the plan, and the runner
+// starts orchestrate/autopilot.mjs for it; `stop` with the plan stops it.
+// One runner per requests directory: a second one refuses to start, so a
+// request never runs twice.
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync,
+  appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,8 +37,9 @@ const ORCH_REPO = resolve(HERE, '..');
 const WORKSPACE = resolve(process.env.ORCH_WORKSPACE_ROOT ?? join(ORCH_REPO, '..'));
 const STATE_ROOT = resolve(process.env.ORCH_STATE_ROOT ?? join(ORCH_REPO, 'runs'));
 const CLI = resolve(process.env.ORCH_RUNNER_CLI ?? join(HERE, 'orchestrate.mjs'));
+const AUTOPILOT = resolve(process.env.ORCH_RUNNER_AUTOPILOT ?? join(HERE, 'autopilot.mjs'));
 
-export const RUNNER_COMMANDS = Object.freeze(['prepare', 'implement', 'check', 'verify', 'commit', 'status', 'stop']);
+export const RUNNER_COMMANDS = Object.freeze(['prepare', 'implement', 'check', 'verify', 'commit', 'status', 'stop', 'autopilot']);
 const SIDED = new Set(['implement', 'check', 'verify', 'commit', 'stop']);
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
@@ -43,6 +50,7 @@ export function validateRequest(file, raw, { workspace = WORKSPACE } = {}) {
   const id = file.replace(/\.json$/, '');
   if (!ID.test(id) || request.id !== id) return { error: 'request id must match the file name ([A-Za-z0-9_-], up to 64)' };
   if (!RUNNER_COMMANDS.includes(request.command)) return { error: `command must be one of ${RUNNER_COMMANDS.join(', ')}` };
+  if (request.command === 'autopilot' || (request.command === 'stop' && request.plan !== undefined)) return validatePlanRequest(request, workspace);
   if (SIDED.has(request.command) ? !['be', 'fe'].includes(request.side) : request.side !== undefined) {
     return { error: SIDED.has(request.command) ? 'side must be be or fe' : `${request.command} takes no side` };
   }
@@ -61,6 +69,44 @@ export function validateRequest(file, raw, { workspace = WORKSPACE } = {}) {
   return { request: { ...request, taskPath: task, key: `${parsed.id}/${request.side ?? '-'}` } };
 }
 
+/** An autopilot (or stop) request: a plan file in the workspace, bound to the sha256 the user approved. */
+function validatePlanRequest(request, workspace) {
+  if (request.task !== undefined || request.side !== undefined) return { error: `${request.command} for a plan takes plan and plan_sha256, not task or side` };
+  if (typeof request.plan !== 'string' || request.plan.includes('\0')) return { error: 'plan must be a path' };
+  const plan = resolve(workspace, request.plan);
+  const inside = relative(workspace, plan);
+  if (!inside || inside.startsWith('..') || isAbsolute(inside) || !plan.endsWith('.plan.json')) return { error: 'plan must be a .plan.json file inside the workspace' };
+  if (!existsSync(plan)) return { error: 'plan file not found' };
+  const content = readFileSync(plan);
+  if (!/^[0-9a-f]{64}$/.test(request.plan_sha256 ?? '') || createHash('sha256').update(content).digest('hex') !== request.plan_sha256) {
+    return { error: 'plan_sha256 does not match the plan file (it changed after the request was approved)' };
+  }
+  let parsed;
+  try { parsed = JSON.parse(content); } catch { return { error: 'plan file is not JSON' }; }
+  return { request: { ...request, planPath: plan, key: `plan:${parsed.id}` } };
+}
+
+/** One runner per requests directory; returns a release function, or null when another runner is alive. */
+export function acquireRunnerLock(dir) {
+  const file = join(dir, '.runner.lock');
+  for (let i = 0; i < 2; i += 1) {
+    try {
+      const fd = openSync(file, 'wx', 0o600);
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+      return () => rmSync(file, { force: true });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const pid = Number.parseInt(readFileSync(file, 'utf8'), 10);
+      let alive = false;
+      try { process.kill(pid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
+      if (alive) return null;
+      rmSync(file, { force: true });
+    }
+  }
+  return null;
+}
+
 function writeAtomic(file, text) {
   const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, text, { mode: 0o600 });
@@ -70,10 +116,11 @@ function writeAtomic(file, text) {
 const tail = (text, lines = 40) => text.split('\n').slice(-lines).map((l) => safeText(l, 400)).join('\n');
 
 export class Runner {
-  constructor({ dir = join(STATE_ROOT, 'requests'), workspace = WORKSPACE, cli = CLI, env = process.env, log = (m) => console.log(m) } = {}) {
+  constructor({ dir = join(STATE_ROOT, 'requests'), workspace = WORKSPACE, cli = CLI, autopilot = AUTOPILOT, env = process.env, log = (m) => console.log(m) } = {}) {
     this.dir = dir;
     this.workspace = workspace;
     this.cli = cli;
+    this.autopilot = autopilot;
     this.env = env;
     this.log = log;
     this.running = new Map();
@@ -100,7 +147,16 @@ export class Runner {
       if (request.command === 'stop') {
         const child = this.running.get(request.key);
         if (child) child.kill('SIGTERM');
-        this.result(id, { command: 'stop', side: request.side, exit: child ? 0 : 1, note: child ? 'SIGTERM sent' : 'nothing running for that task side' });
+        this.result(id, { command: 'stop', side: request.side ?? null, exit: child ? 0 : 1, note: child ? 'SIGTERM sent' : `nothing running for ${request.key}` });
+        continue;
+      }
+      if (request.command === 'autopilot' && this.running.has(request.key)) {
+        this.result(id, { refused: `${request.key} is already running; request stop first or wait` });
+        continue;
+      }
+      const plan = [...this.running.keys()].find((k) => k.startsWith('plan:'));
+      if (plan && request.command !== 'status' && request.command !== 'autopilot') {
+        this.result(id, { refused: `${plan} is running; its steps are the autopilot's until it stops` });
         continue;
       }
       if (request.command !== 'status' && request.command !== 'prepare' && this.running.has(request.key)) {
@@ -113,10 +169,12 @@ export class Runner {
   }
 
   execute(id, request) {
-    const args = [this.cli, request.command, request.taskPath, ...(request.side ? [request.side] : [])];
+    const args = request.command === 'autopilot'
+      ? [this.autopilot, 'run', request.planPath, '--approval', `Omnigent ASK, runner request ${id}`]
+      : [this.cli, request.command, request.taskPath, ...(request.side ? [request.side] : [])];
     const startedAt = new Date().toISOString();
     const child = spawn(process.execPath, args, { cwd: ORCH_REPO, env: this.env, stdio: ['ignore', 'pipe', 'pipe'] });
-    if (SIDED.has(request.command)) this.running.set(request.key, child);
+    if (SIDED.has(request.command) || request.command === 'autopilot') this.running.set(request.key, child);
     let output = '';
     const keep = (d) => { output = (output + d).slice(-200_000); };
     child.stdout.on('data', keep);
@@ -125,7 +183,8 @@ export class Runner {
       child.on('close', (code, signal) => {
         if (this.running.get(request.key) === child) this.running.delete(request.key);
         this.result(id, {
-          command: request.command, side: request.side ?? null, task: relative(this.workspace, request.taskPath),
+          command: request.command, side: request.side ?? null, task: request.taskPath ? relative(this.workspace, request.taskPath) : null,
+          ...(request.planPath ? { plan: relative(this.workspace, request.planPath) } : {}),
           exit: code ?? (signal ? 128 : 1), signal, started_at: startedAt, output: tail(output),
         });
         done();
@@ -137,12 +196,18 @@ export class Runner {
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   if (process.argv.length > 2) { console.error('usage: node orchestrate/runner.mjs'); process.exit(2); }
   const runner = new Runner();
+  const release = acquireRunnerLock(runner.dir);
+  if (!release) {
+    console.error(`refused: another runner is already watching ${runner.dir} (pid in ${join(runner.dir, '.runner.lock')}); keep only one`);
+    process.exit(2);
+  }
   console.log(`runner: watching ${runner.dir} (Ctrl-C stops the runner and any running step)`);
   const timer = setInterval(() => runner.scan(), 1000);
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
       clearInterval(timer);
       for (const child of runner.running.values()) child.kill('SIGTERM');
+      release();
       setTimeout(() => process.exit(130), 200);
     });
   }
