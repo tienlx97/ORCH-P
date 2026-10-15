@@ -13,6 +13,7 @@
       "objective": "One sentence: the backend outcome",
       "complexity": "complex",
       "model": "<model slug from `codex debug models`>",
+      "runner": "omnigent",
       "allowed_paths": ["src/**", "tests/**", "docs/api/**", "requests/**", "openspec/changes/<slug>/**"],
       "acceptance_criteria": ["Observable behavior 1", "Tests that prove it"],
       "inputs": ["openspec/changes/<slug>/proposal.md"],
@@ -23,6 +24,7 @@
       "objective": "One sentence: the frontend outcome",
       "complexity": "normal",
       "model": "<model slug>",
+      "runner": "omnigent",
       "allowed_paths": ["src/**", "openspec/changes/<slug>/**"],
       "acceptance_criteria": ["Observable UI behavior", "Adapter tests"],
       "inputs": ["BE handoff: docs/api changes and the verified BE commit"]

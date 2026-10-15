@@ -1,0 +1,111 @@
+# ORCH-P independent reviewer in the Omnigent hub (plan.md §10, docs/omnigent-evaluation.md).
+# A Claude session that reviews Codex's verified commits and records the review
+# through ORCH-P, whose provenance check needs a Claude process (this session)
+# and no Codex process in the ancestry. Checked by `cockpit.mjs lint`.
+spec_version: 1
+name: orch-reviewer
+description: >-
+  Reviews the verified BE-P / FE-P commits of an ORCH-P task against its
+  acceptance criteria and records accept or rework_required. Reads code and
+  diffs only; writes only its review file.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-native
+    permission_mode: default
+
+prompt: |
+  You are the ORCH-P reviewer, independent of the Codex implementer. The
+  workspace root is your working directory. Read ORCH-P/AGENTS.md and
+  ORCH-P/docs/orchestration.md (review-record) first.
+
+  1. Run `node ORCH-P/orchestrate/orchestrate.mjs status <task file>` and note
+     each side's base and verified commit.
+  2. Read each change with `git -C BE-P show <commit>` /
+     `git -C FE-P diff <base>..<commit>` and the files around it. Judge it only
+     against the task's objective, allowed_paths and acceptance criteria, plus
+     correctness, security and tests.
+  3. Write ORCH-P/runs/reviews/<task id>.json:
+     {"commits": {"be": "<sha>", "fe": "<sha>"}, "verdict": "accept" | "rework_required",
+      "findings": [{"side": "be", "severity": "blocking" | "minor", "file": "<path>",
+                    "summary": "<what and why>"}]}
+  4. Record it: `node ORCH-P/orchestrate/orchestrate.mjs review-record <task file>
+     ORCH-P/runs/reviews/<task id>.json`, and report the result.
+
+  Never edit code, never run builds or tests (the gate already did), never
+  push, merge or open pull requests. Policies enforce this; when one blocks
+  you, report it and stop.
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: linux_bwrap
+    # Claude's own login and state (~/.claude, ~/.claude.json), the nvm node
+    # for `node ORCH-P/...`, and Omnigent's runtime dir /tmp/omnigent-<uid>
+    # (its hooks in Claude write the settings/bridge files there; observed
+    # 2026-10-15 — without it Claude never accepts a message). $HOME is
+    # otherwise not mounted. The tool allowlist
+    # still denies every Read/Write of a dot-path, so only the Claude process
+    # itself uses them.
+    read_paths: ["~/.nvm"]
+    write_paths: ["ORCH-P/runs", "~/.claude", "/tmp/omnigent-1000"]
+    write_files: ["~/.claude.json"]
+    cwd_allow_hidden: [".git", ".nvm", ".claude", ".credentials.json"]
+    # No egress_rules: with them, sessions created through the REST API cannot reach
+    # Omnigent's egress proxy and Claude never reaches the API (observed 2026-10-15).
+    # The network is open, so the CEL allowlist (no network commands) and the user's
+    # per-command approval are what keep this agent off the local Omnigent API.
+
+guardrails:
+  policies:
+    orch_tool_allowlist:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.builtins.cel.cel_policy
+        arguments:
+          reason: "Not allowed for the ORCH-P reviewer."
+          expression: |
+            event.type != "tool_call" ? {} :
+            event.data.name == "TodoWrite" ? {} :
+            event.data.name == "Bash" ?
+              (has(event.data.arguments.command)
+                && ((event.data.arguments.command.matches(r'^git -C (BE-P|FE-P) (show|diff|log) [A-Za-z0-9._/:^~ -]+$')
+                     && !event.data.arguments.command.matches(r'--(output|no-index|ext-diff|textconv)'))
+                    || (event.data.arguments.command.matches(r'^node ORCH-P/orchestrate/orchestrate\.mjs (status [A-Za-z0-9._/-]+\.json|review-record [A-Za-z0-9._/-]+\.json ORCH-P/runs/reviews/[A-Za-z0-9_-]+\.json)$')
+                        && !event.data.arguments.command.contains("..")))
+                ? {} : {"result": "DENY", "reason": "Only read-only git show/diff/log in BE-P or FE-P, and ORCH-P status / review-record, may run."}) :
+            event.data.name == "Read" ?
+              (has(event.data.arguments.file_path)
+                && !event.data.arguments.file_path.matches(r'(^|/)(\.\.|\.[^/]+)(/|$)')
+                && (!event.data.arguments.file_path.matches(r'(^|/)runs(/|$)')
+                    || event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/reviews/[A-Za-z0-9_-]+\.json$'))
+                ? {} : {"result": "DENY", "reason": "Read is limited to workspace files outside runs/ and dot-paths (reviews excepted)."}) :
+            event.data.name in ["Grep", "Glob"] ?
+              (has(event.data.arguments.path)
+                && !event.data.arguments.path.matches(r'(^|/)(\.\.|\.[^/]+|runs)(/|$)')
+                && event.data.arguments.path.matches(r'(^|/)(ORCH-P|BE-P|FE-P)(/|$)')
+                ? {} : {"result": "DENY", "reason": "Search needs an explicit path inside ORCH-P, BE-P or FE-P, outside runs/ and dot-paths."}) :
+            event.data.name in ["Write", "Edit", "MultiEdit"] ?
+              (has(event.data.arguments.file_path)
+                && event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/reviews/[A-Za-z0-9_-]+\.json$')
+                && !event.data.arguments.file_path.contains("..")
+                ? {} : {"result": "DENY", "reason": "Writes are limited to ORCH-P/runs/reviews/<task id>.json."}) :
+            {"result": "DENY", "reason": "Tool not on the ORCH-P reviewer allowlist."}
+    tool_cap:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.builtins.safety.max_tool_calls_per_session
+        arguments:
+          limit: 200
+    loop_guard:
+      type: function
+      on: [tool_call]
+      function:
+        path: omnigent.policies.builtins.safety.detect_loop
+        arguments:
+          window: 10
+          threshold: 3

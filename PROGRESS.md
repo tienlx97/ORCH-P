@@ -2,6 +2,48 @@
 
 Newest first. Evidence directories under `runs/` are local (gitignored).
 
+## 2026-10-15 — Coordinator / reviewer trial; egress_rules dropped
+
+- Coordinator self-test through a REST-created session: reads allowed, `.env` and `curl` refused (by the agent and the CEL allowlist), Bash waits for the user's approval under `permission_mode: default`. Claude needs write access to `/tmp/omnigent-<uid>` (both agents); `egress_rules` break REST-created sessions (egress proxy refused), so the user chose option A: removed from both agents, lint rejects them until the proxy is understood. Residual: agents can reach the unauthenticated local API, held off by the CEL allowlist and per-command approval.
+- Agents are installed with `omnigent agent add` (coordinator v4, reviewer v2) and sessions are created over REST or in the web UI; `omni run -p` without a TTY stops the session after the first message.
+- Open: question 6 (`node` in the sandbox) once the pending `status` approval is given; question 7 (reviewer) and the pilot task need a real BE-P / FE-P task.
+
+## 2026-10-15 — Option 3: Codex sessions in Omnigent under the accepted read-isolation risk
+
+- The three options for Codex ignoring the permission profile in Omnigent are saved in `docs/omnigent-evaluation.md`; the user chose option 3 first. `omnigent/pin.json` is approved and records the accepted risk `codex-read-isolation` (exactly the five read checks); AGENTS.md rule 2 names it as the only exception.
+- `implement` (`runner: omnigent`) runs when Step 0 through Omnigent fails only covered checks, warns on every run and records `accepted_risks`. Everything else stays mandatory and is checked per run: Codex's own log must show only `WorkspaceWrite`/`ReadOnly` (read from the session's `logs_2.sqlite`, waiting for the flush), no permission-mode change item, secret scan of the history.
+- Found during the runs: Omnigent labels this stance `full-access` while Codex runs WorkspaceWrite, so the label is recorded but not used; Codex flushes its log seconds after the session is idle.
+- Step 0 through Omnigent (third run): writes outside, network, loopback denied; no credential variables; private TMPDIR; sandbox policies `ReadOnly`, `WorkspaceWrite`; reads allowed (accepted).
+
+## 2026-10-14 — O1: Omnigent installed and probed; Codex sessions in Omnigent blocked
+
+- Installed `omnigent==0.18.0` into `tools/omnigent/.venv` from `tools/omnigent/requirements.lock` (94 packages, hash-pinned, wheels only; wheel sha256 = pin). `~/.omnigent/config.yaml` sets `telemetry: false`.
+- `cockpit.mjs host` / `host-stop` start the daemon (stdin closed: with a pipe the CLI hangs) with the allowlisted environment and `CODEX_HOME=~/.codex-orch` (hub Codex home: `model` only, `auth.json` linked), recorded in `runs/omnigent-host.json`; `implement` and `step0-omnigent.mjs` require that daemon. `HARNESS_CODEX_MINIMAL_CONFIG` was dropped: the daemon strips it before runners.
+- Codex profile passed as a file profile (`--profile`, launch args are capped at 4096 characters) plus `-c default_permissions`.
+- `probe-api`: real REST shapes recorded; client and runner match them. Server bound to 127.0.0.1 only; idle sockets loopback only; no Claude/Codex setting changed.
+- **Step 0 through Omnigent: NOT READY.** Writes outside, network and loopback denied, but reads of the canary, SSH key, `~/.codex/auth.json`, `~/.omnigent` and BE `.env` succeeded: Codex logged `sandbox_policy=WorkspaceWrite … permission_profile: None` for the app-server/`--remote` thread, ignoring the permission profile. `implement` with `runner: omnigent` stays blocked; use `runner: codex-exec`.
+- CEL allowlists confirmed under the installed cel-python (tests no longer skipped). Gate: 96 tests, all pass.
+
+## 2026-10-14 — Design answers for the ten O1 questions
+
+- Codex sessions in Omnigent: launch args add `shell_environment_policy.inherit="core"` and the run's private `TMPDIR`; `implement` refuses a `~/.codex/config.toml` with MCP servers, notify, hooks, profiles, sandbox/approval settings or a model provider (Omnigent copies it into the session).
+- `orchestrate/step0-omnigent.mjs`: Step 0 inside a real Omnigent Codex session (canary, credentials, `~/.omnigent`, `.env`, write outside, network, loopback to Omnigent, credential env vars, private TMPDIR); `implement` with `runner: omnigent` requires it READY for the pinned Omnigent and installed Codex.
+- `cockpit.mjs probe-api` (GET only) records real REST shapes; `cockpit.mjs start` warns when a session changed Claude/Codex settings.
+- Agents: `~/.claude` login files and `~/.nvm` in their sandboxes (dot-path tool access still denied); request writes are `Write` only and the ASK shows the request. `tests/cel_check.py` evaluates both CEL allowlists where cel-python exists (skipped here).
+- Open after O1: whether the local server can require a token or the agent sandbox takes egress rules (question 9). Details: `docs/omnigent-evaluation.md`.
+
+## 2026-10-14 — Omnigent as the agent hub; AgentHUD removed
+
+- Rules: AGENTS.md rule 7 admits a third-party platform only after a written static evaluation and the user's written approval. The user then chose Omnigent as the hub that runs, coordinates and keeps the shared history of every agent.
+- Evaluated `omnigent==0.18.0` (tag `v0.18.0` = `a8676d23e88d`) statically; not installed, nothing run. Key findings: its Codex dispatch gives sub-agents a full sandbox bypass by default and ignores their launch args; top-level sessions accept launch args and pass `default_permissions` profiles; its bwrap cannot host Codex's sandbox; loopback single-user API is unauthenticated; telemetry opt-outs prevent the remote config fetch. Details and the O1 questions: `docs/omnigent-evaluation.md`.
+- `implement` has `runner: omnigent` (default) — a `codex-native-ui` session created over the loopback API with the Step 0 profile as launch args, session policies before the prompt, history exported as evidence (0600), and a permission change in the UI blocks the side — and `runner: codex-exec` (the previous path, kept as fallback; shared `finishImplement`).
+- `orchestrate/runner.mjs`: runs step requests the coordinator writes and the user approves in the Omnigent UI (prepare/implement/check/verify/commit/status/stop), bound to the task's sha256; results and audit log.
+- `omnigent/`: pin, required `~/.omnigent` setting, `orch-coordinator` (proposals, requests with ASK, status) and `orch-reviewer` (read-only git, review-record), both `claude-native` in `linux_bwrap` with CEL allowlists; `cockpit.mjs lint|check|start [coordinator|reviewer]`.
+- `status` inside a sandbox: owner pids from another pid namespace are UNKNOWN (heartbeat decides, never ORPHANED); the Codex model catalog is cached in `runs/model-catalog.json`.
+- AgentHUD removed (`tools/agenthud`, `hud.mjs`, `lib/agenthud.mjs`, its tests); the Omnigent UI is the live view.
+- Gate: 85 tests (stub `omnigent` binary and loopback REST stub; runner with stub CLI) and the `omnigent-bundle` lint step; `./harness/verify.sh` PASSED.
+- Not done (needs approval): O1 install and probe — including a Step 0 run through an Omnigent Codex session; the CEL expressions are not compiled by cel-python yet; REST list envelopes and status transitions are from source, not observed.
+
 ## 2026-10-14 — Live agent observability (plan.md Phase 1) with AgentHUD
 
 Phase 0 found: `implement` ran Codex through `spawnSync` and wrote `events.jsonl` after exit (no live view); raw events hold full command lines, command output and model text; Codex events carry no timestamps and report usage only at turn end; `--ephemeral` means Codex writes no session files, so AgentHUD alone shows nothing of ORCH-P runs (0 rollouts with an `orch-worktrees` cwd); `state.json` was read at start and written whole at the end of each command, so concurrent BE/FE `implement` lost one side's steps; a timeout returned 127 (spawnSync ETIMEDOUT), kept as is.

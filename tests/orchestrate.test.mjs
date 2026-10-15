@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import {
-  appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync,
+  appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -17,7 +17,10 @@ import {
   buildFilesystemPolicy, deniedBy, gateFindings, globToRegExp, hiddenToolchain, matchesAny, profileArgs, reviewProvenance,
   sanitizedEnv, scanSecrets,
 } from '../orchestrate/orchestrate.mjs';
-import { agentHudBin, hudEnv } from '../orchestrate/hud.mjs';
+
+import { DatabaseSync } from 'node:sqlite';
+
+import { startOmnigentStub } from './omnigent-stub.mjs';
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'orchestrate', 'orchestrate.mjs');
 // Not under /tmp: the generated sandbox profile denies /tmp, and implement
@@ -155,8 +158,8 @@ function setup(overrides = {}) {
     approval: { source: 'test', approved_by: 'user' },
     base_revision: { be: beBase, fe: feBase },
     sides: {
-      be: { change: 'demo-change', objective: 'Demo backend change', allowed_paths: ['src/**'], acceptance_criteria: ['works'], model: 'test-model', complexity: 'complex' },
-      fe: { change: 'demo-change', objective: 'Demo frontend change', allowed_paths: ['src/**'], acceptance_criteria: ['works'], model: 'test-model' },
+      be: { change: 'demo-change', objective: 'Demo backend change', allowed_paths: ['src/**'], acceptance_criteria: ['works'], model: 'test-model', complexity: 'complex', runner: 'codex-exec' },
+      fe: { change: 'demo-change', objective: 'Demo frontend change', allowed_paths: ['src/**'], acceptance_criteria: ['works'], model: 'test-model', runner: 'codex-exec' },
     },
     ...overrides,
   };
@@ -727,20 +730,14 @@ async function waitFor(what, fn, ms = 15_000) {
   }
 }
 
-const hudFiles = (ctx) => {
-  const files = [];
-  const walk = (dir) => { if (!existsSync(dir)) return; for (const n of readdirSync(dir, { withFileTypes: true })) { const p = join(dir, n.name); if (n.isDirectory()) walk(p); else files.push(p); } };
-  walk(join(ctx.ws, 'state', 'agenthud', 'codex'));
-  return files;
-};
 const liveText = (ctx) => {
   const liveDir = join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'live');
-  const files = [...hudFiles(ctx)];
+  const files = [];
   for (const sub of ['streams', 'agents']) if (existsSync(join(liveDir, sub))) for (const n of readdirSync(join(liveDir, sub))) files.push(join(liveDir, sub, n));
   return files.map((f) => readFileSync(f, 'utf8')).join('\n');
 };
 
-test('live: an agent event is visible in status, the stream and AgentHUD before codex exits', async () => {
+test('live: an agent event is visible in status and the stream before codex exits', async () => {
   const ctx = setup();
   orch(ctx, ['prepare', ctx.taskFile]);
   rmSync(join(root, 'home', 'release-be'), { force: true });
@@ -761,11 +758,9 @@ test('live: an agent event is visible in status, the stream and AgentHUD before 
   assert.equal(running.model, 'test-model');
   assert.equal(running.effort, 'high');
   assert.equal(running.attempt, 1);
-  const hud = hudFiles(ctx).filter((f) => f.endsWith('-be.jsonl'));
-  assert.equal(hud.length, 1, 'one AgentHUD session per agent (prepare made one per side)');
-  const recs = readFileSync(hud[0], 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-  assert.ok(recs.some((r) => r.payload?.name === 'exec_command' && JSON.parse(r.payload.arguments).cmd === 'dotnet build'), 'tool call in AgentHUD before exit');
-  assert.ok(recs.some((r) => r.payload?.type === 'user_message' && r.payload.message.startsWith('[running] ORCH-T')));
+  const stream = readdirSync(join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'live', 'streams')).find((n) => n.endsWith('-implement-be.ndjson'));
+  const events = readFileSync(join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'live', 'streams', stream), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.ok(events.some((e) => e.kind === 'tool.command' && e.data.label === 'dotnet build'), 'tool call in the stream before exit');
   writeFileSync(join(root, 'home', 'release-be'), '');
   const result = await run.done;
   assert.equal(result.code, 0, result.out);
@@ -802,7 +797,6 @@ test('live: concurrent BE and FE implement stay isolated and neither loses its s
   assert.equal(s.log.filter((e) => e.step === 'implement').length, 2);
   const streams = readdirSync(join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'live', 'streams')).filter((n) => n.includes('-implement-'));
   assert.deepEqual(streams.map((n) => n.slice(-9)).sort(), ['be.ndjson', 'fe.ndjson']);
-  assert.equal(hudFiles(ctx).filter((f) => /-(be|fe)\.jsonl$/.test(f)).length, 2);
   assert.ok(!existsSync(join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'state.json.lock')), 'lock released');
 });
 
@@ -885,26 +879,200 @@ test('live: a killed orchestrator shows ORPHANED, a refusal mid-command keeps th
   assert.match(fe.summary, /check ended without a result/);
 });
 
-test('live: AgentHUD renders the sanitized projection (when the pinned AgentHUD is installed)', { skip: !existsSync(join(dirname(CLI), '..', 'tools', 'agenthud', 'node_modules', 'agenthud', 'package.json')) && 'tools/agenthud not installed' }, () => {
+// ── implementers as Omnigent sessions ────────────────────────────────────
+/** A task whose BE side runs in Omnigent, and an approved copy of the bundle. */
+function omnigentSetup() {
   const ctx = setup();
+  ctx.task.sides.be.runner = 'omnigent';
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task, null, 2));
+  const bundle = join(ctx.ws, 'omnigent');
+  cpSync(join(dirname(CLI), '..', 'omnigent'), bundle, { recursive: true });
+  const pin = JSON.parse(readFileSync(join(bundle, 'pin.json'), 'utf8'));
+  writeFileSync(join(bundle, 'pin.json'), JSON.stringify({ ...pin, status: 'approved', approval: { source: 'test', approved_by: 'user' } }));
+  // A READY Step 0 through Omnigent for the pinned version and the stub Codex.
+  const codexVersion = spawnSync('codex', ['--version'], { encoding: 'utf8', env: orchEnv(ctx), input: '' }).stdout.trim();
+  writeFileSync(join(ctx.ws, 'step0-omnigent.json'), JSON.stringify({ ready: true, omnigent_version: pin.version, codex_version: codexVersion }));
+  // The host daemon cockpit.mjs started: the test process stands in for it.
+  mkdirSync(join(root, 'home', '.omnigent'), { recursive: true });
+  writeFileSync(join(root, 'home', '.omnigent', 'host.pid'), `${process.pid}\nlocal\n`);
+  const hubCodex = join(ctx.ws, 'codex-orch');
+  mkdirSync(hubCodex);
+  writeFileSync(join(hubCodex, 'config.toml'), 'model = "test-model"\n');
+  writeFileSync(join(ctx.ws, 'omnigent-host.json'), JSON.stringify({
+    pid: process.pid, env: { OMNIGENT_ANALYTICS: '0', DO_NOT_TRACK: '1', OMNIGENT_NO_UPDATE_CHECK: '1', CODEX_HOME: hubCodex },
+  }));
+  codexSessionLog(['sandbox_policy=WorkspaceWrite { writable_roots: [] }']);
+  return { ctx, bundle, hubCodex };
+}
+
+/** What Codex logs for the stub session conv_1 (read by implement as ground truth). */
+function codexSessionLog(lines) {
+  const dir = join(root, 'home', '.omnigent', 'codex-native', 'conv1');
+  const codexHome = join(dir, 'codex-home');
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(codexHome, { recursive: true });
+  writeFileSync(join(dir, 'state.json'), JSON.stringify({ session_id: 'conv_1', codex_home: codexHome }));
+  const db = new DatabaseSync(join(codexHome, 'logs_2.sqlite'));
+  db.exec('create table logs (id integer primary key, feedback_log_body text)');
+  for (const line of lines) db.prepare('insert into logs (feedback_log_body) values (?)').run(line);
+  db.close();
+}
+
+const omnigentEnvFor = (ctx, bundle, extra = {}) => ({
+  ORCH_OMNIGENT_BUNDLE: bundle, ORCH_STEP0_OMNIGENT_REPORT: join(ctx.ws, 'step0-omnigent.json'), ORCH_OMNIGENT_POLL_MS: '10',
+  ORCH_OMNIGENT_HOST_RECORD: join(ctx.ws, 'omnigent-host.json'), ...extra,
+});
+
+test('omnigent runner: refused until the Omnigent pin is approved', () => {
+  const { ctx, bundle } = omnigentSetup();
+  const pin = JSON.parse(readFileSync(join(bundle, 'pin.json'), 'utf8'));
+  writeFileSync(join(bundle, 'pin.json'), JSON.stringify({ ...pin, status: 'evaluated-static', approval: null }));
   orch(ctx, ['prepare', ctx.taskFile]);
-  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'v2\n' }, stream: [{ event: cmdEvent('item_0', '/bin/bash -c "dotnet build"') }] }));
-  assert.equal(orch(ctx, ['implement', ctx.taskFile, 'be']).status, 0);
-  const hud = spawnSync(process.execPath, [join(dirname(CLI), 'hud.mjs'), '--once'], {
-    encoding: 'utf8', env: { PATH: process.env.PATH, TERM: 'dumb', COLUMNS: '160', ORCH_HUD_ROOT: join(ctx.ws, 'state', 'agenthud') }, timeout: 30_000,
-  });
-  assert.equal(hud.status, 0, hud.stderr);
-  assert.match(hud.stdout, /\[idle\] ORCH-T\d+ · be/);
-  // AgentHUD parses the activity as Codex (`report` is test-only here: hud.mjs refuses it).
-  const hudRoot = join(ctx.ws, 'state', 'agenthud');
-  const report = spawnSync(process.execPath, [agentHudBin().bin, 'report', '--format', 'json', '--include', 'all'], {
-    encoding: 'utf8', env: hudEnv({ PATH: process.env.PATH }, hudRoot), cwd: hudRoot, timeout: 30_000,
-  });
-  assert.equal(report.status, 0, report.stderr);
-  const activity = JSON.stringify(JSON.parse(report.stdout));
-  assert.match(activity, /dotnet build/);
-  assert.match(activity, /codex finished; next: check/);
-  const refused = spawnSync(process.execPath, [join(dirname(CLI), 'hud.mjs'), 'summary'], { encoding: 'utf8' });
-  assert.equal(refused.status, 2);
-  assert.match(refused.stderr, /only the live view/);
+  const r = orch(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle));
+  assert.equal(r.status, 2, r.stderr);
+  assert.match(r.stderr, /Omnigent runner is not approved/);
+  const bad = setup();
+  bad.task.sides.be.runner = 'swarm';
+  writeFileSync(bad.taskFile, JSON.stringify(bad.task, null, 2));
+  assert.match(orch(bad, ['validate', bad.taskFile]).stderr, /runner must be omnigent or codex-exec/);
+});
+
+test('omnigent runner: Codex runs as a session on the worktree; evidence is the session history; check follows', async () => {
+  const { ctx, bundle, hubCodex } = omnigentSetup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const worktree = state(ctx).sides.be.worktree;
+  const stub = await startOmnigentStub({ onMessage: ({ session }) => writeFileSync(join(session.workspace, 'src', 'app.txt'), 'v2\n') });
+  try {
+    const run = orchAsync(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url }));
+    const result = await run.done;
+    assert.equal(result.code, 0, result.out);
+    const create = stub.requests.find((r) => r.method === 'POST' && r.path === '/v1/sessions');
+    assert.equal(create.body.workspace, worktree);
+    assert.match(create.body.title, /^ORCH-T\d+ · be · implement #1$/);
+    const args = create.body.terminal_launch_args;
+    const profileAt = args.indexOf('--profile');
+    assert.match(args[profileAt + 1], /^orch-ORCH-T\d+-be$/, JSON.stringify(args));
+    assert.ok(args.every((a) => a.length <= 4096), 'Omnigent caps each launch arg at 4096 characters');
+    const profile = readFileSync(join(hubCodex, `${args[profileAt + 1]}.config.toml`), 'utf8');
+    assert.match(profile, /^default_permissions = "orch"$/m);
+    assert.match(profile, /^\[permissions\.orch\.filesystem\]$/m);
+    assert.ok(args.includes('approval_policy="never"'));
+    assert.ok(args.includes('shell_environment_policy.inherit="core"'));
+    assert.ok(args.some((a) => /^shell_environment_policy\.set\.TMPDIR=".+-be-tmp"$/.test(a)), JSON.stringify(args));
+    assert.deepEqual(args.slice(args.indexOf('-m'), args.indexOf('-m') + 2), ['-m', 'test-model']);
+    const prompt = stub.requests.find((r) => r.body?.type === 'message').body.data.content[0].text;
+    assert.match(prompt, /Demo backend change/);
+    assert.match(prompt, /must match this JSON Schema/);
+    const impl = state(ctx).sides.be.steps.implement;
+    assert.deepEqual([impl.exit, impl.runner, impl.session_id, impl.permission_changed], [0, 'omnigent', 'conv_1', false]);
+    for (const f of ['session-items.jsonl', 'session.json', 'last-message.md']) {
+      assert.equal(statSync(join(impl.dir, f)).mode & 0o777, 0o600, f);
+    }
+    assert.equal(readFileSync(join(impl.dir, 'last-message.md'), 'utf8'), '{"status":"implemented"}');
+    assert.deepEqual([live(ctx, 'be').state, live(ctx, 'be').next], ['idle', 'check']);
+    assert.equal(orch(ctx, ['check', ctx.taskFile, 'be']).status, 0);
+  } finally { await stub.close(); }
+});
+
+test('omnigent runner: a widened sandbox in the Codex log blocks the run', async () => {
+  const { ctx, bundle } = omnigentSetup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  codexSessionLog(['sandbox_policy=WorkspaceWrite { }', 'sandbox_policy=DangerFullAccess']);
+  const stub = await startOmnigentStub();
+  try {
+    const result = await orchAsync(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url })).done;
+    assert.notEqual(result.code, 0, result.out);
+    assert.match(result.out, /Codex ran with sandbox DangerFullAccess/);
+    assert.equal(state(ctx).sides.be.status, 'blocked');
+    assert.deepEqual(state(ctx).sides.be.steps.implement.sandbox_policies, ['DangerFullAccess', 'WorkspaceWrite']);
+  } finally { await stub.close(); }
+});
+
+test('omnigent runner: a permission change in the UI blocks the run', async () => {
+  const { ctx, bundle } = omnigentSetup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const stub = await startOmnigentStub({ afterMessage: ({ items }) => { items.push({ type: 'external_codex_approval_mode_change' }); } });
+  try {
+    const result = await orchAsync(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url })).done;
+    assert.notEqual(result.code, 0, result.out);
+    assert.match(result.out, /permission mode was changed in Omnigent/);
+    const s = state(ctx).sides.be;
+    assert.equal(s.status, 'blocked');
+    assert.equal(s.steps.implement.permission_changed, true);
+    assert.equal(live(ctx, 'be').state, 'blocked');
+  } finally { await stub.close(); }
+});
+
+test('omnigent runner: an MCP server in the hub Codex home is refused before any session', () => {
+  const { ctx, bundle, hubCodex } = omnigentSetup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  writeFileSync(join(hubCodex, 'config.toml'), '[mcp_servers.x]\ncommand = "x"\n');
+  const r = orch(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: 'http://127.0.0.1:9' }));
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /codex-orch\/config\.toml would be copied into the Omnigent session; remove: mcp_servers/);
+});
+
+test('omnigent runner: refused unless the running daemon is the one cockpit.mjs host started', () => {
+  const { ctx, bundle } = omnigentSetup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const env = omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: 'http://127.0.0.1:9' });
+  writeFileSync(join(root, 'home', '.omnigent', 'host.pid'), '1\nlocal\n');
+  assert.match(orch(ctx, ['implement', ctx.taskFile, 'be'], env).stderr, /was not started by cockpit\.mjs host/);
+  writeFileSync(join(root, 'home', '.omnigent', 'host.pid'), `${process.pid}\n`);
+  const record = join(ctx.ws, 'omnigent-host.json');
+  writeFileSync(record, JSON.stringify({ pid: process.pid, env: { OMNIGENT_ANALYTICS: '0' } }));
+  assert.match(orch(ctx, ['implement', ctx.taskFile, 'be'], env).stderr, /lacks DO_NOT_TRACK=1/);
+  writeFileSync(record, JSON.stringify({ pid: process.pid, env: { OMNIGENT_ANALYTICS: '0', DO_NOT_TRACK: '1', OMNIGENT_NO_UPDATE_CHECK: '1' } }));
+  assert.match(orch(ctx, ['implement', ctx.taskFile, 'be'], env).stderr, /lacks CODEX_HOME/);
+  rmSync(record);
+  assert.match(orch(ctx, ['implement', ctx.taskFile, 'be'], env).stderr, /no host record/);
+});
+
+test('omnigent runner: refused without a READY Step 0 through Omnigent for these versions', () => {
+  const { ctx, bundle } = omnigentSetup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const report = join(ctx.ws, 'step0-omnigent.json');
+  const good = JSON.parse(readFileSync(report, 'utf8'));
+  const cases = [
+    [null, /has not run/],
+    [{ ...good, ready: false }, /did not pass/],
+    [{ ...good, omnigent_version: '0.17.0' }, /ran on Omnigent 0\.17\.0, pinned is 0\.18\.0/],
+    [{ ...good, codex_version: 'codex-cli 0.1.0' }, /ran on codex-cli 0\.1\.0, installed is/],
+  ];
+  for (const [content, expected] of cases) {
+    if (content) writeFileSync(report, JSON.stringify(content)); else rmSync(report, { force: true });
+    const r = orch(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: 'http://127.0.0.1:9' }));
+    assert.equal(r.status, 2, r.stderr);
+    assert.match(r.stderr, expected);
+  }
+});
+
+test('omnigent runner: with the read-isolation risk accepted, a report failing only the read checks lets the session run and is recorded', async () => {
+  const { ctx, bundle } = omnigentSetup();
+  const pin = JSON.parse(readFileSync(join(bundle, 'pin.json'), 'utf8'));
+  const checks = ['CANARY_READ', 'SSH_KEY_READ', 'CODEX_AUTH_READ', 'OMNIGENT_STATE_READ', 'BE_ENV_READ'];
+  writeFileSync(join(bundle, 'pin.json'), JSON.stringify({ ...pin, accepted_risks: [{ id: 'codex-read-isolation', checks, approved_by: 'user', source: 'test', date: '2026-10-14' }] }));
+  const report = join(ctx.ws, 'step0-omnigent.json');
+  const good = JSON.parse(readFileSync(report, 'utf8'));
+  writeFileSync(report, JSON.stringify({ ...good, ready: false, failed: checks, status: 0, script_completed: true, secret_hits: [], permission_changed: false, canary_leaked: true }));
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const stub = await startOmnigentStub({ onMessage: ({ session }) => writeFileSync(join(session.workspace, 'src', 'app.txt'), 'v2\n') });
+  try {
+    const result = await orchAsync(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url })).done;
+    assert.equal(result.code, 0, result.out);
+    assert.match(result.out, /WARNING: running with accepted risk codex-read-isolation/);
+    assert.deepEqual(state(ctx).sides.be.steps.implement.accepted_risks, ['codex-read-isolation']);
+  } finally { await stub.close(); }
+  writeFileSync(report, JSON.stringify({ ...good, ready: false, failed: [...checks, 'NETWORK'], status: 0, script_completed: true, secret_hits: [] }));
+  const r = orch(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: 'http://127.0.0.1:9' }));
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /no accepted risk covers: NETWORK/);
+});
+
+test('omnigent runner: a non-loopback server URL is refused', () => {
+  const { ctx, bundle } = omnigentSetup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const r = orch(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: 'http://0.0.0.0:6767' }));
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /loopback/);
 });

@@ -1,4 +1,4 @@
-// Unit tests for live observability (orchestrate/lib/*, orchestrate/hud.mjs,
+// Unit tests for live observability (orchestrate/lib/*,
 // runStreaming). No model calls, no Docker; child processes are `node -e`.
 import assert from 'node:assert/strict';
 import {
@@ -8,14 +8,12 @@ import { dirname, join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { AgentHudProjection, agentHudSessionPath } from '../orchestrate/lib/agenthud.mjs';
 import {
   AgentObserver, deriveLive, processAlive, readJson, snapshotPath, withLock,
 } from '../orchestrate/lib/agent-state.mjs';
 import {
   codexProjector, lineSplitter, LiveWriter, programOf, relativePath, safeText,
 } from '../orchestrate/lib/event-stream.mjs';
-import { agentHudBin, hudArgs, hudEnv } from '../orchestrate/hud.mjs';
 import { runStreaming } from '../orchestrate/orchestrate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -117,59 +115,6 @@ test('live writer: one file per invocation, 0600, line and size caps keep the ou
   if (process.platform !== 'win32') assert.equal(statSync(w.file).mode & 0o777, 0o600);
 });
 
-// ── AgentHUD projection ──────────────────────────────────────────────────
-test('agenthud projection writes the codex rollout shape AgentHUD reads, sanitized', () => {
-  const rootDir = fresh('hud');
-  const hud = new AgentHudProjection({ root: rootDir, taskId: 'ORCH-X', side: 'be', startedAt: '2026-10-14T05:06:07.123Z', model: 'gpt-5.6-sol' });
-  assert.equal(hud.file, agentHudSessionPath(rootDir, { taskId: 'ORCH-X', side: 'be', startedAt: '2026-10-14T05:06:07.123Z' }));
-  assert.match(hud.file, /codex[/\\]2026[/\\]10[/\\]14[/\\]rollout-2026-10-14T05-06-07-orch-ORCH-X-be\.jsonl$/);
-  hud.event({ kind: 'lifecycle', data: { title: '[running] ORCH-X · be', summary: null } });
-  hud.event({ kind: 'tool.command', data: { phase: 'started', id: 'item_0', label: 'dotnet build' } });
-  hud.event({ kind: 'tool.command', data: { phase: 'completed', id: 'item_0', label: 'dotnet build', status: 'failed', exit_code: 1 } });
-  hud.event({ kind: 'tool.file_change', data: { changes: [{ path: 'docs/x.md', kind: 'add', in_scope: false, outside: false }], more: 0, outside: 0 } });
-  hud.note(`leak ${FAKE_TOKEN} ${ESC}[2J`);
-  hud.close();
-  const recs = readFileSync(hud.file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-  assert.deepEqual(recs.slice(0, 2).map((r) => r.type), ['session_meta', 'turn_context']);
-  assert.equal(recs[0].payload.cwd, '/orch-p/ORCH-X', 'logical cwd, not a Git repository');
-  assert.equal(recs[1].payload.model, 'gpt-5.6-sol');
-  assert.deepEqual(recs[2].payload, { type: 'user_message', message: '[running] ORCH-X · be' });
-  assert.deepEqual(JSON.parse(recs[3].payload.arguments), { cmd: 'dotnet build' });
-  assert.equal(recs[3].payload.name, 'exec_command');
-  assert.equal(recs[4].payload.message, '✗ dotnet build exit 1');
-  assert.equal(recs[5].payload.message, 'add docs/x.md — OUTSIDE allowed_paths');
-  assert.equal(recs[6].payload.message, '[redacted]');
-  const again = new AgentHudProjection({ root: rootDir, taskId: 'ORCH-X', side: 'be', startedAt: '2026-10-14T05:06:07.123Z', model: 'gpt-5.6-sol' });
-  again.close();
-  const after2 = readFileSync(hud.file, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-  assert.equal(after2.filter((r) => r.type === 'session_meta').length, 1, 'one session per agent across commands');
-});
-
-test('hud launcher: live view only, every data path inside the projection, no credentials', () => {
-  assert.ok(hudArgs(['summary']).error);
-  assert.ok(hudArgs(['report', '--with-git']).error);
-  assert.ok(hudArgs(['--cwd']).error);
-  assert.deepEqual(hudArgs(['--once']).args, ['--once']);
-  const env = hudEnv({ PATH: '/p', TERM: 'xterm', HOME: '/home/u', OPENAI_API_KEY: 'x', ANTHROPIC_API_KEY: 'y', SSH_AUTH_SOCK: 's', CODEX_HOME: '/home/u/.codex' }, '/r/agenthud');
-  assert.equal(env.HOME, join('/r/agenthud', 'home'));
-  assert.equal(env.CODEX_SESSIONS_DIR, join('/r/agenthud', 'codex'));
-  for (const key of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'SSH_AUTH_SOCK', 'CODEX_HOME']) assert.ok(!(key in env), key);
-  for (const [key, value] of Object.entries(env)) {
-    if (['PATH', 'TERM'].includes(key)) continue;
-    assert.ok(value.startsWith(join('/r/agenthud')), `${key}=${value} stays inside the projection`);
-  }
-  // AgentHUD routes files by path prefix (Kiro IDE: the parent of its dir); none may claim the codex sessions.
-  for (const owner of [env.CLAUDE_PROJECTS_DIR, env.KIRO_SESSIONS_DIR, dirname(env.KIRO_IDE_SESSIONS_DIR)]) {
-    assert.ok(!`${env.CODEX_SESSIONS_DIR}/`.startsWith(`${owner}/`), `${owner} would take over the codex sessions`);
-  }
-  const toolDir = fresh('tool');
-  writeFileSync(join(toolDir, 'package.json'), JSON.stringify({ dependencies: { agenthud: '0.19.0' } }));
-  assert.match(agentHudBin(toolDir).error, /not installed/);
-  mkdirSync(join(toolDir, 'node_modules', 'agenthud'), { recursive: true });
-  writeFileSync(join(toolDir, 'node_modules', 'agenthud', 'package.json'), JSON.stringify({ version: '0.20.0', bin: { agenthud: 'dist/index.js' } }));
-  assert.match(agentHudBin(toolDir).error, /not the pinned 0\.19\.0/);
-});
-
 // ── agent state ──────────────────────────────────────────────────────────
 test('deriveLive tells RUNNING, STALLED, ORPHANED, IDLE and UNKNOWN apart', () => {
   const now = Date.parse('2026-10-14T10:00:00Z');
@@ -185,6 +130,16 @@ test('deriveLive tells RUNNING, STALLED, ORPHANED, IDLE and UNKNOWN apart', () =
   assert.equal(quiet.status, 'STALLED');
   assert.match(quiet.reason, /no agent event for 11 min/);
   assert.equal(deriveLive({ ...base, stage: 'verify', last_agent_event_at: iso(60 * 60_000) }, { now, alive }).status, 'RUNNING', 'a long gate is not a stall');
+});
+
+test('an owner in another pid namespace (an Omnigent sandbox reading status) is unknown, never ORPHANED', () => {
+  const owner = { pid: 2 ** 22 + 12345, pid_ns: 'pid:[1]' };
+  assert.equal(processAlive(owner, 'pid:[2]'), null);
+  assert.equal(processAlive(owner, 'pid:[1]'), false);
+  const now = Date.parse('2026-10-14T10:00:00Z');
+  const snap = { active: true, owner, stage: 'check', heartbeat_at: '2026-10-14T09:59:59Z', since: '2026-10-14T09:59:00Z' };
+  assert.equal(deriveLive(snap, { now, alive: () => null }).status, 'RUNNING');
+  assert.equal(deriveLive({ ...snap, heartbeat_at: '2026-10-14T09:50:00Z' }, { now, alive: () => null }).status, 'STALLED');
 });
 
 test('processAlive rejects dead and reused pids', () => {
@@ -208,8 +163,8 @@ test('observer: snapshot, stream and projection agree; failures only disable obs
   const dir = fresh('obs');
   const liveDir = join(dir, 'live');
   const obs = new AgentObserver({
-    liveDir, hudRoot: join(dir, 'hud'), taskId: 'ORCH-Y', runId: 'r1', side: 'fe', command: 'implement', attempt: 2,
-    provider: 'codex', model: 'm', effort: 'medium', preparedAt: '2026-10-14T00:00:00Z',
+    liveDir, taskId: 'ORCH-Y', runId: 'r1', side: 'fe', command: 'implement', attempt: 2,
+    provider: 'codex', model: 'm', effort: 'medium',
   });
   obs.start('running');
   obs.emit('tool.command', { phase: 'started', id: 'i1', label: 'pnpm test' });
@@ -234,7 +189,7 @@ test('observer: snapshot, stream and projection agree; failures only disable obs
   const warnings = [];
   const blockedDir = join(dir, 'file-not-dir');
   writeFileSync(blockedDir, 'x');
-  const broken = new AgentObserver({ liveDir: blockedDir, hudRoot: null, taskId: 'ORCH-Y', runId: 'r1', side: 'be', command: 'check', attempt: 1, provider: 'codex', model: 'm', effort: 'low', preparedAt: 'x', warn: (m) => warnings.push(m) });
+  const broken = new AgentObserver({ liveDir: blockedDir, taskId: 'ORCH-Y', runId: 'r1', side: 'be', command: 'check', attempt: 1, provider: 'codex', model: 'm', effort: 'low', warn: (m) => warnings.push(m) });
   broken.start('checking');
   broken.emit('check', { exit: 0 });
   broken.finish('idle', 'ok');
