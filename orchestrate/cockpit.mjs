@@ -50,6 +50,16 @@ export function startProblems({ bundle = BUNDLE, bin = BIN, env = omnigentEnv(),
   return problems;
 }
 
+/**
+ * How autopilot starts the reviewer with its first message: the same checks,
+ * environment and working directory as `start reviewer`.
+ */
+export function reviewerCommand(prompt, { bin = BIN, env = omnigentEnv() } = {}) {
+  const problems = startProblems({ bin, env });
+  for (const dir of ['proposals', 'requests', 'reviews']) mkdirSync(join(ORCH_REPO, 'runs', dir), { recursive: true, mode: 0o700 });
+  return { command: bin, args: ['run', AGENTS.reviewer, '-p', prompt], env, cwd: WORKSPACE, problems };
+}
+
 // Agent settings outside ~/.omnigent that a platform could change (hooks,
 // MCP servers, permission defaults). Hashed around every session.
 export const WATCHED_CONFIG = ['.claude/settings.json', '.claude/settings.local.json', '.codex/config.toml', '.codex/hooks.json'];

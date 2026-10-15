@@ -8,6 +8,7 @@ Start with [AGENTS.md](AGENTS.md) and [docs/orchestration.md](docs/orchestration
 ```sh
 # Once, and after upgrades
 node verify-container/run-gate.mjs build-image   # once, and after Dockerfile changes
+node verify-container/run-gate.mjs reap          # remove containers/networks left by a killed gate
 node orchestrate/step0-probe.mjs                 # must report READY before real runs
 node orchestrate/step0-omnigent.mjs              # Step 0 inside an Omnigent Codex session (one model call)
 
@@ -17,7 +18,12 @@ node orchestrate/cockpit.mjs host-stop           # stop them
 node orchestrate/cockpit.mjs check               # lint, pin approval, installed version, telemetry off
 node orchestrate/cockpit.mjs probe-api           # record the real REST shapes (GET only)
 
-# A task
+# Autopilot (default): paste the spec into the coordinator, approve its plan once in the UI
+node orchestrate/cockpit.mjs start               # coordinator session in Omnigent
+node orchestrate/runner.mjs                      # second terminal, keep it open (only one runner)
+node orchestrate/autopilot.mjs status runs/proposals/<PLAN>.plan.json
+
+# A single task by hand
 node orchestrate/orchestrate.mjs validate task.json
 node orchestrate/cockpit.mjs start               # coordinator session in Omnigent
 node orchestrate/runner.mjs                      # second terminal: runs step requests approved in the UI

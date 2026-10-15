@@ -135,12 +135,13 @@ const REQUIRED = [
 // a config drifts. Codex implementers are not bundle agents: orchestrate.mjs
 // creates their sessions with the Step 0 profile (lib/omnigent-runner.mjs).
 export const COORDINATOR_SHELL = '^node ORCH-P/orchestrate/orchestrate\\.mjs (status|validate) [A-Za-z0-9._/-]+\\.json$';
+export const COORDINATOR_AUTOPILOT = '^node ORCH-P/orchestrate/autopilot\\.mjs (check|status) [A-Za-z0-9._/-]+\\.plan\\.json$';
 export const REVIEWER_GIT = '^git -C (BE-P|FE-P) (show|diff|log) [A-Za-z0-9._/:^~ -]+$';
 export const REVIEWER_ORCH = '^node ORCH-P/orchestrate/orchestrate\\.mjs (status [A-Za-z0-9._/-]+\\.json|review-record [A-Za-z0-9._/-]+\\.json ORCH-P/runs/reviews/[A-Za-z0-9_-]+\\.json)$';
 const CLAUDE_SANDBOX = { read_paths: '["~/.nvm"]', write_files: '["~/.claude.json"]' };
 export const BUNDLE_AGENTS = Object.freeze({
   'orch-coordinator': {
-    shell: [COORDINATOR_SHELL],
+    shell: [COORDINATOR_SHELL, COORDINATOR_AUTOPILOT],
     sandbox: { ...CLAUDE_SANDBOX, write_paths: '["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude", "/tmp/omnigent-1000"]', cwd_allow_hidden: '[".nvm", ".claude", ".credentials.json"]' },
   },
   'orch-reviewer': {

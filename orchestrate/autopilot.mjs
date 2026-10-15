@@ -1,0 +1,511 @@
+#!/usr/bin/env node
+// Autopilot: runs an approved plan of ORCH-P tasks end to end (docs/orchestration.md#autopilot).
+//
+//   node orchestrate/autopilot.mjs check  <plan.json>   validate a plan; prints its sha256 (coordinator)
+//   node orchestrate/autopilot.mjs status <plan.json>   progress of a plan run (coordinator)
+//   node orchestrate/autopilot.mjs run    <plan.json> [--approval <source>]
+//
+// The coordinator splits a spec into task proposals and one plan
+// (runs/proposals/<PLAN>.plan.json) that lists them in order and binds each
+// one's sha256. The user approves the plan once: by approving the runner
+// request for it in the Omnigent UI (the runner passes --approval), or by
+// typing `run` in a terminal. That approval is the task approval of every
+// task in the plan: autopilot writes approved copies of the proposals under
+// runs/autopilot/<PLAN>/tasks/ (base revisions resolved, approval naming the
+// plan digest) and never edits the proposals.
+//
+// Each task then goes through the same orchestrate.mjs commands a human
+// would run — prepare; per side implement, check, verify (gate findings go
+// back to Codex, at most max_rework times), commit — and a review by the
+// orch-reviewer agent, started in Omnigent with its own sandbox and
+// guardrails; rework_required sends the findings back, at most max_rework
+// rounds. Transient failures are retried once, never past a safety stop: a
+// gate infrastructure failure (exit 70) after removing what killed gates left
+// behind, an implement that failed without being blocked, timing out or being
+// interrupted, and an implement refused for a stale Step 0 after rerunning
+// that Step 0 (its result decides, as always).
+// A task whose base is "after:<ID>" starts from that task's reviewed
+// commit (stacked branches). Nothing here pushes, merges, cleans up or
+// weakens a step: a refusal, a failed check, an infrastructure failure or an
+// exhausted rework budget stops the plan and says why.
+import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import {
+  closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync,
+} from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { readJson, writeJsonAtomic } from './lib/agent-state.mjs';
+import { validateTask } from './orchestrate.mjs';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ORCH_REPO = resolve(HERE, '..');
+const WORKSPACE = resolve(process.env.ORCH_WORKSPACE_ROOT ?? join(ORCH_REPO, '..'));
+const STATE_ROOT = resolve(process.env.ORCH_STATE_ROOT ?? join(ORCH_REPO, 'runs'));
+const CLI = resolve(process.env.ORCH_AUTOPILOT_CLI ?? join(HERE, 'orchestrate.mjs'));
+const GATE_RUNNER = resolve(process.env.ORCH_GATE_RUNNER ?? join(ORCH_REPO, 'verify-container', 'run-gate.mjs'));
+const STEP0 = { direct: join(HERE, 'step0-probe.mjs'), omnigent: join(HERE, 'step0-omnigent.mjs') };
+const REPOS = {
+  be: resolve(process.env.ORCH_BE_REPO ?? join(ORCH_REPO, '..', 'BE-P')),
+  fe: resolve(process.env.ORCH_FE_REPO ?? join(ORCH_REPO, '..', 'FE-P')),
+};
+
+export const MAX_REWORK_LIMIT = 3;
+const PLAN_ID = /^[A-Z][A-Z0-9-]{1,40}$/;
+const TASK_ID = /^[A-Z][A-Z0-9-]{2,40}$/;
+const SHA = /^[0-9a-f]{40}$/;
+const REF = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$/;
+const SIDE_ORDER = ['be', 'fe'];
+const REVIEW_TIMEOUT_MS = Number(process.env.ORCH_REVIEW_TIMEOUT_MS ?? 45 * 60_000);
+const REVIEW_POLL_MS = Number(process.env.ORCH_REVIEW_POLL_MS ?? 5000);
+
+const sha256 = (data) => createHash('sha256').update(data).digest('hex');
+const now = () => new Date().toISOString();
+
+class Stop extends Error {}
+
+/** Workspace path → absolute path, or null when it leaves the workspace. */
+function inWorkspace(path, workspace) {
+  if (typeof path !== 'string' || path.includes('\0')) return null;
+  const abs = resolve(workspace, path);
+  const rel = relative(workspace, abs);
+  return !rel || rel.startsWith('..') || isAbsolute(rel) ? null : abs;
+}
+
+/**
+ * Checks a plan and the proposals it lists. Returns { plan, digest, tasks, problems };
+ * tasks carry their parsed content and resolved paths. `run` refuses unless problems is empty.
+ */
+export function checkPlan(planPath, { workspace = WORKSPACE } = {}) {
+  const problems = [];
+  if (!existsSync(planPath)) return { problems: ['plan file not found'] };
+  const raw = readFileSync(planPath);
+  let plan;
+  try { plan = JSON.parse(raw); } catch { return { problems: ['plan is not JSON'] }; }
+  const digest = sha256(raw);
+  if (!PLAN_ID.test(plan.id ?? '')) problems.push('plan id must match ^[A-Z][A-Z0-9-]{1,40}$');
+  const maxRework = plan.max_rework ?? 2;
+  if (!Number.isInteger(maxRework) || maxRework < 0 || maxRework > MAX_REWORK_LIMIT) problems.push(`max_rework must be an integer from 0 to ${MAX_REWORK_LIMIT}`);
+  if (!Array.isArray(plan.tasks) || plan.tasks.length === 0) problems.push('tasks must be a non-empty array');
+  const tasks = [];
+  const seen = new Map();
+  for (const [i, entry] of (plan.tasks ?? []).entries()) {
+    const where = `tasks[${i}]`;
+    const file = inWorkspace(entry?.file, workspace);
+    if (!file || !file.endsWith('.json')) { problems.push(`${where}.file must be a .json file inside the workspace`); continue; }
+    if (!existsSync(file)) { problems.push(`${where}.file ${entry.file} not found`); continue; }
+    const content = readFileSync(file);
+    const actual = sha256(content);
+    if (entry.sha256 !== actual) problems.push(`${where}.sha256 must be ${actual} (the digest of ${entry.file} now)`);
+    let task;
+    try { task = JSON.parse(content); } catch { problems.push(`${where}: ${entry.file} is not JSON`); continue; }
+    if (!TASK_ID.test(task.id ?? '')) { problems.push(`${where}: task id must match ^[A-Z][A-Z0-9-]{2,40}$`); continue; }
+    if (seen.has(task.id)) problems.push(`${where}: task ${task.id} is listed twice`);
+    const preApproved = task.status === 'approved';
+    if (!preApproved && (task.status !== 'proposed' || task.approval !== null)) {
+      problems.push(`${where}: ${task.id} must be "status": "proposed" with "approval": null (the plan approval approves it)`);
+    }
+    const sides = Object.keys(task.sides ?? {});
+    if (sides.length === 0 || sides.some((s) => !REPOS[s])) problems.push(`${where}: ${task.id} sides must be be and/or fe`);
+    const base = {};
+    for (const side of sides) {
+      const value = preApproved ? task.base_revision?.[side] : entry.base?.[side];
+      if (preApproved && !SHA.test(value ?? '')) { problems.push(`${where}: approved task ${task.id} needs a full base_revision.${side}`); continue; }
+      if (typeof value !== 'string') { problems.push(`${where}.base.${side} is required: a full SHA, a branch name, or "after:<earlier task id>"`); continue; }
+      if (value.startsWith('after:')) {
+        const dep = value.slice(6);
+        const earlier = seen.get(dep);
+        if (!earlier) problems.push(`${where}.base.${side}: ${dep} must be an earlier task in this plan`);
+        else if (!earlier.sides.includes(side)) problems.push(`${where}.base.${side}: ${dep} has no ${side} side to stack on`);
+      } else if (!SHA.test(value) && !REF.test(value)) problems.push(`${where}.base.${side}: ${value} is not a SHA or a branch name`);
+      base[side] = value;
+    }
+    if (!preApproved && sides.length) {
+      // Everything prepare will check except the bases, which exist only once the plan runs.
+      const candidate = { ...structuredClone(task), status: 'approved', approval: { source: 'plan', approved_by: 'user' }, base_revision: Object.fromEntries(sides.map((s) => [s, '0'.repeat(40)])) };
+      try { validateTask(candidate, { resolveCommit: false }); } catch (error) { problems.push(`${where}: ${task.id} ${error.message.replace(/\n\s*/g, ' ')}`); }
+    }
+    const own = entry.max_rework ?? maxRework;
+    if (!Number.isInteger(own) || own < 0 || own > MAX_REWORK_LIMIT) problems.push(`${where}.max_rework must be an integer from 0 to ${MAX_REWORK_LIMIT}`);
+    const item = { maxRework: own, index: i, id: task.id, file, rel: relative(workspace, file), sha256: actual, task, sides: SIDE_ORDER.filter((s) => sides.includes(s)), base, preApproved };
+    seen.set(task.id, item);
+    tasks.push(item);
+  }
+  return { plan, digest, maxRework, tasks, problems };
+}
+
+// ── state ────────────────────────────────────────────────────────────────
+export function planDir(planId, stateRoot = STATE_ROOT) {
+  return join(stateRoot, 'autopilot', planId);
+}
+
+function readState(dir) {
+  return readJson(join(dir, 'state.json'));
+}
+
+function writeState(dir, state) {
+  writeJsonAtomic(join(dir, 'state.json'), { ...state, updated_at: now() });
+}
+
+/** One autopilot per plan: an O_EXCL lock with the owner pid; a dead owner's lock is taken over. */
+export function acquireLock(dir) {
+  const file = join(dir, 'run.lock');
+  for (let i = 0; i < 2; i += 1) {
+    try {
+      const fd = openSync(file, 'wx', 0o600);
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+      return () => rmSync(file, { force: true });
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const pid = Number.parseInt(readFileSync(file, 'utf8'), 10);
+      let alive = false;
+      try { process.kill(pid, 0); alive = true; } catch (e) { alive = e.code === 'EPERM'; }
+      if (alive) return null;
+      rmSync(file, { force: true });
+    }
+  }
+  return null;
+}
+
+// ── steps ────────────────────────────────────────────────────────────────
+/** Runs one orchestrate.mjs command (or another ORCH-P script); output goes to the plan log. Returns { exit, output }. */
+function runCli(ctx, args, script = ctx.cli) {
+  return new Promise((done) => {
+    const child = spawn(process.execPath, [script, ...args], { cwd: ORCH_REPO, env: ctx.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    ctx.child = child;
+    let output = '';
+    const keep = (d) => { output = (output + d).slice(-100_000); };
+    child.stdout.on('data', keep);
+    child.stderr.on('data', keep);
+    child.on('close', (code, signal) => {
+      ctx.child = null;
+      const exit = code ?? (signal ? 128 : 1);
+      ctx.log(`$ ${script === ctx.cli ? 'orchestrate' : relative(ORCH_REPO, script)} ${args.map((a) => (a.startsWith('/') ? relative(WORKSPACE, a) : a)).join(' ')} → exit ${exit}\n${output.trim()}`);
+      done({ exit, output });
+    });
+  });
+}
+
+function taskState(ctx, id) {
+  return readJson(join(ctx.stateRoot, `orch-${id}`, 'state.json'));
+}
+
+/** Where an existing run of a side stands, so a resumed plan continues instead of repeating steps. */
+export function nextStep(s) {
+  const at = (step) => (s?.steps?.[step] ? Date.parse(s.steps[step].at) : -1);
+  const ok = (step) => s?.steps?.[step]?.exit === 0;
+  if (!s?.steps?.implement) return 'implement';
+  if (at('commit') >= at('implement') && ok('commit') && at('commit') >= at('verify')) return 'review';
+  if (ok('verify') && at('verify') >= at('check') && at('check') >= at('implement')) return 'commit';
+  // A failed gate with findings goes back to Codex; one without (infrastructure) is retried.
+  if (s.steps.verify && at('verify') >= at('check') && at('check') >= at('implement')) {
+    return (s.rework ?? []).some((f) => f.source === 'gate') ? 'implement' : 'verify';
+  }
+  if (ok('check') && at('check') >= at('implement')) return 'verify';
+  if (ok('implement')) return 'check';
+  return 'implement';
+}
+
+/** implement → check → verify (gate rework up to the budget) → commit for one side. */
+async function sideToCommit(ctx, item, side, { from = 'implement' } = {}) {
+  const t = item.runFile;
+  let step = from;
+  let gateRounds = 0;
+  for (;;) {
+    ctx.progress(item, `${side}: ${step}`);
+    if (step === 'review') return;
+    if (step === 'implement') {
+      await implement(ctx, item, side);
+      step = 'check';
+    } else if (step === 'check') {
+      const r = await runCli(ctx, ['check', t, side]);
+      if (r.exit !== 0) throw new Stop(`${item.id} ${side}: check failed (changes outside allowed_paths, protected paths or secret-like text)${tailLine(r.output)}`);
+      step = 'verify';
+    } else if (step === 'verify') {
+      let r = await runCli(ctx, ['verify', t, side]);
+      if (r.exit === 70) {
+        ctx.progress(item, `${side}: gate infrastructure failure, removing leftovers and verifying once more`);
+        await runCli(ctx, ['reap'], ctx.gateRunner);
+        r = await runCli(ctx, ['verify', t, side]);
+      }
+      if (r.exit === 0) { step = 'commit'; continue; }
+      if (r.exit === 70) throw new Stop(`${item.id} ${side}: gate infrastructure failure (exit 70) twice; fix the environment, then run the plan again`);
+      const findings = (taskState(ctx, item.id)?.sides?.[side]?.rework ?? []).filter((f) => f.source === 'gate').length;
+      if (!findings) throw new Stop(`${item.id} ${side}: verify exit ${r.exit} without gate findings${tailLine(r.output)}`);
+      if (gateRounds >= item.maxRework) throw new Stop(`${item.id} ${side}: the gate still fails after ${gateRounds} rework rounds (${findings} findings)`);
+      gateRounds += 1;
+      ctx.progress(item, `${side}: gate failed, rework ${gateRounds}/${item.maxRework}`);
+      step = 'implement';
+    } else if (step === 'commit') {
+      const r = await runCli(ctx, ['commit', t, side]);
+      if (r.exit !== 0) throw new Stop(`${item.id} ${side}: commit exit ${r.exit}${tailLine(r.output)}`);
+      return;
+    }
+  }
+}
+
+/**
+ * implement, retried once when that is safe: after rerunning a stale Step 0
+ * (implement then decides again whether it passed), or after a failure that
+ * left the side unblocked and was neither a timeout, an interruption nor a refusal.
+ */
+async function implement(ctx, item, side) {
+  const t = item.runFile;
+  let r = await runCli(ctx, ['implement', t, side]);
+  if (r.exit === 2 && /Step 0/.test(r.output)) {
+    const which = /Step 0 through Omnigent/.test(r.output) ? 'omnigent' : 'direct';
+    ctx.progress(item, `${side}: Step 0 is not current, rerunning ${relative(ORCH_REPO, ctx.step0[which])}`);
+    await runCli(ctx, [], ctx.step0[which]);
+    r = await runCli(ctx, ['implement', t, side]);
+  } else if (r.exit !== 0 && r.exit !== 2 && !ctx.interrupted) {
+    const s = taskState(ctx, item.id)?.sides?.[side];
+    const last = s?.steps?.implement ?? {};
+    if (s?.status !== 'blocked' && !last.timed_out && !last.interrupted) {
+      ctx.progress(item, `${side}: implement exit ${r.exit}, retrying once`);
+      r = await runCli(ctx, ['implement', t, side]);
+    }
+  }
+  if (r.exit !== 0) throw new Stop(`${item.id} ${side}: implement exit ${r.exit}${tailLine(r.output)}`);
+}
+
+const tailLine = (output) => {
+  const line = output.trim().split('\n').filter(Boolean).pop();
+  return line ? ` — ${line.slice(0, 300)}` : '';
+};
+
+/** Starts the orch-reviewer agent in Omnigent and waits until it records a review of the current commits. */
+async function review(ctx, item) {
+  const before = taskState(ctx, item.id)?.review?.file ?? null;
+  const prompt = `Review task ${relative(WORKSPACE, item.runFile)}.`;
+  ctx.progress(item, 'review');
+  const reviewer = await ctx.startReviewer(prompt);
+  try {
+    const deadline = Date.now() + ctx.reviewTimeoutMs;
+    for (;;) {
+      const recorded = taskState(ctx, item.id)?.review;
+      if (recorded?.file && recorded.file !== before) return recorded.status;
+      if (reviewer.exited()) throw new Stop(`${item.id}: the reviewer session ended without recording a review (see the orch-reviewer session in Omnigent)`);
+      if (Date.now() > deadline) throw new Stop(`${item.id}: no review recorded within ${Math.round(ctx.reviewTimeoutMs / 60_000)} minutes (see the orch-reviewer session in Omnigent)`);
+      await new Promise((r) => { setTimeout(r, ctx.reviewPollMs); });
+    }
+  } finally {
+    reviewer.stop();
+  }
+}
+
+/** The approved copy autopilot runs: the proposal with resolved bases and the plan approval. */
+function materialize(ctx, item) {
+  if (item.preApproved) return item.file;
+  const base = {};
+  for (const side of item.sides) {
+    const value = item.base[side];
+    if (value.startsWith('after:')) {
+      const dep = ctx.state.tasks[value.slice(6)];
+      const commit = dep?.commits?.[side];
+      if (dep?.status !== 'ready_for_human_merge' || !commit) throw new Stop(`${item.id}: ${value.slice(6)} has no reviewed ${side} commit to stack on`);
+      base[side] = commit;
+    } else base[side] = ctx.state.refs[`${side}:${value}`] ?? value;
+  }
+  const task = {
+    ...item.task, status: 'approved',
+    approval: { source: `plan ${ctx.plan.id} (sha256 ${ctx.digest}) approved: ${ctx.approval}`, approved_by: 'user', plan_sha256: ctx.digest },
+    base_revision: base,
+  };
+  const file = join(ctx.dir, 'tasks', `${item.id}.json`);
+  if (existsSync(file)) {
+    // A resumed plan keeps the copy its run was prepared from (its digest binds the run).
+    const kept = JSON.parse(readFileSync(file, 'utf8'));
+    if (kept.approval?.plan_sha256 === ctx.digest) return file;
+    throw new Stop(`${item.id}: ${relative(WORKSPACE, file)} belongs to another version of the plan; use new task ids`);
+  }
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `${JSON.stringify(task, null, 2)}\n`, { mode: 0o600 });
+  return file;
+}
+
+async function runTask(ctx, item) {
+  const record = ctx.state.tasks[item.id];
+  item.runFile = materialize(ctx, item);
+  record.run_file = relative(WORKSPACE, item.runFile);
+  if (!taskState(ctx, item.id)) {
+    ctx.progress(item, 'prepare');
+    const r = await runCli(ctx, ['prepare', item.runFile]);
+    if (r.exit !== 0) throw new Stop(`${item.id}: prepare exit ${r.exit}${tailLine(r.output)}`);
+  }
+  for (const side of item.sides) {
+    await sideToCommit(ctx, item, side, { from: nextStep(taskState(ctx, item.id)?.sides?.[side]) });
+  }
+  for (let round = 0; ; round += 1) {
+    const verdict = await review(ctx, item);
+    if (verdict === 'ready_for_human_merge') break;
+    if (round >= item.maxRework) throw new Stop(`${item.id}: review still requires rework after ${round} rounds; read the review in runs/orch-${item.id}/`);
+    const state = taskState(ctx, item.id);
+    const sides = item.sides.filter((side) => (state.sides[side].rework ?? []).length);
+    ctx.progress(item, `review rework ${round + 1}/${item.maxRework} (${sides.join(', ') || 'no side named'})`);
+    if (!sides.length) throw new Stop(`${item.id}: review requires rework but names no side`);
+    for (const side of sides) await sideToCommit(ctx, item, side);
+  }
+  const state = taskState(ctx, item.id);
+  record.commits = Object.fromEntries(item.sides.map((side) => [side, state.sides[side].steps.commit.commit]));
+  record.branches = Object.fromEntries(item.sides.map((side) => [side, state.sides[side].branch]));
+  record.status = item.task.contract_check ? 'needs_contract_pilot' : 'ready_for_human_merge';
+  // A stacked task builds on the reviewed commit; the contract pilot still gates the merge.
+  if (record.status === 'needs_contract_pilot') record.note = 'run BE-P docs/coordination/pilot.md manually before merging';
+  record.finished_at = now();
+}
+
+/** Starts orch-reviewer through cockpit's checks; returns { exited(), stop() }. */
+async function startReviewerSession(prompt) {
+  const { reviewerCommand } = await import('./cockpit.mjs');
+  const { command, args, env, cwd, problems } = reviewerCommand(prompt);
+  if (problems.length) throw new Stop(`cannot start the reviewer: ${problems.join('; ')}`);
+  // `omnigent run` is a REPL: give it a terminal (script) and an stdin that stays open.
+  const child = spawn('script', ['-qfec', [command, ...args].map(shellQuote).join(' '), '/dev/null'], {
+    cwd, env, stdio: ['pipe', 'ignore', 'ignore'], detached: true,
+  });
+  let exited = false;
+  child.on('exit', () => { exited = true; });
+  return {
+    exited: () => exited,
+    stop: () => { if (!exited) { try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ } } },
+  };
+}
+
+const shellQuote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
+
+// ── run ──────────────────────────────────────────────────────────────────
+export async function runPlan(planPath, {
+  approval = 'typed `autopilot run` in a terminal', workspace = WORKSPACE, stateRoot = STATE_ROOT, cli = CLI, env = process.env,
+  gateRunner = GATE_RUNNER, step0 = STEP0,
+  startReviewer = startReviewerSession, reviewTimeoutMs = REVIEW_TIMEOUT_MS, reviewPollMs = REVIEW_POLL_MS,
+  resolveRef = (side, ref) => gitRevParse(REPOS[side], ref), log = (m) => console.log(m),
+} = {}) {
+  const checked = checkPlan(planPath, { workspace });
+  if (checked.problems.length) {
+    log(`refused: plan is not runnable:\n  - ${checked.problems.join('\n  - ')}`);
+    return 2;
+  }
+  const { plan, digest, tasks } = checked;
+  const dir = planDir(plan.id, stateRoot);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const release = acquireLock(dir);
+  if (!release) { log(`refused: plan ${plan.id} is already running`); return 2; }
+  const logFile = join(dir, 'autopilot.log');
+  let state = readState(dir);
+  if (state && state.plan_sha256 !== digest) {
+    release();
+    log(`refused: runs/autopilot/${plan.id} belongs to another version of the plan (sha256 ${state.plan_sha256}); give the new plan a new id`);
+    return 2;
+  }
+  if (!state) {
+    const refs = {};
+    try {
+      for (const item of tasks) {
+        for (const side of item.sides) {
+          const value = item.base[side];
+          if (value && !value.startsWith('after:') && !SHA.test(value)) refs[`${side}:${value}`] ??= resolveRef(side, value);
+        }
+      }
+    } catch (error) {
+      release();
+      log(`refused: ${error.message}`);
+      return 2;
+    }
+    state = {
+      plan: plan.id, plan_file: relative(workspace, planPath), plan_sha256: digest, approval, started_at: now(), refs,
+      tasks: Object.fromEntries(tasks.map((t) => [t.id, { file: t.rel, status: 'pending' }])),
+    };
+  }
+  state.status = 'running';
+  state.runs = [...(state.runs ?? []), { approval, at: now(), pid: process.pid }];
+  delete state.stopped;
+  const ctx = {
+    plan, digest, dir, state, cli, env, gateRunner, step0, stateRoot, approval, startReviewer, reviewTimeoutMs, reviewPollMs, child: null,
+    log: (m) => writeFileSync(logFile, `[${now()}] ${m}\n`, { flag: 'a', mode: 0o600 }),
+    progress: (item, what) => {
+      state.tasks[item.id].status = 'running';
+      state.tasks[item.id].step = what;
+      state.current = `${item.id} ${what}`;
+      writeState(dir, state);
+      ctx.log(`${item.id}: ${what}`);
+      log(`autopilot ${plan.id}: ${item.id} ${what}`);
+    },
+  };
+  const onSignal = () => { if (ctx.child) ctx.child.kill('SIGTERM'); ctx.interrupted = true; };
+  for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, onSignal);
+  writeState(dir, state);
+  let exit = 0;
+  try {
+    for (const item of tasks) {
+      if (['ready_for_human_merge', 'needs_contract_pilot'].includes(state.tasks[item.id].status)) continue;
+      if (ctx.interrupted) throw new Stop('interrupted');
+      await runTask(ctx, item);
+      delete state.tasks[item.id].step;
+      writeState(dir, state);
+      log(`autopilot ${plan.id}: ${item.id} ${state.tasks[item.id].status}`);
+    }
+    state.status = 'done';
+    state.summary = summary(state);
+  } catch (error) {
+    if (!(error instanceof Stop)) throw error;
+    state.status = 'stopped';
+    state.stopped = ctx.interrupted ? 'interrupted' : error.message;
+    const current = tasks.find((t) => state.tasks[t.id].status === 'running');
+    if (current) state.tasks[current.id].status = 'stopped';
+    ctx.log(`STOPPED: ${state.stopped}`);
+    log(`autopilot ${plan.id}: STOPPED — ${state.stopped}`);
+    exit = 1;
+  } finally {
+    for (const sig of ['SIGINT', 'SIGTERM']) process.off(sig, onSignal);
+    delete state.current;
+    writeState(dir, state);
+    release();
+  }
+  if (exit === 0) log(`autopilot ${plan.id}: done — ${state.summary}`);
+  return exit;
+}
+
+function summary(state) {
+  return Object.entries(state.tasks).map(([id, t]) => `${id} ${t.status}${t.branches ? ` (${Object.values(t.branches).join(', ')})` : ''}`).join('; ')
+    + '. Nothing was pushed: push and merge the branches in order.';
+}
+
+function gitRevParse(repo, ref) {
+  const r = spawnSync('git', ['-C', repo, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { encoding: 'utf8' });
+  if (r.status !== 0 || !SHA.test(r.stdout.trim())) throw new Error(`cannot resolve ${ref} in ${repo}`);
+  return r.stdout.trim();
+}
+
+// ── entry ────────────────────────────────────────────────────────────────
+function statusOf(planPath) {
+  const checked = checkPlan(planPath);
+  const id = checked.plan?.id;
+  const state = id ? readState(planDir(id)) : null;
+  if (!state) return { plan: id ?? null, status: 'not_started', problems: checked.problems ?? [] };
+  return {
+    plan: state.plan, status: state.status, current: state.current ?? null, stopped: state.stopped ?? null,
+    plan_changed: checked.digest !== state.plan_sha256, tasks: state.tasks, summary: state.summary ?? null, updated_at: state.updated_at,
+  };
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const [command, planArg, ...rest] = process.argv.slice(2);
+  const usage = 'usage: node orchestrate/autopilot.mjs check|status|run <plan.json> [--approval <source>]';
+  if (!['check', 'status', 'run'].includes(command) || !planArg) { console.error(usage); process.exit(2); }
+  const planPath = resolve(planArg);
+  if (command === 'check') {
+    const { digest, tasks, problems } = checkPlan(planPath);
+    if (tasks) for (const t of tasks) console.log(`${t.id}: ${t.rel} sha256 ${t.sha256} sides ${t.sides.join('+')} base ${JSON.stringify(t.preApproved ? 'approved file' : t.base)}`);
+    for (const p of problems) console.error(`problem: ${p}`);
+    if (digest) console.log(`plan sha256 ${digest}${problems.length ? ' (not runnable)' : ''}`);
+    process.exit(problems.length ? 1 : 0);
+  }
+  if (command === 'status') { console.log(JSON.stringify(statusOf(planPath), null, 2)); process.exit(0); }
+  const i = rest.indexOf('--approval');
+  if ((i >= 0 && !rest[i + 1]) || rest.length !== (i >= 0 ? 2 : 0)) { console.error(usage); process.exit(2); }
+  const approval = i >= 0 ? rest[i + 1].slice(0, 200) : undefined;
+  process.exitCode = await runPlan(planPath, approval ? { approval } : {});
+}
+

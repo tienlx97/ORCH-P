@@ -13,6 +13,9 @@ Its rules govern how you implement, test and document the change.
 ## Inputs
 {{INPUTS}}
 
+## Context from the approved spec
+{{CONTEXT}}
+
 ## Findings to address (rework)
 Findings from the repository gate or a review of your previous attempt in this same worktree.
 Fix every one of them; keep the rest of the existing work.

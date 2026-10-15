@@ -16,7 +16,7 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
 
 ## Layout
 
-- `orchestrate/` — `orchestrate.mjs` (commands), `step0-probe.mjs` (sandbox verification),
+- `orchestrate/` — `orchestrate.mjs` (commands), `autopilot.mjs` (runs an approved plan end to end), `step0-probe.mjs` (sandbox verification),
   `prompt.md`, `report.schema.json`, `task.example.json`; `lib/` live observability (sanitized
   events, agent snapshots), `omnigent.mjs` (bundle lint, launch environment) and
   `omnigent-runner.mjs` (Codex implementer sessions in Omnigent); `cockpit.mjs` (starts Omnigent
@@ -46,7 +46,9 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
    `orchestrate/orchestrate.mjs`) need the matching change in that repository first.
 4. Real Codex runs need a READY Step 0 (`node orchestrate/step0-probe.mjs`) and explicit user
    approval; Codex sessions in Omnigent also need a READY `node orchestrate/step0-omnigent.mjs`.
-   Rerun both after Codex or Omnigent upgrades.
+   Rerun both after Codex or Omnigent upgrades. Approving a plan (one ASK for its `autopilot`
+   request, or `autopilot.mjs run` typed by the user) is that approval for every task in it
+   (docs/orchestration.md#autopilot); nothing else may approve a task or a plan.
 5. GitHub CI stays manual-only; run the gate locally before any push.
 6. Never put secrets, tokens or `.env` values in prompts, task files, logs or evidence.
 7. A third-party orchestration platform or agent framework (e.g. Omnigent, Paperclip) may be

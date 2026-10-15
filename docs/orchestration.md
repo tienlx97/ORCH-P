@@ -8,7 +8,7 @@ the policy and gate engine: sandbox profile, approvals, scope, gates, evidence. 
 [not adopted](ruflo-evaluation.md). Policy: [BE-P coordination](../../BE-P/docs/coordination/README.md).
 
 ```text
-human approves task.json ──► prepare ──► implement (Codex, sandboxed) ──► check ──► verify (gate)
+human approves task.json (or a plan: [Autopilot](#autopilot)) ──► prepare ──► implement (Codex, sandboxed) ──► check ──► verify (gate)
                                                     ▲                                   │
                       gate or review findings ─────┘ (same worktree)                   ▼
 human merges ◄── ready_for_human_merge ◄── review-record (Claude Code) ◄── contract ◄── commit (local)
@@ -153,6 +153,58 @@ human: approves task files (status "approved") in the terminal; pushes and merge
 - **Status inside a sandbox** uses the cached Codex model catalog (`runs/model-catalog.json`,
   written whenever `codex debug models` runs) because the `codex` binary is not visible there.
 
+## Autopilot
+
+The default flow: the user handles the spec, ORCH-P does the rest.
+
+```text
+user ──► debby (/debate) ──► spec ──► coordinator: compares with the code, splits it into tasks
+                                        └─ runs/proposals/<ID>.json ("proposed") + <PLAN>.plan.json
+user: approves the plan ONCE (the ASK for the "autopilot" request; or `autopilot.mjs run` in a terminal)
+runner ──► orchestrate/autopilot.mjs, per task in plan order:
+  prepare → per side implement → check → verify ─gate findings→ implement (≤ max_rework)
+          → commit → orch-reviewer session (started by autopilot) → review-record
+          ─rework_required→ implement … commit → review again (≤ max_rework rounds)
+user: pushes and merges the branches in order (ORCH-P never does)
+```
+
+- **Plan** (`runs/proposals/<PLAN>.plan.json`): `id`, `max_rework` (0–3, default 2) and `tasks`
+  in run order, each `{file, sha256, base}`. `base` per side is a full SHA, a branch name
+  (resolved to a SHA when the plan starts and recorded) or `after:<earlier task id>` (the
+  reviewed commit of that task: branches are stacked, so a dependent task does not wait for a
+  merge). `node orchestrate/autopilot.mjs check <plan>` prints each digest and every problem,
+  including what `validate` would refuse except the bases.
+- **Approval.** Approving the plan request (or typing `run`) approves every task in it, bound to
+  the plan's sha256 and through it each proposal's sha256. Autopilot never edits a proposal: it
+  writes approved copies to `runs/autopilot/<PLAN>/tasks/<ID>.json` (resolved bases, `approval`
+  naming the plan digest and how it was approved), and every step runs on that copy, so
+  `prepare` binds its digest as for a hand-approved task. A proposal that is already
+  `approved` (with full bases) is used as it is. A changed plan is refused once its run exists:
+  use a new plan id.
+- **Steps** are the same `orchestrate.mjs` commands, unchanged: the sandbox profile, Step 0,
+  scope check, containerized gate, commit binding and review provenance all apply. The
+  reviewer is `orch-reviewer` started through `cockpit.mjs` (`omnigent run … -p "Review task
+  <copy>."` in a pseudo-terminal), so it keeps its sandbox and CEL allowlist and records the
+  review itself; autopilot only waits for the record (`ORCH_REVIEW_TIMEOUT_MS`, default 45 min)
+  and then ends that REPL (the session stays in the UI).
+- **Retries** (once each, never past a safety stop): gate exit 70 → `run-gate.mjs reap`
+  (removes containers and networks of gates whose process is gone) and verify again;
+  `implement` refused for a stale or missing Step 0 → rerun that Step 0 (`step0-probe.mjs` or
+  `step0-omnigent.mjs`) and implement again, which still decides whether Step 0 passed;
+  `implement` exiting non-zero without a refusal, a block, a timeout or an interruption →
+  implement again on the same worktree.
+- **Stops** (state `stopped` with the reason, nothing undone): a refusal or a failure that
+  remains after its one retry in `prepare`, `implement`, `check` or `commit`; gate exit 70
+  twice; a gate or review that still fails after `max_rework` rounds (per plan, or per task
+  with `max_rework` on its entry, 0–3); a reviewer that records nothing. Fix the cause and approve the same
+  plan again: it resumes where each task stands. A task with `contract_check` ends as
+  `needs_contract_pilot` (run [pilot.md](../../BE-P/docs/coordination/pilot.md) before merging);
+  later tasks still run.
+- **Status:** `node orchestrate/autopilot.mjs status <plan>` (also allowed to the coordinator);
+  log in `runs/autopilot/<PLAN>/autopilot.log`. One autopilot per plan and one runner per
+  requests directory (`.runner.lock`); while a plan runs, the runner refuses single-step
+  requests. `stop` with the plan's `plan` and `plan_sha256` stops it.
+
 ## Task file
 
 See `orchestrate/task.example.json`. `status` must be `approved` with an
@@ -161,7 +213,9 @@ SHAs are refused, and `origin/main` is never assumed). Per side: `change`, `obje
 `allowed_paths`, `acceptance_criteria`, `model`, and `effort` or `complexity`
 (`simple` → low, `normal` → medium, `complex` → high), checked against the model's
 supported efforts. Optional `runner`: `omnigent` (default; needs the approved Omnigent pin) or
-`codex-exec`. The task file's digest is bound at `prepare`: editing it requires a new id.
+`codex-exec`. Optional `context` (≤ 20 000 characters): the part of the spec the side needs,
+rendered into the prompt (Codex sees only its worktree). The task file's digest is bound at
+`prepare`: editing it requires a new id.
 
 ## Security controls
 

@@ -71,6 +71,8 @@ const PROTECTED = [
 // SSH_AUTH_SOCK, GIT_*, cloud and Docker settings) is dropped.
 const ENV_ALLOWLIST = ['HOME', 'PATH', 'LANG', 'LC_ALL', 'TERM', 'CODEX_HOME', 'DOTNET_ROOT', 'TMPDIR', 'USER'];
 const DEFAULT_EFFORT = { simple: 'low', normal: 'medium', complex: 'high' };
+// The spec excerpt a task can carry for Codex (it cannot read the plan or the proposals).
+const CONTEXT_MAX = 20_000;
 
 // Sandbox read policy. Step 0 showed the built-in :workspace profile lets
 // commands read the whole home directory (SSH keys, gh token, Codex/Claude
@@ -361,6 +363,7 @@ export function validateTask(task, { resolveCommit = true } = {}) {
       if (isAbsolute(glob) || normalize(glob).startsWith('..')) problems.push(`sides.${side}.allowed_paths: ${glob} must stay inside the repository`);
     }
     if (!Array.isArray(spec.acceptance_criteria) || spec.acceptance_criteria.length === 0) problems.push(`sides.${side}.acceptance_criteria must be non-empty`);
+    if (spec.context !== undefined && (typeof spec.context !== 'string' || spec.context.length > CONTEXT_MAX)) problems.push(`sides.${side}.context must be text of at most ${CONTEXT_MAX} characters`);
     const effort = spec.effort ?? DEFAULT_EFFORT[spec.complexity ?? 'normal'];
     if (!effort) problems.push(`sides.${side}.complexity must be simple, normal or complex`);
     if (!spec.model) problems.push(`sides.${side}.model is required (verify it with \`codex debug models\`)`);
@@ -665,6 +668,7 @@ function renderPrompt(task, side, spec, s) {
     ALLOWED_PATHS: spec.allowed_paths.map((p) => `- ${p}`).join('\n'),
     ACCEPTANCE: spec.acceptance_criteria.map((c) => `- ${c}`).join('\n'),
     INPUTS: (spec.inputs ?? []).map((i) => `- ${i}`).join('\n') || '- (none)',
+    CONTEXT: spec.context?.trim() || '(none)',
     REWORK: (s.rework ?? []).map((f) => `- [${f.severity}]${f.file ? ` ${f.file}` : ''} ${f.summary}`).join('\n') || '- (none)',
     TOOLING: toolingNote(side, s),
   };
@@ -902,9 +906,9 @@ function cmdCheck(taskPath, side) {
 }
 
 function preserveEvidence(worktree, runPath, target) {
-  const source = join(worktree, runPath);
-  if (!runPath || !existsSync(source)) return null;
-  cpSync(source, target, { recursive: true });
+  // A gate that stops before writing evidence (another verification holds the checkout) prints no path.
+  if (!runPath || !existsSync(join(worktree, runPath))) return null;
+  cpSync(join(worktree, runPath), target, { recursive: true });
   return target;
 }
 

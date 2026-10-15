@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { Runner, validateRequest } from '../orchestrate/runner.mjs';
+import { acquireRunnerLock, Runner, validateRequest } from '../orchestrate/runner.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT_PARENT = process.env.ORCH_TEST_ROOT ?? join(HERE, '..', 'runs');
@@ -96,4 +96,63 @@ test('an invalid request is refused with a result, never executed', async () => 
   assert.deepEqual(runner.scan(), []);
   assert.match(result('c1').refused, /task_sha256/);
   assert.ok(!existsSync(join(runner.dir, 'c1.tmp')));
+});
+
+function planWorkspace() {
+  const base = workspace();
+  const content = JSON.stringify({ id: 'PLAN-A', status: 'proposed', tasks: [] });
+  writeFileSync(join(base.ws, 'p.plan.json'), content);
+  // Stub autopilot.mjs: prints its arguments, waits until stopped.
+  const autopilot = join(base.ws, 'autopilot.cjs');
+  writeFileSync(autopilot, `console.log(JSON.stringify(process.argv.slice(2)));
+process.on('SIGTERM', () => process.exit(143)); require('node:fs').writeFileSync(${JSON.stringify(join(base.ws, 'plan-ready'))}, ''); setInterval(() => {}, 1000);
+`);
+  base.runner.autopilot = autopilot;
+  return { ...base, planSha: createHash('sha256').update(content).digest('hex') };
+}
+
+test('an approved autopilot request starts the plan once, blocks single steps meanwhile, and stop ends it', async () => {
+  const { ws, runner, result, planSha, sha } = planWorkspace();
+  const write = (id, body) => writeFileSync(join(runner.dir, `${id}.json`), JSON.stringify({ id, ...body }));
+  write('p1', { command: 'autopilot', plan: 'p.plan.json', plan_sha256: planSha });
+  const [running] = runner.scan();
+  write('p2', { command: 'autopilot', plan: 'p.plan.json', plan_sha256: planSha });
+  write('p3', { command: 'check', task: 'task.json', task_sha256: sha, side: 'be' });
+  runner.scan();
+  assert.match(result('p2').refused, /plan:PLAN-A is already running/);
+  assert.match(result('p3').refused, /plan:PLAN-A is running/);
+  while (!existsSync(join(ws, 'plan-ready'))) await new Promise((r) => { setTimeout(r, 10); });
+  write('p4', { command: 'stop', plan: 'p.plan.json', plan_sha256: planSha });
+  runner.scan();
+  assert.equal(result('p4').note, 'SIGTERM sent');
+  await running;
+  const r = result('p1');
+  assert.equal(r.exit, 143);
+  assert.equal(r.plan, 'p.plan.json');
+  assert.deepEqual(JSON.parse(r.output.split('\n')[0]), ['run', join(ws, 'p.plan.json'), '--approval', 'Omnigent ASK, runner request p1']);
+});
+
+test('autopilot requests are bound to the plan digest and stay inside the workspace', () => {
+  const { ws, planSha } = planWorkspace();
+  const raw = (body) => JSON.stringify({ id: 'q1', command: 'autopilot', plan: 'p.plan.json', plan_sha256: planSha, ...body });
+  assert.ok(validateRequest('q1.json', raw(), { workspace: ws }).request);
+  const cases = [
+    [raw({ plan_sha256: '0'.repeat(64) }), /plan_sha256 does not match/],
+    [raw({ plan: '../p.plan.json' }), /inside the workspace/],
+    [raw({ plan: 'task.json' }), /\.plan\.json/],
+    [raw({ side: 'be' }), /not task or side/],
+  ];
+  for (const [body, expected] of cases) assert.match(validateRequest('q1.json', body, { workspace: ws }).error, expected, body);
+});
+
+test('only one runner watches a requests directory', () => {
+  const dir = mkdtempSync(join(root, 'lock-'));
+  const release = acquireRunnerLock(dir);
+  assert.ok(release);
+  assert.equal(acquireRunnerLock(dir), null, 'a second runner is refused while the first lives');
+  release();
+  writeFileSync(join(dir, '.runner.lock'), '999999999');
+  const again = acquireRunnerLock(dir);
+  assert.ok(again, 'a dead runner\'s lock is taken over');
+  again();
 });

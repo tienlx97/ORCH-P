@@ -5,6 +5,7 @@
 //   node verify-container/run-gate.mjs be <worktree> --base <sha> [--record <file>] [--allow-restore-inputs]
 //   node verify-container/run-gate.mjs fe <worktree> --change <slug> [--record <file>]
 //   node verify-container/run-gate.mjs probe [<worktree>]
+//   node verify-container/run-gate.mjs reap        remove containers / networks of gates whose process is gone
 //   node verify-container/run-gate.mjs restore <worktree> --base <sha> --packages <dir>
 //
 // `restore` prepares a fresh BE worktree for the implementer: the networked
@@ -150,6 +151,32 @@ function cleanup(runId) {
   const left = docker(['ps', '-aq', '--filter', `label=companymanagement.verify=${runId}`]).stdout.trim()
     + docker(['network', 'ls', '-q', '--filter', `label=companymanagement.verify=${runId}`]).stdout.trim();
   return left === '';
+}
+
+/** Run ids whose gate process is gone (the id ends in its pid): their containers and networks are leftovers. */
+export function orphanRunIds(runIds, alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } }) {
+  return [...new Set(runIds)].filter((id) => {
+    const pid = Number(/-(\d+)$/.exec(id)?.[1]);
+    return Number.isInteger(pid) && pid > 0 && !alive(pid);
+  });
+}
+
+/** Removes what killed gates left behind (a stopped verify, a crash); never touches a live run. */
+function reap() {
+  const label = '{{.Label "companymanagement.verify"}}';
+  const ids = [
+    ...docker(['ps', '-a', '--filter', 'label=companymanagement.verify', '--format', label]).stdout.split('\n'),
+    ...docker(['network', 'ls', '--filter', 'label=companymanagement.verify', '--format', label]).stdout.split('\n'),
+  ].map((l) => l.trim()).filter(Boolean);
+  const orphans = orphanRunIds(ids);
+  let ok = true;
+  for (const runId of orphans) {
+    const clean = cleanup(runId);
+    ok &&= clean;
+    console.log(`reap ${runId}: ${clean ? 'removed' : 'cleanup incomplete'}`);
+  }
+  if (!orphans.length) console.log('reap: nothing left behind');
+  return ok ? 0 : 70;
 }
 
 function startMysql(runId, network, env) {
@@ -322,8 +349,9 @@ function main() {
   const { command, options } = parse(process.argv.slice(2));
   if (command === 'build-image') return buildImage();
   if (command === 'probe') return probe(options.positional[0]).ok ? 0 : 1;
+  if (command === 'reap') return reap();
   if (command !== 'be' && command !== 'fe' && command !== 'restore') {
-    console.error('usage: run-gate.mjs build-image | probe [worktree] | be <worktree> --base <sha> | fe <worktree> --change <slug> | restore <worktree> --base <sha> --packages <dir>');
+    console.error('usage: run-gate.mjs build-image | probe [worktree] | reap | be <worktree> --base <sha> | fe <worktree> --change <slug> | restore <worktree> --base <sha> --packages <dir>');
     return 2;
   }
   // One heavy gate per machine: re-run this command under the shared machine lock.
