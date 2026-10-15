@@ -71,14 +71,10 @@ os_env:
     write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude", "/tmp/omnigent-1000"]
     write_files: ["~/.claude.json"]
     cwd_allow_hidden: [".nvm", ".claude", ".credentials.json"]
-    # Network only through Omnigent's egress proxy (isolated namespace,
-    # default deny, loopback and private ranges refused): Claude reaches
-    # Anthropic, nothing else, and never the unauthenticated local API.
-    egress_rules:
-      - "* api.anthropic.com/**"
-      - "* console.anthropic.com/**"
-      - "* platform.claude.com/**"
-      - "* claude.ai/**"
+    # No egress_rules: with them, sessions created through the REST API cannot reach
+    # Omnigent's egress proxy and Claude never reaches the API (observed 2026-10-15).
+    # The network is open, so the CEL allowlist (no network commands) and the user's
+    # per-command approval are what keep this agent off the local Omnigent API.
 
 guardrails:
   policies:

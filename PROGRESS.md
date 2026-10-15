@@ -2,6 +2,12 @@
 
 Newest first. Evidence directories under `runs/` are local (gitignored).
 
+## 2026-10-15 — Coordinator / reviewer trial; egress_rules dropped
+
+- Coordinator self-test through a REST-created session: reads allowed, `.env` and `curl` refused (by the agent and the CEL allowlist), Bash waits for the user's approval under `permission_mode: default`. Claude needs write access to `/tmp/omnigent-<uid>` (both agents); `egress_rules` break REST-created sessions (egress proxy refused), so the user chose option A: removed from both agents, lint rejects them until the proxy is understood. Residual: agents can reach the unauthenticated local API, held off by the CEL allowlist and per-command approval.
+- Agents are installed with `omnigent agent add` (coordinator v4, reviewer v2) and sessions are created over REST or in the web UI; `omni run -p` without a TTY stops the session after the first message.
+- Open: question 6 (`node` in the sandbox) once the pending `status` approval is given; question 7 (reviewer) and the pilot task need a real BE-P / FE-P task.
+
 ## 2026-10-15 — Option 3: Codex sessions in Omnigent under the accepted read-isolation risk
 
 - The three options for Codex ignoring the permission profile in Omnigent are saved in `docs/omnigent-evaluation.md`; the user chose option 3 first. `omnigent/pin.json` is approved and records the accepted risk `codex-read-isolation` (exactly the five read checks); AGENTS.md rule 2 names it as the only exception.

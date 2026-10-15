@@ -125,9 +125,7 @@ test('the reviewer config is linted for its own shell allowlist and write paths'
   assert.ok(edit((t) => t.replace('read_paths: ["~/.nvm"]', 'read_paths: ["~/"]')).some((p) => /orch-reviewer.*read_paths must be exactly/.test(p)));
   assert.ok(edit((t) => t.replace('write_files: ["~/.claude.json"]', 'write_files: ["~/.claude.json", "~/.ssh/config"]')).some((p) => /write_files must be exactly/.test(p)));
   assert.ok(edit((t) => t.replace('cwd_allow_hidden: [".git",', 'cwd_allow_hidden: ["*", ".git",')).some((p) => /cwd_allow_hidden must be exactly/.test(p)));
-  assert.ok(edit((t) => t.replace('      - "* claude.ai/**"\n', '      - "* claude.ai/**"\n      - "* *.example.com/**"\n')).some((p) => /orch-reviewer.*egress_rules must be exactly/.test(p)));
-  assert.ok(edit((t) => t.replace(/ {4}egress_rules:\n(?: {6}- .*\n)+/, '')).some((p) => /egress_rules must be exactly/.test(p)));
-  assert.ok(edit((t) => t.replace('    egress_rules:', '    egress_allow_private_destinations: true\n    egress_rules:')).some((p) => /egress_allow_private_destinations/.test(p)));
+  assert.ok(edit((t) => t.replace('    write_files:', '    egress_rules:\n      - "* api.anthropic.com/**"\n    write_files:')).some((p) => /orch-reviewer.*egress_rules break REST-created sessions/.test(p)));
   assert.deepEqual(Object.keys(BUNDLE_AGENTS), ['orch-coordinator', 'orch-reviewer']);
   const extra = bundleCopy();
   cpSync(join(extra, 'orch-reviewer'), join(extra, 'codex-worker'), { recursive: true });
