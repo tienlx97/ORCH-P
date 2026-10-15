@@ -164,6 +164,35 @@ options 1 and 2 stay available.
    send it over the network from its commands. Remove the entry when Step 0 through Omnigent is
    READY.
 
+## Debby for complex features
+
+Decided 2026-10-15 by the user: *"Chấp nhận debby chạy không sandbox, đọc được mọi file của
+user."* Recorded as `debby-unsandboxed` in `omnigent/pin.json`.
+
+- **What debby is.** Omnigent's built-in example agent (`resources/examples/debby`): a
+  `claude-sdk` brain that sends each question to a Claude head (`claude-sdk`) and a GPT head
+  (`codex`) as sub-agents, and with the `debate` skill has them critique each other for N rounds
+  before a synthesis. All three run with `sandbox: type: none` and a shell that runs without an
+  ASK; only `blast_radius` (force-push, `rm -rf /`, hard reset to a remote ref) is denied.
+- **What the accepted risk means in practice.** Debby and its heads can read every file the user
+  can (SSH keys, `~/.codex/auth.json`, `~/.claude`, BE-P `.env`) into a conversation sent to two
+  model providers and kept in Omnigent's history. Unsandboxed also means they can write files,
+  use the network and run `git`/`gh` with the user's login; the decision named reads, so keep
+  to the use below.
+- **Use.** Only for tasks with `complexity: complex` (user, 2026-10-15): brainstorm or
+  stress-test the feature or its proposal before the user approves the task; paste the proposal
+  into the chat. Simple and normal tasks never go through debby. Never ask debby to edit
+  code, run builds, commit, push or open PRs, and never let its output change a task file
+  without the user's review. ORCH-P gates, task approval and review provenance are unchanged:
+  debby is not a bundle agent and the lint still rejects sub-agents, `sandbox: none` and other
+  harnesses in `omnigent/`.
+- **Still required (not covered by this decision):** debby's providers must be subscriptions,
+  not API keys or gateways (rule 7). `claude-sdk` resolves whatever `omnigent setup` configured;
+  check it in the Omnigent settings before the first debby session.
+- **Lower-risk replacement, if wanted later:** an `orch-debby` copy with no `os_env` (no file or
+  shell tools) and the same `debate` skill; the `codex` head's built-in shell must be checked
+  first.
+
 ## Open questions for the O1 probe
 
 Each question has a design answer in place (2026-10-14); O1 confirms it with evidence.

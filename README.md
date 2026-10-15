@@ -6,13 +6,39 @@ isolated containers, Claude review, human merge.
 Start with [AGENTS.md](AGENTS.md) and [docs/orchestration.md](docs/orchestration.md).
 
 ```sh
+# Once, and after upgrades
 node verify-container/run-gate.mjs build-image   # once, and after Dockerfile changes
 node orchestrate/step0-probe.mjs                 # must report READY before real runs
+node orchestrate/step0-omnigent.mjs              # Step 0 inside an Omnigent Codex session (one model call)
+
+# Omnigent hub (web UI: http://127.0.0.1:6767)
+node orchestrate/cockpit.mjs host                # start the host daemon and loopback server
+node orchestrate/cockpit.mjs host-stop           # stop them
+node orchestrate/cockpit.mjs check               # lint, pin approval, installed version, telemetry off
+node orchestrate/cockpit.mjs probe-api           # record the real REST shapes (GET only)
+
+# A task
 node orchestrate/orchestrate.mjs validate task.json
-node orchestrate/cockpit.mjs check               # Omnigent hub readiness (evaluated, not approved: docs/omnigent-evaluation.md)
-node orchestrate/cockpit.mjs probe-api           # O1: record the real REST shapes (GET only)
-node orchestrate/step0-omnigent.mjs              # O1: Step 0 inside an Omnigent Codex session (one model call)
-node orchestrate/cockpit.mjs start [reviewer]    # coordinator (or reviewer) session in Omnigent
-node orchestrate/runner.mjs                      # runs step requests approved in the Omnigent UI
+node orchestrate/cockpit.mjs start               # coordinator session in Omnigent
+node orchestrate/runner.mjs                      # second terminal: runs step requests approved in the UI
+node orchestrate/cockpit.mjs start reviewer      # reviewer session, after the verified commit
+
 ./harness/verify.sh                              # this repository's gate
+
+# Personal Claude Code session in Omnigent (starts its own server when none is running,
+# not one started by `cockpit.mjs host`)
+tools/omnigent/.venv/bin/omnigent claude -- --chrome
 ```
+
+## Debby: complex features only
+
+Omnigent's built-in **debby** has a Claude and a GPT head answer, then critique each other
+(`/debate`). It runs **unsandboxed** and can read every file you can (accepted risk
+`debby-unsandboxed`, [docs](docs/omnigent-evaluation.md#debby-for-complex-features)).
+
+- Use it **only** for tasks with `complexity: complex`, before you approve the task. Simple and
+  normal tasks go straight to the coordinator.
+- In the web UI: new session → agent `debby` → paste the proposal → `/debate` (or "debate this
+  for 2 rounds"). Read the synthesis, then edit and approve the task file yourself.
+- Never ask it to edit code, build, commit, push or open PRs. Its providers must be
+  subscriptions, not API keys.

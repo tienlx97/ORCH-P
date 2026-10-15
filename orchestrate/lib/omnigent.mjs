@@ -78,9 +78,12 @@ export function readPin(bundleDir) {
 
 // Gaps the user may accept, by name, with the Step 0 checks each one covers.
 // Nothing else can be accepted: write isolation, network, loopback, credential
-// variables, the private TMPDIR and the secret scan always have to hold.
+// variables, the private TMPDIR and the secret scan always have to hold for
+// Codex implementers. `debby-unsandboxed` covers no Step 0 check: it concerns
+// Omnigent's built-in debby, which never runs a pipeline step.
 export const KNOWN_RISKS = Object.freeze({
   'codex-read-isolation': Object.freeze(['CANARY_READ', 'SSH_KEY_READ', 'CODEX_AUTH_READ', 'OMNIGENT_STATE_READ', 'BE_ENV_READ']),
+  'debby-unsandboxed': Object.freeze([]),
 });
 
 /**

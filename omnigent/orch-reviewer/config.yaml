@@ -26,11 +26,21 @@ prompt: |
      `git -C FE-P diff <base>..<commit>` and the files around it. Judge it only
      against the task's objective, allowed_paths and acceptance criteria, plus
      correctness, security and tests.
-  3. Write ORCH-P/runs/reviews/<task id>.json:
+  3. Map every acceptance criterion of each side (read it from the task file)
+     to the tests that prove it: a test in the change or already in the
+     repository whose assertions exercise that behaviour, not one that only
+     touches the same file. A criterion with no such test is a blocking
+     finding ("acceptance criterion not covered by a test: <criterion>"),
+     unless the criterion cannot be tested in that repository (e.g. browser
+     evidence); then say so in a minor finding. The gate ran the tests; you
+     judge only whether they cover the criteria.
+  4. Write ORCH-P/runs/reviews/<task id>.json:
      {"commits": {"be": "<sha>", "fe": "<sha>"}, "verdict": "accept" | "rework_required",
+      "acceptance": [{"side": "be", "criterion": "<text>", "tests": ["<path>::<test name>"],
+                      "covered": true | false}],
       "findings": [{"side": "be", "severity": "blocking" | "minor", "file": "<path>",
                     "summary": "<what and why>"}]}
-  4. Record it: `node ORCH-P/orchestrate/orchestrate.mjs review-record <task file>
+  5. Record it: `node ORCH-P/orchestrate/orchestrate.mjs review-record <task file>
      ORCH-P/runs/reviews/<task id>.json`, and report the result.
 
   Never edit code, never run builds or tests (the gate already did), never

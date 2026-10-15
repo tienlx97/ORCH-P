@@ -26,6 +26,16 @@
       "source": "Claude Code conversation 2026-10-14: the user chose Omnigent as the agent hub and, after the O1 probe, option 3 (accept the read-isolation gap) ahead of options 1 and 2 (docs/omnigent-evaluation.md#options-while-codex-ignores-the-profile)",
       "date": "2026-10-14",
       "until": "node orchestrate/step0-omnigent.mjs reports READY; retest after every Codex or Omnigent upgrade, then remove this entry"
+    },
+    {
+      "id": "debby-unsandboxed",
+      "checks": [],
+      "reason": "The built-in Omnigent example agent debby (claude-sdk brain, claude-sdk and codex heads as sub-agents) runs with sandbox type none and an unprompted shell, so it can read every file the user can. Used only to brainstorm complex features before a task is approved; never part of prepare, implement, verify or review, and never an ORCH-P bundle agent.",
+      "scope": "debby and its two heads only; no other Omnigent example agent (polly and the rest stay unaccepted)",
+      "approved_by": "user",
+      "source": "Claude Code conversation 2026-10-15, the user's words: \"Chấp nhận debby chạy không sandbox, đọc được mọi file của user.\" (docs/omnigent-evaluation.md#debby-for-complex-features)",
+      "date": "2026-10-15",
+      "until": "the user withdraws it, or an orch-debby with no os_env replaces debby"
     }
   ]
 }
