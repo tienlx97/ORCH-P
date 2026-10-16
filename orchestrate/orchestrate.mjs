@@ -3,7 +3,7 @@
 //
 //   node orchestrate/orchestrate.mjs <command> <task.json> [side] [options]   (from ORCH-P)
 //
-// Commands: validate, prepare, implement, check, verify, commit, contract,
+// Commands: validate, prepare, implement, check, verify, commit, test, contract,
 // review-record, status, cleanup. Every child process runs without a shell
 // pipe, its exit code is recorded in the task state and returned as this
 // process's exit code. Refusals exit 2.
@@ -25,6 +25,8 @@ import { fileURLToPath } from 'node:url';
 import {
   AgentObserver, deriveLive, HEARTBEAT_MS, openObservers, readJson, snapshotPath, withLock, writeJsonAtomic,
 } from './lib/agent-state.mjs';
+import { CLAUDE_LIMIT } from './lib/claude-limit.mjs';
+import { claudeArgs, claudeImplementerSettings, claudeProgress, SANDBOX_DISABLED, SANDBOX_TOOLS } from './lib/claude-runner.mjs';
 import { codexProjector, lineSplitter } from './lib/event-stream.mjs';
 import { orchHostStatus, readPin, step0Acceptance } from './lib/omnigent.mjs';
 import {
@@ -51,7 +53,14 @@ const GATE_RUNNER = process.env.ORCH_GATE_RUNNER ?? join(HERE, '..', 'verify-con
 const REPOS = { be: BE_REPO, fe: FE_REPO };
 // Implementers run as Omnigent sessions (the hub, docs/omnigent-evaluation.md);
 // `codex-exec` is the direct `codex exec` path, kept until O1 approves Omnigent.
-const RUNNERS = ['omnigent', 'codex-exec'];
+const RUNNERS = ['omnigent', 'codex-exec', 'claude'];
+// runner "claude" (FE): Claude Code headless with Claude in Chrome (docs/orchestration.md#fe-implementer-claude).
+const CLAUDE = process.env.ORCH_CLAUDE_BIN ?? 'claude';
+const CLAUDE_MODEL = /^claude-(opus|sonnet|haiku|fable)-[0-9]+(-[0-9]+)*$/;
+const CLAUDE_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const CLAUDE_LIMITED = Symbol('claude usage limit');
+const FALLBACK_NOTE = '\n\nNote: a Claude run of this task stopped at its usage limit. The worktree may hold its partial changes: '
+  + 'read `git status` and `git diff` first, keep what is right, and finish the task.\n';
 const OMNIGENT_BUNDLE = resolve(process.env.ORCH_OMNIGENT_BUNDLE ?? join(ORCH_REPO, 'omnigent'));
 const OMNIGENT_HOST_RECORD = resolve(process.env.ORCH_OMNIGENT_HOST_RECORD ?? join(ORCH_REPO, 'runs', 'omnigent-host.json'));
 const STEP0_OMNIGENT_REPORT = resolve(process.env.ORCH_STEP0_OMNIGENT_REPORT ?? join(STATE_ROOT, 'orch-step0', 'omnigent-report.json'));
@@ -274,8 +283,11 @@ export function gitMetadataDigest(worktree) {
       else hash.update(`${path}\0`).update(readFileSync(path));
     }
   };
+  // core.untrackedCache is left out: Omnigent sets it when it opens a session in
+  // the repository (a git status cache; it runs no code and moves no ref).
+  const harmless = /^\s*untrackedCache\s*=.*$/gim;
   for (const file of [join(common, 'config'), join(gitDir, 'config.worktree'), join(common, 'packed-refs')]) {
-    if (existsSync(file)) hash.update(`${file}\0`).update(readFileSync(file));
+    if (existsSync(file)) hash.update(`${file}\0`).update(readFileSync(file, 'utf8').replace(harmless, ''));
   }
   walk(join(common, 'hooks'));
   walk(join(common, 'info'));
@@ -347,7 +359,7 @@ export function validateTask(task, { resolveCommit = true } = {}) {
   if (!task.approval?.source || !task.approval?.approved_by) problems.push('approval.source and approval.approved_by are required');
   const sides = Object.entries(task.sides ?? {});
   if (sides.length === 0) problems.push('sides must define be and/or fe');
-  const catalog = sides.length ? loadCatalog() : null;
+  const catalog = sides.some(([, spec]) => (spec?.runner ?? 'omnigent') !== 'claude' || spec?.fallback) ? loadCatalog() : null;
   for (const [side, spec] of sides) {
     if (!REPOS[side]) { problems.push(`unknown side ${side}`); continue; }
     const base = task.base_revision?.[side];
@@ -367,10 +379,23 @@ export function validateTask(task, { resolveCommit = true } = {}) {
     const effort = spec.effort ?? DEFAULT_EFFORT[spec.complexity ?? 'normal'];
     if (!effort) problems.push(`sides.${side}.complexity must be simple, normal or complex`);
     if (!spec.model) problems.push(`sides.${side}.model is required (verify it with \`codex debug models\`)`);
-    else {
+    else if (spec.runner === 'claude') {
+      if (!CLAUDE_MODEL.test(spec.model)) problems.push(`sides.${side}.model ${spec.model} is not a Claude model id (e.g. claude-opus-5-5)`);
+      else if (!CLAUDE_EFFORTS.includes(effort)) problems.push(`sides.${side}: Claude effort must be ${CLAUDE_EFFORTS.join(', ')}, not ${effort}`);
+    } else {
       const efforts = catalogEfforts(catalog, spec.model);
       if (!efforts) problems.push(`sides.${side}.model ${spec.model} is not in the Codex model catalog`);
       else if (!efforts.includes(effort)) problems.push(`sides.${side}: model ${spec.model} supports ${efforts.join(', ')}, not ${effort}`);
+    }
+    if (spec.fallback !== undefined) {
+      const f = spec.fallback;
+      if (spec.runner !== 'claude') problems.push(`sides.${side}.fallback is only for runner claude`);
+      else if (!['omnigent', 'codex-exec'].includes(f?.runner)) problems.push(`sides.${side}.fallback.runner must be omnigent or codex-exec`);
+      else {
+        const efforts = catalogEfforts(catalog, f.model);
+        if (!efforts) problems.push(`sides.${side}.fallback.model ${f.model} is not in the Codex model catalog`);
+        else if (!efforts.includes(f.effort ?? effort)) problems.push(`sides.${side}.fallback: model ${f.model} supports ${efforts.join(', ')}, not ${f.effort ?? effort}`);
+      }
     }
     spec.effort = effort;
     spec.runner ??= 'omnigent';
@@ -435,7 +460,7 @@ function observe(task, state, side, command) {
   return new AgentObserver({
     liveDir: join(stateDir(task), 'live'), taskId: task.id, runId: state.run_id ?? `${task.id}@${state.prepared_at}`,
     side, command, attempt: command === 'implement' ? attempts + 1 : Math.max(attempts, 1),
-    provider: 'codex', model: spec.model, effort: spec.effort,
+    provider: spec.runner === 'claude' ? 'claude' : 'codex', model: spec.model, effort: spec.effort,
   });
 }
 
@@ -515,14 +540,38 @@ export function gateFindings({ output, evidenceDir, worktree }) {
       const message = at >= 0 ? (lines[i + 2 + at] ?? '').trim() : '';
       add(`test failed ${m[1]}${message ? ` — ${message}` : ''}`, step);
     });
-    // Anything else (eslint, node:test, scripts): the step's error lines, not its pass summaries.
+    // node --test: the "✖ failing tests:" summary names each failure, its file and its assertion.
+    const summary = lines.findIndex((l) => /^\s*✖ failing tests:/.test(l));
+    if (summary >= 0) {
+      for (let i = summary + 1; i < lines.length; i += 1) {
+        const m = /^\s*✖ (.+?)(?: \([\d.]+m?s\))?$/.exec(lines[i]);
+        if (!m) continue;
+        specific = true;
+        const where = /^\s*test at (\S+)/.exec(lines[i - 1] ?? '')?.[1];
+        const next = lines.slice(i + 1).findIndex((x) => /^\s*(test at |✖ )/.test(x));
+        const detail = lines.slice(i + 1, next >= 0 ? i + 1 + next : undefined).map((x) => x.trim())
+          .filter((x) => x && !/^(at |\{|\}|code:|operator:|diff:|generatedMessage:|actual:|expected:)/.test(x)
+            && !/^(\+ actual - expected|[+-]\s*[[\]]+)$/.test(x))
+          .slice(0, 8).join(' ');
+        add(`test failed ${m[1]}${where ? ` (${where})` : ''}${detail ? ` — ${detail}` : ''}`, step);
+      }
+    }
+    // Anything else (eslint, scripts): the step's error lines, not its pass summaries or passing tests.
     if (!specific) {
-      lines.filter((l) => /\berror\b|✖|^not ok|FAIL/i.test(l) && !/Failed:\s+0\b|^\s*Passed!/.test(l))
+      lines.filter((l) => /\berror\b|✖|^not ok|FAIL/i.test(l) && !/Failed:\s+0\b|^\s*Passed!|^\s*✔/.test(l))
         .slice(0, 8).forEach((l) => add(l.trim(), step));
     }
     if (!specific && findings.length === before) add(`gate step ${step} failed; see ${step}.log in the verification evidence`);
   }
-  if (findings.length === 0) add('the repository gate failed without a recognizable failing step; see gate.log');
+  // No recognizable step: the gate stopped before its steps (e.g. its task
+  // binding). Quote its error lines; the implementer cannot read gate.log.
+  if (findings.length === 0) {
+    const errors = output.split('\n').map((l) => l.trim())
+      .filter((l) => /^(\w*Error\b|error:|fatal:|refused:)/i.test(l) || /\b(ERR_|failed|cannot|not found)\b/i.test(l))
+      .filter((l) => !/^CONTAINER-GATE /.test(l)).slice(0, 5);
+    if (errors.length) errors.forEach((l) => add(`gate stopped before its steps: ${l}`));
+    else add('the repository gate failed without a recognizable failing step; see gate.log');
+  }
   const kept = findings.slice(0, GATE_FINDINGS_MAX);
   if (findings.length > kept.length) kept.push({ severity: 'blocking', source: 'gate', summary: `${findings.length - kept.length} more gate findings omitted` });
   if (dropped) kept.push({ severity: 'blocking', source: 'gate', summary: `${dropped} gate lines omitted because they looked like secrets` });
@@ -633,14 +682,47 @@ function cmdPrepare(taskPath) {
   return 0;
 }
 
+/**
+ * Accepted risk `orch-defaults`: Codex runs with its default workspace-write
+ * sandbox and network on (loopback included) instead of the ORCH-P profile,
+ * without the Step 0 requirement or the refusal of hub Codex config. Scope
+ * check, Git metadata check, gate, commit binding and review are unchanged.
+ * ORCH_DEFAULTS=0 turns it off (tests); only the pin turns it on.
+ */
+function orchDefaults() {
+  if (process.env.ORCH_DEFAULTS === '0') return false;
+  return (readPin(OMNIGENT_BUNDLE).pin?.accepted_risks ?? []).some((r) => r?.id === 'orch-defaults');
+}
+const DEFAULT_SANDBOX = ['-c', 'sandbox_mode="workspace-write"', '-c', 'sandbox_workspace_write.network_access=true'];
+
 function step0Ready() {
+  if (orchDefaults()) return null;
   if (!existsSync(STEP0_REPORT)) return 'Step 0 report missing — run orchestrate/step0-probe.sh first';
   const report = JSON.parse(readFileSync(STEP0_REPORT, 'utf8'));
   return report.ready === true ? null : `Step 0 did not pass (${STEP0_REPORT}); real implementation is blocked`;
 }
 
-function toolingNote(side, s) {
-  if (side === 'fe') return '- Dependencies are installed in `node_modules`; there is no network, so do not install packages.';
+function toolingNote(side, s, spec = {}) {
+  if (side === 'fe') {
+    const port = process.env.ORCH_FE_DEV_PORT ?? '3101';
+    const browser = spec.runner === 'claude' ? [
+      `- You can see the UI: start the dev server in the background with \`pnpm dev -p ${port}\` (API_BASE_URL already points at the`,
+      `  user's running backend), then open http://localhost:${port} in Chrome with the Claude in Chrome tools and check the`,
+      '  change on desktop and a narrow (mobile) width. Open only localhost pages; never other tabs or sites. Run the unit',
+      '  tests (`pnpm run test:unit`) too. Stop the dev server before you finish, and list what you checked in the browser',
+      '  under `checks` (command "browser: <page> <what>", exit_code 0 when it looked right).',
+    ] : orchDefaults() ? [
+      '- Run the unit tests (`pnpm run test:unit`). You may start the dev server (`pnpm dev -p ' + port + '`) to check that pages',
+      '  render without errors; there is no browser. Stop it before you finish.',
+    ] : [];
+    return [
+      '- Dependencies are installed in `node_modules`; do not install or add packages.',
+      ...browser,
+      '- Never tick a checkbox in `openspec/changes/*/tasks.md` (`- [ ]` stays `- [ ]`), even if an acceptance criterion says',
+      '  "marked done": the FE gate verifies the first unchecked task and stops with "No unchecked numbered task" when none',
+      '  is left. The user ticks it after the gate passes.',
+    ].join('\n');
+  }
   // Observed in the real sandbox (2026-10-14): parallel MSBuild nodes fail
   // silently ("Build FAILED", 0 errors), and the vstest host cannot open its
   // loopback socket, so tests compile here but only run in the gate.
@@ -649,8 +731,13 @@ function toolingNote(side, s) {
       '- NuGet packages of the base revision are restored for this worktree and there is no network. Compile every project you touch,',
       '  test projects included, with `dotnet build --no-restore -m:1 -nodeReuse:false <project or CompanyManagement.sln>` and fix',
       '  every error before finishing. Without `-m:1` the build fails with no error listed. Do not run `dotnet restore`.',
-      '- `dotnet test` cannot run here (the test host needs a loopback socket the sandbox blocks). The orchestrator\'s gate runs',
-      '  the tests; report them as not run, not as passed.',
+      ...(orchDefaults() ? [
+        '- Run the test projects you touch with `dotnet test --no-restore -m:1 <project>` and fix failures. Integration tests that',
+        '  need MySQL may fail here; the orchestrator\'s gate runs them, so report those as not run.',
+      ] : [
+        '- `dotnet test` cannot run here (the test host needs a loopback socket the sandbox blocks). The orchestrator\'s gate runs',
+        '  the tests; report them as not run, not as passed.',
+      ]),
     ].join('\n');
   }
   return '- Package restore is not available for this worktree, so compiling and running tests is impossible here. Check every type, '
@@ -670,18 +757,36 @@ function renderPrompt(task, side, spec, s) {
     INPUTS: (spec.inputs ?? []).map((i) => `- ${i}`).join('\n') || '- (none)',
     CONTEXT: spec.context?.trim() || '(none)',
     REWORK: (s.rework ?? []).map((f) => `- [${f.severity}]${f.file ? ` ${f.file}` : ''} ${f.summary}`).join('\n') || '- (none)',
-    TOOLING: toolingNote(side, s),
+    TOOLING: toolingNote(side, s, spec),
   };
   return template.replace(/\{\{(\w+)\}\}/g, (_, key) => values[key] ?? '');
 }
 
-async function cmdImplement(taskPath, side) {
+/**
+ * A rework implement after `verify`: the gate's restore left obj/ naming its
+ * container package paths, so re-point it at the prepare packages offline,
+ * or Codex's `dotnet build --no-restore` fails (MSB4018, missing /nuget-ro).
+ */
+function repointPackages(task, state, side, s) {
+  if (side !== 'be' || !s.steps.verify || s.steps.restore?.exit !== 0) return;
+  const { packages } = s.steps.restore;
+  if (!packages || !existsSync(packages)) return;
+  const r = run(process.execPath, [GATE_RUNNER, 'repoint', s.worktree, '--packages', packages]);
+  const log = join(stateDir(task), 'be-repoint.log');
+  writeFileSync(log, `${r.stdout}\n${r.stderr}`);
+  recordStep(state, side, 'repoint', { exit: r.status, log });
+  if (r.status !== 0) console.error(`be: offline package re-point failed (exit ${r.status}, ${log}); Codex may not be able to build`);
+}
+
+async function cmdImplement(taskPath, side, { override = null } = {}) {
   const { task, digest } = loadTask(taskPath);
   const state = loadState(task, digest);
-  const { spec, s } = sideOf(task, state, side);
+  const { spec: taskSpec, s } = sideOf(task, state, side);
+  // override: the task's Codex fallback after Claude hit its usage limit.
+  const spec = override ? { ...taskSpec, ...override } : taskSpec;
   const blocked = step0Ready();
   if (blocked) refuse(blocked);
-  const prompt = renderPrompt(task, side, spec, s);
+  const prompt = renderPrompt(task, side, spec, s) + (override ? FALLBACK_NOTE : '');
   const promptHits = scanSecrets(prompt, 'prompt');
   if (promptHits.length) refuse(`prompt contains secret-like text (${promptHits.join(', ')}); fix the task file`);
   const dir = join(stateDir(task), `${side}-implement-${Date.now()}`);
@@ -696,9 +801,17 @@ async function cmdImplement(taskPath, side) {
     refuse(`the sandbox profile hides ${hidden.map((h) => `${h.name} (${h.path}, under denied ${h.denied_by})`).join(', ')}; `
       + 'install it under an allowed toolchain (~/.nvm, ~/.dotnet, ~/.local/bin) or put that one first on PATH');
   }
+  repointPackages(task, state, side, s);
+  if (spec.runner === 'claude') {
+    const exit = await implementViaClaude({ task, state, side, spec, s, dir, prompt });
+    if (exit !== CLAUDE_LIMITED) return exit;
+    if (!spec.fallback) { console.error(`implement ${side}: Claude hit its usage limit and the task names no fallback`); return 1; }
+    console.error(`implement ${side}: Claude hit its usage limit; running the fallback ${spec.fallback.runner} ${spec.fallback.model} on the same worktree`);
+    return cmdImplement(taskPath, side, { override: { runner: spec.fallback.runner, model: spec.fallback.model, effort: spec.fallback.effort ?? spec.effort, fallback: undefined } });
+  }
   if (spec.runner === 'omnigent') return implementViaOmnigent({ task, state, side, spec, s, dir, prompt, policy });
   const args = [
-    'exec', '-C', s.worktree, ...profileArgs(policy), '-m', spec.model,
+    'exec', '-C', s.worktree, ...(orchDefaults() ? DEFAULT_SANDBOX : profileArgs(policy)), '-m', spec.model,
     '-c', `model_reasoning_effort="${spec.effort}"`, '--ignore-user-config', '--ephemeral',
     '--json', '-o', join(dir, 'last-message.md'), '--output-schema', join(HERE, 'report.schema.json'), '-',
   ];
@@ -741,6 +854,87 @@ async function cmdImplement(taskPath, side) {
     },
     why: `${result.timedOut ? ' (timed out)' : ''}${result.interrupted ? ` (interrupted by ${result.interrupted})` : ''}`,
   });
+}
+
+/**
+ * The backend the FE implementer's dev server talks to: ORCH_FE_API_BASE_URL,
+ * else `fe_api_base_url` in runs/config.json (read at every implement, so the
+ * runner needs no restart), else the pilot backend.
+ */
+function feApiBaseUrl() {
+  if (process.env.ORCH_FE_API_BASE_URL) return process.env.ORCH_FE_API_BASE_URL;
+  const config = readJson(join(STATE_ROOT, 'config.json'));
+  return typeof config?.fe_api_base_url === 'string' ? config.fe_api_base_url : 'http://127.0.0.1:8098';
+}
+
+/**
+ * runner "claude" (FE): Claude Code headless with Claude in Chrome. The
+ * implementer can run the dev server against the user's backend
+ * (ORCH_FE_API_BASE_URL) and look at the result in Chrome; ORCH_IMPLEMENTER
+ * keeps it from recording a review of its own work.
+ */
+async function implementViaClaude({ task, state, side, spec, s, dir, prompt }) {
+  if (!(readPin(OMNIGENT_BUNDLE).pin?.accepted_risks ?? []).some((r) => r?.id === 'fe-claude-chrome')) {
+    refuse('runner "claude" drives the user\'s Chrome; it needs the accepted risk fe-claude-chrome in omnigent/pin.json');
+  }
+  // ORCH_CLAUDE_SANDBOX_TOOLS: tests only (a stub toolchain).
+  const tools = process.env.ORCH_CLAUDE_SANDBOX_TOOLS?.split(',').filter(Boolean) ?? SANDBOX_TOOLS;
+  const missing = tools.filter((tool) => run('sh', ['-c', `command -v ${tool}`], { env: sanitizedEnv() }).status !== 0);
+  if (missing.length) refuse(`Claude Code's sandbox needs ${missing.join(' and ')} (sudo apt install ${missing.map((t) => (t === 'bwrap' ? 'bubblewrap' : t)).join(' ')}); without it Claude's commands run unsandboxed`);
+  console.error('WARNING: running with accepted risk fe-claude-chrome (omnigent/pin.json): Claude in Chrome drives the user\'s real Chrome, signed-in sessions included.');
+  const tmpDir = sideTmpDir(task, side);
+  const settingsFile = join(dir, 'claude-settings.json');
+  writeFileSync(settingsFile, `${JSON.stringify(claudeImplementerSettings({ worktree: s.worktree, tmpDir, home: homedir(), denied: [join(BE_REPO, '.env'), join(FE_REPO, '.env'), STATE_ROOT] }), null, 2)}\n`, { mode: 0o600 });
+  // Claude Code's validator does not know the draft-2020-12 meta-schema that Codex accepts (observed 2026-10-16).
+  const { $schema: _meta, title: _title, ...reportSchema } = JSON.parse(readFileSync(join(HERE, 'report.schema.json'), 'utf8'));
+  const schema = JSON.stringify(reportSchema);
+  const args = claudeArgs({ model: spec.model, effort: spec.effort, settingsFile, schema });
+  const env = {
+    ...sanitizedEnv(), TMPDIR: tmpDir, ORCH_IMPLEMENTER: '1', NEXT_TELEMETRY_DISABLED: '1',
+    API_BASE_URL: feApiBaseUrl(),
+  };
+  writeFileSync(join(dir, 'command.json'), `${JSON.stringify({ bin: CLAUDE, args: args.map((a) => (a === schema ? '<report.schema.json>' : a)), env: Object.keys(env) }, null, 2)}\n`);
+  const timeout = (spec.timeout_minutes ?? 60) * 60_000;
+  const metadataBefore = gitMetadataDigest(s.worktree);
+  const obs = observe(task, state, side, 'implement');
+  obs.start('running');
+  const progress = claudeProgress();
+  const progressFile = join(stateDir(task), 'live', 'agents', `${side}.claude.json`);
+  const publish = () => { try { writeJsonAtomic(progressFile, { ...progress.seen, report: undefined, result: undefined, at: now() }); } catch { /* observability only */ } };
+  const splitter = lineSplitter({
+    onLine: (line) => {
+      let event;
+      try { event = JSON.parse(line); } catch { obs.emit('stream.anomaly', { reason: 'malformed' }); return; }
+      progress.push(event);
+      if (event?.type === 'assistant') { obs.agentActive(); publish(); }
+    },
+    onOversized: () => obs.emit('stream.anomaly', { reason: 'oversized' }),
+  });
+  const result = await runStreaming(CLAUDE, args, {
+    input: prompt, env, cwd: s.worktree, timeout, killSignal: 'SIGTERM',
+    stdoutFile: join(dir, 'events.jsonl'), stderrFile: join(dir, 'stderr.log'),
+    onStdout: (chunk) => splitter.push(chunk), onHeartbeat: () => obs.heartbeat(),
+  });
+  splitter.end();
+  publish();
+  const { report, result: text, is_error: isError, usage } = progress.seen;
+  writeFileSync(join(dir, 'last-message.md'), report ? `${JSON.stringify(report, null, 2)}\n` : `${text ?? ''}\n`);
+  obs.emit('process.exit', { exit: result.status, signal: result.signal, timed_out: result.timedOut, interrupted: result.interrupted, overflow: result.overflow });
+  const status = result.status === 0 && isError ? 1 : result.status;
+  const stderrText = existsSync(join(dir, 'stderr.log')) ? readFileSync(join(dir, 'stderr.log'), 'utf8') : '';
+  const limited = status !== 0 && CLAUDE_LIMIT.test(`${text ?? ''}\n${stderrText}`);
+  const unsandboxed = ['events.jsonl', 'stderr.log'].some((f) => existsSync(join(dir, f)) && SANDBOX_DISABLED.test(readFileSync(join(dir, f), 'utf8')));
+  const exit = finishImplement({
+    task, state, side, spec, s, obs, dir, metadataBefore, status,
+    blockedBy: unsandboxed ? 'Claude Code reported its sandbox disabled; its commands ran without filesystem or network limits — inspect the worktree and the machine' : null,
+    evidence: ['events.jsonl', 'stderr.log', 'last-message.md'],
+    record: {
+      signal: result.signal, usage, runner: 'claude', report_status: report?.status ?? null, ...(limited ? { claude_limited: true } : {}),
+      ...(result.timedOut ? { timed_out: true } : {}), ...(result.interrupted ? { interrupted: result.interrupted } : {}),
+    },
+    why: `${result.timedOut ? ' (timed out)' : ''}${result.interrupted ? ` (interrupted by ${result.interrupted})` : ''}${limited ? ' (Claude usage limit)' : isError ? ' (Claude reported an error)' : ''}`,
+  });
+  return limited && state.sides[side].status !== 'blocked' ? CLAUDE_LIMITED : exit;
 }
 
 /** Shared end of `implement`: evidence scan, Git metadata check, state and live status. */
@@ -792,7 +986,9 @@ async function implementViaOmnigent({ task, state, side, spec, s, dir, prompt: b
   }
   let base;
   try { base = loopbackUrl(process.env.ORCH_OMNIGENT_URL ?? undefined); } catch (error) { refuse(error.message); }
-  const step0 = step0OmnigentReady(pin);
+  const defaults = orchDefaults();
+  const step0 = defaults ? { blocked: null, accepted: [], checks: [] } : step0OmnigentReady(pin);
+  if (defaults) console.error('WARNING: running with accepted risk orch-defaults (omnigent/pin.json): Codex uses its default workspace-write sandbox with network and loopback on.');
   if (step0.blocked) refuse(step0.blocked);
   if (step0.accepted.length) {
     console.error(`WARNING: running with accepted risk ${step0.accepted.join(', ')} (omnigent/pin.json): Codex commands in this session can read files outside the worktree (${step0.checks.join(', ')} not enforced); writes, network and loopback stay denied.`);
@@ -801,18 +997,23 @@ async function implementViaOmnigent({ task, state, side, spec, s, dir, prompt: b
   if (!host.ok) refuse(host.reason);
   const codexConfig = join(host.codexHome, 'config.toml');
   const configProblems = codexUserConfigProblems(existsSync(codexConfig) ? readFileSync(codexConfig, 'utf8') : '');
-  if (configProblems.length) {
+  if (configProblems.length && !defaults) {
     refuse(`${codexConfig} would be copied into the Omnigent session; remove: ${configProblems.join('; ')}`);
   }
+  if (configProblems.length) console.error(`WARNING: ${codexConfig} is copied into the session with ${configProblems.join('; ')}`);
   const attempt = state.log.filter((e) => e.side === side && e.step === 'implement').length + 1;
   // The profile goes into the hub Codex home as a file profile (launch args are capped at 4096 chars);
   // `-c default_permissions` selects it on the command line too: from the config file alone the
   // app-server thread ran WorkspaceWrite with no permission profile (observed 2026-10-14, Codex 0.162.1).
-  const profileName = codexProfileName(task.id, side);
-  const profileToml = codexProfileToml(policy);
-  writeFileSync(join(host.codexHome, `${profileName}.config.toml`), profileToml, { mode: 0o600 });
-  writeFileSync(join(dir, 'codex-profile.toml'), profileToml, { mode: 0o600 });
-  const launchArgs = codexLaunchArgs({ profile: ['--profile', profileName, '-c', 'default_permissions="orch"'], model: spec.model, effort: spec.effort, tmpDir: sideTmpDir(task, side) });
+  let profile = DEFAULT_SANDBOX;
+  if (!defaults) {
+    const profileName = codexProfileName(task.id, side);
+    const profileToml = codexProfileToml(policy);
+    writeFileSync(join(host.codexHome, `${profileName}.config.toml`), profileToml, { mode: 0o600 });
+    writeFileSync(join(dir, 'codex-profile.toml'), profileToml, { mode: 0o600 });
+    profile = ['--profile', profileName, '-c', 'default_permissions="orch"'];
+  }
+  const launchArgs = codexLaunchArgs({ profile, model: spec.model, effort: spec.effort, tmpDir: sideTmpDir(task, side) });
   const policies = sessionPolicies(s.worktree);
   const agentName = process.env.ORCH_OMNIGENT_CODEX_AGENT ?? 'codex-native-ui';
   writeFileSync(join(dir, 'command.json'), `${JSON.stringify({ runner: 'omnigent', server: base, agent: agentName, launch_args: launchArgs, policies }, null, 2)}\n`);
@@ -830,6 +1031,14 @@ async function implementViaOmnigent({ task, state, side, spec, s, dir, prompt: b
       timeoutMs: (spec.timeout_minutes ?? 60) * 60_000, pollMs: Number(process.env.ORCH_OMNIGENT_POLL_MS ?? 2000),
       signal: controller.signal, onHeartbeat: () => obs.heartbeat(),
       onStatus: (status) => { if (['launching', 'running', 'waiting'].includes(status)) obs.agentActive(); },
+      // For `autopilot wait`, which relays the session's progress to the coordinator's chat.
+      onSession: (id) => {
+        try {
+          writeJsonAtomic(join(stateDir(task), 'live', 'agents', `${side}.session.json`), {
+            session_id: id, title: `${task.id} · ${side} · implement #${attempt}`, started_at: new Date().toISOString(),
+          });
+        } catch { /* observability only */ }
+      },
     });
   } catch (error) {
     recordStep(state, side, 'implement', { exit: 1, dir, runner: 'omnigent', session_id: error.sessionId ?? null, error: error.message });
@@ -975,6 +1184,11 @@ function cmdCommit(taskPath, side) {
   if (!verified || verified.exit !== 0) refuse(`verify must pass before commit (side ${side})`);
   if (!verified.evidence) refuse('verification evidence was not preserved; refusing to commit');
   if (worktreeTree(s.worktree) !== verified.tree) refuse('worktree changed since verification; run check and verify again');
+  if (!git(s.worktree, ['status', '--porcelain', '--untracked-files=all']).stdout.trim()) {
+    // Exit 3: the implementer changed nothing since the last commit (e.g. it reported blocked).
+    console.error(`commit ${side}: nothing to commit — the implementer made no changes since ${git(s.worktree, ['rev-parse', '--short', 'HEAD']).stdout.trim()}; read its report`);
+    return 3;
+  }
   const obs = observe(task, state, side, 'commit');
   obs.start('committing');
   const implement = s.steps.implement ?? {};
@@ -1040,6 +1254,7 @@ export function reviewProvenance(env = process.env, chain = ancestry()) {
 }
 
 function cmdReviewRecord(taskPath, reviewPath) {
+  if (process.env.ORCH_IMPLEMENTER) refuse('review was recorded from an implementer session; the implementer cannot review its own work');
   const { task, digest } = loadTask(taskPath);
   const state = loadState(task, digest);
   if (!reviewPath || !existsSync(reviewPath)) refuse('usage: review-record <task.json> <review.json>');
@@ -1047,6 +1262,64 @@ function cmdReviewRecord(taskPath, reviewPath) {
   const provenance = reviewProvenance();
   if (!provenance.claude) refuse('review must be recorded from a Claude Code session (CLAUDECODE=1 and a claude process in the ancestry)');
   if (provenance.codex) refuse('review was recorded from a Codex process; the implementer cannot review its own work');
+  return recordReview(task, state, review, provenance);
+}
+
+/**
+ * Codex reviews when Claude is out of tokens (accepted risk codex-review-fallback):
+ * `codex exec` read-only in the workspace root writes the review as its final
+ * answer (review.schema.json); this process, not Codex, records it.
+ */
+async function cmdReviewCodex(taskPath) {
+  if (process.env.ORCH_IMPLEMENTER) refuse('an implementer session cannot start a review');
+  if (!(readPin(OMNIGENT_BUNDLE).pin?.accepted_risks ?? []).some((r) => r?.id === 'codex-review-fallback')) {
+    refuse('a Codex review needs the accepted risk codex-review-fallback in omnigent/pin.json');
+  }
+  const { task, digest } = loadTask(taskPath);
+  const state = loadState(task, digest);
+  const sides = Object.entries(task.sides);
+  const model = process.env.ORCH_REVIEW_CODEX_MODEL
+    ?? sides.map(([, spec]) => (spec.runner === 'claude' ? spec.fallback?.model : spec.model)).find(Boolean);
+  if (!model) refuse('no Codex model for the review: set ORCH_REVIEW_CODEX_MODEL or give the task a Codex side or fallback');
+  const lines = [];
+  for (const [side, spec] of sides) {
+    const s = state.sides[side];
+    const commit = s.steps.commit?.commit;
+    if (!commit) refuse(`side ${side} has no verified commit to review`);
+    lines.push(`## ${side} (${side === 'be' ? 'BE-P' : 'FE-P'})`, `base ${s.base}, commit ${commit}`, `objective: ${spec.objective}`,
+      'acceptance criteria:', ...spec.acceptance_criteria.map((c) => `- ${c}`), '');
+  }
+  const prompt = [
+    `You are the ORCH-P reviewer for task ${task.id}, independent of the implementer. The working directory is the workspace`,
+    'root (BE-P, FE-P, ORCH-P). You are read-only: never edit files, never build or run tests (the gate did).',
+    '', ...lines,
+    'Read each change with `git -C BE-P diff <base>..<commit>` / `git -C FE-P diff <base>..<commit>` and the files around it.',
+    'Judge it only against the objective and acceptance criteria, plus correctness, security and tests. Map every acceptance',
+    'criterion to the tests that prove it (a test whose assertions exercise that behaviour); a testable criterion with no such',
+    'test is a blocking finding ("acceptance criterion not covered by a test: <criterion>"); a criterion that cannot be tested',
+    'in the repository (browser evidence) is a minor finding. Blocking only for a defect, a security problem, a change outside',
+    'the objective, or an uncovered testable criterion; style, naming and wording are minor. Verdict "accept" when nothing is',
+    'blocking. Answer with the review JSON only; "commits" names each side\'s commit above (null for a side the task lacks).',
+  ].join('\n');
+  const dir = join(stateDir(task), `review-codex-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'prompt.md'), prompt);
+  const args = ['exec', '-C', resolve(ORCH_REPO, '..'), '-s', 'read-only', '-m', model, '-c', 'model_reasoning_effort="high"',
+    '--ignore-user-config', '--ephemeral', '--json', '-o', join(dir, 'review.json'), '--output-schema', join(HERE, 'review.schema.json'), '-'];
+  writeFileSync(join(dir, 'command.json'), `${JSON.stringify({ bin: CODEX, args }, null, 2)}\n`);
+  const r = await runStreaming(CODEX, args, {
+    input: prompt, env: sanitizedEnv(), timeout: 45 * 60_000, killSignal: 'SIGTERM',
+    stdoutFile: join(dir, 'events.jsonl'), stderrFile: join(dir, 'stderr.log'),
+  });
+  if (r.status !== 0 || !existsSync(join(dir, 'review.json'))) { console.error(`review-codex: codex exit ${r.status}; evidence ${dir}`); return r.status || 1; }
+  const hits = ['events.jsonl', 'review.json'].flatMap((f) => scanSecrets(readFileSync(join(dir, f), 'utf8'), f));
+  if (hits.length) refuse(`secret-like text in the Codex review (${hits.join(', ')}); not recorded`);
+  const review = JSON.parse(readFileSync(join(dir, 'review.json'), 'utf8'));
+  for (const side of ['be', 'fe']) if (!task.sides[side] && review.commits) delete review.commits[side];
+  return recordReview(task, state, review, { reviewer: 'codex-fallback', model, evidence: dir, ...reviewProvenance() });
+}
+
+function recordReview(task, state, review, provenance) {
   for (const [side, s] of Object.entries(state.sides)) {
     const commit = s.steps.commit?.commit;
     if (!commit) refuse(`side ${side} has no verified commit to review`);
@@ -1072,6 +1345,45 @@ function cmdReviewRecord(taskPath, reviewPath) {
   }
   console.log(`review: ${status} (${blocking.length} blocking findings)`);
   return status === 'ready_for_human_merge' ? 0 : 1;
+}
+
+// What a reviewer may ask the container to test: one test project, an optional
+// `dotnet test --filter` expression. Passed as argv (no shell); no leading dash.
+export const TEST_PROJECT = /^tests\/[A-Za-z0-9._/-]+\.csproj$/;
+export const TEST_FILTER = /^[A-Za-z0-9_.=~!&|()][A-Za-z0-9_.=~!&|() -]{0,199}$/;
+
+/**
+ * Focused BE tests for the reviewer (runner `test` requests): one test project
+ * of the committed worktree, offline, in a gate container (no network, no
+ * credentials, no host home). Changes no task state; evidence goes to its own
+ * directory. The full gate already ran in `verify`.
+ */
+function cmdTest(taskPath, side, args) {
+  const { task, digest } = loadTask(taskPath);
+  const state = loadState(task, digest);
+  if (side !== 'be') refuse('test runs BE test projects only (side be)');
+  const { s } = sideOf(task, state, side);
+  const opt = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : undefined);
+  const project = opt('--project');
+  const filter = opt('--filter');
+  if (!TEST_PROJECT.test(project ?? '') || project.includes('..')) refuse('--project must be tests/<path>.csproj');
+  if (filter !== undefined && !TEST_FILTER.test(filter)) refuse('--filter has characters a dotnet test filter does not need');
+  const commit = s.steps.commit?.commit;
+  if (!commit) refuse(`side ${side} has no verified commit to test`);
+  if (git(s.worktree, ['rev-parse', 'HEAD']).stdout.trim() !== commit) refuse(`worktree HEAD is not the verified commit ${commit.slice(0, 12)}`);
+  if (git(s.worktree, ['status', '--porcelain', '--untracked-files=all']).stdout.trim()) refuse('worktree has uncommitted changes');
+  const packages = s.steps.restore?.exit === 0 ? s.steps.restore.packages : null;
+  if (!packages || !existsSync(packages)) refuse('no offline packages for this worktree (prepare restore failed)');
+  const dir = join(stateDir(task), `${side}-test-${Date.now()}`);
+  mkdirSync(dir, { recursive: true });
+  const gateArgs = [GATE_RUNNER, 'test', s.worktree, '--base', s.base, '--packages', packages, '--project', project,
+    ...(filter ? ['--filter', filter] : []), '--record', join(dir, 'container-record.json')];
+  const r = run(process.execPath, gateArgs, { cwd: s.worktree });
+  writeFileSync(join(dir, 'test.log'), `${r.stdout}\n${r.stderr}`);
+  process.stdout.write(r.stdout);
+  process.stderr.write(r.stderr);
+  console.log(`test ${side}: ${project}${filter ? ` --filter ${filter}` : ''} on ${commit.slice(0, 12)}: exit ${r.status}; log ${join(dir, 'test.log')}`);
+  return r.status;
 }
 
 function cmdStatus(taskPath) {
@@ -1137,8 +1449,10 @@ const COMMANDS = {
   check: (a) => cmdCheck(a[0], a[1]),
   verify: (a) => cmdVerify(a[0], a[1]),
   commit: (a) => cmdCommit(a[0], a[1]),
+  test: (a) => cmdTest(a[0], a[1], a.slice(2)),
   contract: () => cmdContract(),
   'review-record': (a) => cmdReviewRecord(a[0], a[1]),
+  'review-codex': (a) => cmdReviewCodex(a[0]),
   status: (a) => cmdStatus(a[0]),
   cleanup: (a) => cmdCleanup(a[0], a.find((x) => x === 'be' || x === 'fe'), { preserve: a.includes('--preserve') }),
 };

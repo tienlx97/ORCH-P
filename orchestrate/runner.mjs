@@ -22,6 +22,11 @@
 // starts orchestrate/autopilot.mjs for it; `stop` with the plan stops it.
 // One runner per requests directory: a second one refuses to start, so a
 // request never runs twice.
+//
+// `test` (runs/test-requests/ only, no approval prompt): the reviewer asks for
+// one BE test project of a committed task side to run offline in a gate
+// container (orchestrate.mjs test). That directory accepts nothing else, so
+// writing there can never start, change or approve a step.
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
@@ -31,6 +36,7 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { safeText } from './lib/event-stream.mjs';
+import { TEST_FILTER, TEST_PROJECT } from './orchestrate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ORCH_REPO = resolve(HERE, '..');
@@ -39,17 +45,23 @@ const STATE_ROOT = resolve(process.env.ORCH_STATE_ROOT ?? join(ORCH_REPO, 'runs'
 const CLI = resolve(process.env.ORCH_RUNNER_CLI ?? join(HERE, 'orchestrate.mjs'));
 const AUTOPILOT = resolve(process.env.ORCH_RUNNER_AUTOPILOT ?? join(HERE, 'autopilot.mjs'));
 
-export const RUNNER_COMMANDS = Object.freeze(['prepare', 'implement', 'check', 'verify', 'commit', 'status', 'stop', 'autopilot']);
-const SIDED = new Set(['implement', 'check', 'verify', 'commit', 'stop']);
+export const RUNNER_COMMANDS = Object.freeze(['prepare', 'implement', 'check', 'verify', 'commit', 'test', 'status', 'stop', 'autopilot']);
+const SIDED = new Set(['implement', 'check', 'verify', 'commit', 'test', 'stop']);
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 /** Validates one request; returns { request } or { error }. */
-export function validateRequest(file, raw, { workspace = WORKSPACE } = {}) {
+export function validateRequest(file, raw, { workspace = WORKSPACE, only = null } = {}) {
   let request;
   try { request = JSON.parse(raw); } catch { return { error: 'request is not JSON' }; }
   const id = file.replace(/\.json$/, '');
   if (!ID.test(id) || request.id !== id) return { error: 'request id must match the file name ([A-Za-z0-9_-], up to 64)' };
   if (!RUNNER_COMMANDS.includes(request.command)) return { error: `command must be one of ${RUNNER_COMMANDS.join(', ')}` };
+  if (only && request.command !== only) return { error: `this directory accepts only ${only} requests` };
+  if (request.command === 'test') {
+    if (request.side !== 'be') return { error: 'test runs BE test projects only (side be)' };
+    if (!TEST_PROJECT.test(request.project ?? '') || request.project.includes('..')) return { error: 'project must be tests/<path>.csproj' };
+    if (request.filter !== undefined && !TEST_FILTER.test(request.filter)) return { error: 'filter has characters a dotnet test filter does not need' };
+  }
   if (request.command === 'autopilot' || (request.command === 'stop' && request.plan !== undefined)) return validatePlanRequest(request, workspace);
   if (SIDED.has(request.command) ? !['be', 'fe'].includes(request.side) : request.side !== undefined) {
     return { error: SIDED.has(request.command) ? 'side must be be or fe' : `${request.command} takes no side` };
@@ -116,8 +128,12 @@ function writeAtomic(file, text) {
 const tail = (text, lines = 40) => text.split('\n').slice(-lines).map((l) => safeText(l, 400)).join('\n');
 
 export class Runner {
-  constructor({ dir = join(STATE_ROOT, 'requests'), workspace = WORKSPACE, cli = CLI, autopilot = AUTOPILOT, env = process.env, log = (m) => console.log(m) } = {}) {
+  constructor({
+    dir = join(STATE_ROOT, 'requests'), testDir = join(dirname(dir), 'test-requests'), workspace = WORKSPACE, cli = CLI, autopilot = AUTOPILOT,
+    env = process.env, log = (m) => console.log(m),
+  } = {}) {
     this.dir = dir;
+    this.testDir = testDir;
     this.workspace = workspace;
     this.cli = cli;
     this.autopilot = autopilot;
@@ -126,52 +142,59 @@ export class Runner {
     this.running = new Map();
     this.pending = new Set();
     mkdirSync(dir, { recursive: true, mode: 0o700 });
+    mkdirSync(testDir, { recursive: true, mode: 0o700 });
   }
 
-  result(id, data) {
-    writeAtomic(join(this.dir, `${id}.result.json`), `${JSON.stringify({ id, ...data, finished_at: new Date().toISOString() }, null, 2)}\n`);
+  result(id, data, dir = this.dir) {
+    writeAtomic(join(dir, `${id}.result.json`), `${JSON.stringify({ id, ...data, finished_at: new Date().toISOString() }, null, 2)}\n`);
     appendFileSync(join(this.dir, 'audit.jsonl'), `${JSON.stringify({ at: new Date().toISOString(), id, ...data, output: undefined })}\n`, { mode: 0o600 });
     this.log(`request ${id}: ${data.refused ? `refused — ${data.refused}` : `${data.command} exit ${data.exit}`}`);
   }
 
   /** Picks up new request files once; returns the started child promises. */
   scan() {
+    return [...this.scanDir(this.dir, null), ...this.scanDir(this.testDir, 'test')];
+  }
+
+  scanDir(dir, only) {
     const started = [];
-    for (const file of readdirSync(this.dir).sort()) {
+    const result = (id, data) => this.result(id, data, dir);
+    for (const file of readdirSync(dir).sort()) {
       if (!file.endsWith('.json') || file.endsWith('.result.json') || file.endsWith('.tmp')) continue;
       const id = file.replace(/\.json$/, '');
-      if (this.pending.has(id) || existsSync(join(this.dir, `${id}.result.json`))) continue;
-      this.pending.add(id);
-      const { request, error } = validateRequest(file, readFileSync(join(this.dir, file), 'utf8'), { workspace: this.workspace });
-      if (error) { this.result(id, { refused: error }); continue; }
+      if (this.pending.has(`${dir}:${id}`) || existsSync(join(dir, `${id}.result.json`))) continue;
+      this.pending.add(`${dir}:${id}`);
+      const { request, error } = validateRequest(file, readFileSync(join(dir, file), 'utf8'), { workspace: this.workspace, only });
+      if (error) { result(id, { refused: error }); continue; }
       if (request.command === 'stop') {
         const child = this.running.get(request.key);
         if (child) child.kill('SIGTERM');
-        this.result(id, { command: 'stop', side: request.side ?? null, exit: child ? 0 : 1, note: child ? 'SIGTERM sent' : `nothing running for ${request.key}` });
+        result(id, { command: 'stop', side: request.side ?? null, exit: child ? 0 : 1, note: child ? 'SIGTERM sent' : `nothing running for ${request.key}` });
         continue;
       }
       if (request.command === 'autopilot' && this.running.has(request.key)) {
-        this.result(id, { refused: `${request.key} is already running; request stop first or wait` });
+        result(id, { refused: `${request.key} is already running; request stop first or wait` });
         continue;
       }
       const plan = [...this.running.keys()].find((k) => k.startsWith('plan:'));
-      if (plan && request.command !== 'status' && request.command !== 'autopilot') {
-        this.result(id, { refused: `${plan} is running; its steps are the autopilot's until it stops` });
+      if (plan && !['status', 'autopilot', 'test'].includes(request.command)) {
+        result(id, { refused: `${plan} is running; its steps are the autopilot's until it stops` });
         continue;
       }
       if (request.command !== 'status' && request.command !== 'prepare' && this.running.has(request.key)) {
-        this.result(id, { refused: `a step is already running for ${request.key}; request stop first or wait` });
+        result(id, { refused: `a step is already running for ${request.key}; request stop first or wait` });
         continue;
       }
-      started.push(this.execute(id, request));
+      started.push(this.execute(id, request, dir));
     }
     return started;
   }
 
-  execute(id, request) {
+  execute(id, request, dir = this.dir) {
     const args = request.command === 'autopilot'
       ? [this.autopilot, 'run', request.planPath, '--approval', `Omnigent ASK, runner request ${id}`]
-      : [this.cli, request.command, request.taskPath, ...(request.side ? [request.side] : [])];
+      : [this.cli, request.command, request.taskPath, ...(request.side ? [request.side] : []),
+        ...(request.command === 'test' ? ['--project', request.project, ...(request.filter ? ['--filter', request.filter] : [])] : [])];
     const startedAt = new Date().toISOString();
     const child = spawn(process.execPath, args, { cwd: ORCH_REPO, env: this.env, stdio: ['ignore', 'pipe', 'pipe'] });
     if (SIDED.has(request.command) || request.command === 'autopilot') this.running.set(request.key, child);
@@ -186,7 +209,7 @@ export class Runner {
           command: request.command, side: request.side ?? null, task: request.taskPath ? relative(this.workspace, request.taskPath) : null,
           ...(request.planPath ? { plan: relative(this.workspace, request.planPath) } : {}),
           exit: code ?? (signal ? 128 : 1), signal, started_at: startedAt, output: tail(output),
-        });
+        }, dir);
         done();
       });
     });

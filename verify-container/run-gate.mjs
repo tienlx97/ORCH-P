@@ -7,10 +7,14 @@
 //   node verify-container/run-gate.mjs probe [<worktree>]
 //   node verify-container/run-gate.mjs reap        remove containers / networks of gates whose process is gone
 //   node verify-container/run-gate.mjs restore <worktree> --base <sha> --packages <dir>
+//   node verify-container/run-gate.mjs repoint <worktree> --packages <dir>
+//   node verify-container/run-gate.mjs test <worktree> --base <sha> --packages <dir> --project <csproj> [--filter <expr>]
 //
 // `restore` prepares a fresh BE worktree for the implementer: the networked
 // package restore of step 1 below, on the base revision's restore inputs, so
 // Codex can build and test offline (`--no-restore`) inside its sandbox.
+// `test` runs one BE test project of a committed worktree for the reviewer,
+// offline (network none) on those packages.
 //
 // Runs the repository's own unmodified gate (./harness/verify.sh) on
 // agent-written code inside a disposable container instead of on the host:
@@ -296,6 +300,77 @@ function restoreForAgent(worktree, options) {
   return changed && record.exit === 0 ? 1 : record.exit;
 }
 
+/**
+ * Focused tests for the reviewer (orchestrate `test`): one BE test project of
+ * the committed worktree, with network none. The offline restore re-points
+ * obj/ at the run's packages (the gate's restore left it at its own scratch
+ * dir); only the base revision's restore inputs are accepted, as in `restore`.
+ */
+function testForReviewer(worktree, options) {
+  const wt = realpathSync(worktree);
+  if (!/^[0-9a-f]{40}$/.test(options.base ?? '')) refuse('--base must be the full commit SHA the worktree started from');
+  if (!options.packages || !existsSync(options.packages)) refuse('--packages <dir> must exist (the prepare restore)');
+  if (!/^tests\/[A-Za-z0-9._/-]+\.csproj$/.test(options.project ?? '') || options.project.includes('..')) refuse('--project must be tests/<path>.csproj');
+  if (options.filter !== undefined && !/^[A-Za-z0-9_.=~!&|()][A-Za-z0-9_.=~!&|() -]{0,199}$/.test(options.filter)) refuse('--filter is not a plain dotnet test filter');
+  const packages = resolve(options.packages);
+  const commonGitDir = resolve(wt, git(wt, ['rev-parse', '--git-common-dir']).stdout.trim());
+  const image = requireImage();
+  const inputs = restoreInputChanges(changedPaths(wt, options.base));
+  if (inputs.length) refuse(`restore inputs differ from --base (${inputs.join(', ')}); the offline packages may not match`);
+  const runId = `test-${Date.now()}-${process.pid}`;
+  const record = { side: 'be', command: 'test', worktree: wt, project: options.project, filter: options.filter ?? null, run_id: runId, image, tree_before: treeHash(wt), steps: [] };
+  const offline = (name, cmd) => {
+    const r = docker([...containerArgs({ worktree: wt, commonGitDir, packages, network: 'none', name: `verify-${name}-${runId}`, runId }), ...cmd], { timeout: TIMEOUT_MS });
+    process.stdout.write(r.stdout);
+    process.stderr.write(r.stderr);
+    record.steps.push({ name, exit: r.status, network: 'none' });
+    return r.status;
+  };
+  try {
+    record.exit = offline('restore', ['dotnet', 'restore', options.project, '-p:NuGetAudit=false']);
+    if (record.exit === 0) {
+      record.exit = offline('test', ['dotnet', 'test', options.project, '--no-restore', ...(options.filter ? ['--filter', options.filter] : [])]);
+    }
+  } finally {
+    record.cleanup_complete = cleanup(runId);
+    record.tree_after = treeHash(wt);
+  }
+  if (options.record) writeFileSync(options.record, `${JSON.stringify(record, null, 2)}\n`);
+  const changed = record.tree_after !== record.tree_before;
+  console.log(`CONTAINER-TEST exit=${record.exit} project=${options.project}${changed ? ' (TREE CHANGED)' : ''}`);
+  return changed && record.exit === 0 ? 1 : record.exit;
+}
+
+/**
+ * Offline restore (network none) that re-points obj/ at the run's packages
+ * before a rework implement: the gate's own restore leaves project.assets.json
+ * naming its container paths (/nuget-rw, /nuget-ro), so the implementer's
+ * `dotnet build --no-restore` fails on the host. Packages come only from the
+ * prepare restore; a new package fails here, as it would for the implementer.
+ */
+function repointForAgent(worktree, options) {
+  const wt = realpathSync(worktree);
+  if (!options.packages || !existsSync(options.packages)) refuse('--packages <dir> must exist (the prepare restore)');
+  const packages = resolve(options.packages);
+  const commonGitDir = resolve(wt, git(wt, ['rev-parse', '--git-common-dir']).stdout.trim());
+  requireImage();
+  const runId = `repoint-${Date.now()}-${process.pid}`;
+  const before = treeHash(wt);
+  let exit;
+  try {
+    const r = docker([...containerArgs({ worktree: wt, commonGitDir, packages, network: 'none', name: `verify-repoint-${runId}`, runId }),
+      'dotnet', 'restore', 'CompanyManagement.sln', '-p:NuGetAudit=false'], { timeout: TIMEOUT_MS });
+    process.stdout.write(r.stdout);
+    process.stderr.write(r.stderr);
+    exit = r.status;
+  } finally {
+    cleanup(runId);
+  }
+  const changed = treeHash(wt) !== before;
+  console.log(`CONTAINER-REPOINT exit=${exit} packages=${packages}${changed ? ' (TREE CHANGED)' : ''}`);
+  return changed && exit === 0 ? 1 : exit;
+}
+
 function probe(worktree) {
   // Runs fixed checks inside a gate container to prove the isolation claims.
   const image = requireImage();
@@ -339,6 +414,8 @@ function parse(argv) {
     else if (a === '--change') options.change = rest[++i];
     else if (a === '--record') options.record = rest[++i];
     else if (a === '--packages') options.packages = rest[++i];
+    else if (a === '--project') options.project = rest[++i];
+    else if (a === '--filter') options.filter = rest[++i];
     else if (a === '--allow-restore-inputs') options.allowRestoreInputs = true;
     else options.positional.push(a);
   }
@@ -350,8 +427,8 @@ function main() {
   if (command === 'build-image') return buildImage();
   if (command === 'probe') return probe(options.positional[0]).ok ? 0 : 1;
   if (command === 'reap') return reap();
-  if (command !== 'be' && command !== 'fe' && command !== 'restore') {
-    console.error('usage: run-gate.mjs build-image | probe [worktree] | reap | be <worktree> --base <sha> | fe <worktree> --change <slug> | restore <worktree> --base <sha> --packages <dir>');
+  if (!['be', 'fe', 'restore', 'repoint', 'test'].includes(command)) {
+    console.error('usage: run-gate.mjs build-image | probe [worktree] | reap | be <worktree> --base <sha> | fe <worktree> --change <slug> | restore <worktree> --base <sha> --packages <dir> | repoint <worktree> --packages <dir> | test <worktree> --base <sha> --packages <dir> --project <csproj> [--filter <expr>]');
     return 2;
   }
   // One heavy gate per machine: re-run this command under the shared machine lock.
@@ -364,6 +441,8 @@ function main() {
   const worktree = options.positional[0];
   if (!worktree || !existsSync(worktree)) refuse('worktree path required');
   if (command === 'restore') return restoreForAgent(worktree, options);
+  if (command === 'test') return testForReviewer(worktree, options);
+  if (command === 'repoint') return repointForAgent(worktree, options);
   const { exit, record, scratch } = gate(command, worktree, options);
   record.exit = exit;
   if (options.record) {

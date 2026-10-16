@@ -24,10 +24,11 @@
       "change": "<openspec change slug in FE-P>",
       "objective": "One sentence: the frontend outcome",
       "complexity": "normal",
-      "model": "<model slug>",
-      "runner": "omnigent",
+      "model": "claude-opus-5-5",
+      "runner": "claude",
+      "fallback": { "runner": "omnigent", "model": "<model slug from `codex debug models`>" },
       "allowed_paths": ["src/**", "openspec/changes/<slug>/**"],
-      "acceptance_criteria": ["Observable UI behavior", "Adapter tests"],
+      "acceptance_criteria": ["Observable UI behavior", "Adapter tests", "browser: what the page must show"],
       "inputs": ["BE handoff: docs/api changes and the verified BE commit"]
     }
   }

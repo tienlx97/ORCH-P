@@ -27,6 +27,7 @@ siblings; override with `ORCH_BE_REPO` / `ORCH_FE_REPO`). Run state goes to `ORC
 | `check` | Changed paths ⊆ `allowed_paths`, no protected paths, secret scan of diff and new files; binds the result to the tree hash | — (fails with exit 1) |
 | `verify` | The repository's own gate in a verification container (`verify-container/run-gate.mjs`), FE `task.mjs status`; preserves evidence and the container record; binds both to the tree hash. A failed gate (not exit 70) records its findings as rework: run `implement`, `check`, `verify` again on the same worktree | `check` did not pass, or the tree changed since `check` |
 | `commit` | Local commit with `Verified-Tree` / `Verification-Evidence` trailers | Gate not passed; evidence missing; tree changed since verification |
+| `test` | `test <task> be --project tests/<path>.csproj [--filter <expr>]`: one BE test project of the committed worktree, offline restore + `dotnet test` in a gate container with network none (`run-gate.mjs test`); for the reviewer. Changes no task state; log in `runs/orch-<ID>/be-test-<ts>/` | Side not `be`; no verified commit, HEAD not that commit or uncommitted changes; no prepare packages; restore inputs changed from the base; project or filter outside the allowed shape |
 | `contract` | Disabled: the contract-read check would build and serve agent code on the host. A task with `contract_check: true` cannot reach `ready_for_human_merge`; run [pilot.md](../../BE-P/docs/coordination/pilot.md) manually after review | Always |
 | `review-record` | Stores Claude Code's `review.json` with execution provenance | Not run from a Claude Code process; a Codex process in the ancestry; commits differ from the verified commits |
 | `status` | `in_progress`, `blocked`, `rework_required` (review or gate findings pending) or `ready_for_human_merge`; per side `live` ([Live observability](#live-observability)) | — |
@@ -109,6 +110,7 @@ user ⇄ Omnigent web UI (127.0.0.1:6767) — every session below, live, with sh
   │                                                     └─► orchestrate.mjs prepare|implement|check|verify|commit|stop
   ├─ <ID> · be|fe · implement #n (Codex)   created by `implement` with the Step 0 profile
   └─ orch-reviewer (Claude)     git show/diff, writes runs/reviews/<ID>.json, runs review-record
+         └─ runs/test-requests/<id>.json ──(no ASK)──► runner ──► orchestrate.mjs test (gate container, offline)
 human: approves task files (status "approved") in the terminal; pushes and merges
 ```
 
@@ -142,9 +144,23 @@ human: approves task files (status "approved") in the terminal; pushes and merge
   One step per task side at a time; `stop` sends SIGTERM to it. Results go to
   `<id>.result.json` (exit code, sanitized output tail) and `audit.jsonl`. Never through a
   request: approving or editing a task, `cleanup`, `review-record`, push, merge.
+  `runs/test-requests/` is a second directory the runner watches for the reviewer: it accepts
+  only `test` requests (`side: "be"`, `project`, optional `filter`, same `task_sha256` binding),
+  needs no ASK and may run while a plan runs, because a test run changes nothing and runs in a
+  gate container without network or credentials.
 - **Coordinator and reviewer** are `claude-native` sessions in Omnigent's `linux_bwrap` sandbox
-  ($HOME not mounted, workspace read-only, dot-paths masked) with a CEL tool allowlist; see
-  `omnigent/*/config.yaml`. `cockpit.mjs lint` (in `harness/verify.sh`) rejects any bypass,
+  ($HOME not mounted, workspace read-only, dot-paths masked); see `omnigent/*/config.yaml`.
+  Since 2026-10-15 they have no CEL tool allowlist (accepted risk `agent-no-cel`,
+  [why](omnigent-evaluation.md#no-cel-allowlist-for-the-bundle-agents)): like Omnigent's default
+  agents, Claude asks the user before every command or write that is not pre-approved, and the
+  prompt for a `runs/requests` write is the approval of that step or plan. Never approve
+  `curl`/`wget`/`nc` or a broad "always allow" for Bash there: the network is open and the
+  local Omnigent API can approve prompts. While the pin accepts `agent-prompt-preapproval`, `cockpit.mjs` (host, start, the
+  autopilot reviewer) installs `<workspace>/.claude/settings.json` from
+  `orchestrate/lib/omnigent.mjs` `claudeSettings`: Claude's own prompt is pre-answered for the
+  ORCH-P status/validate/review-record and autopilot check/status commands and for writes to
+  `runs/proposals`, `runs/reviews` and `runs/test-requests`. It never overwrites a settings file it did not write, and removes
+  its own copy when the risk is withdrawn. `cockpit.mjs lint` (in `harness/verify.sh`) rejects any bypass,
   `sandbox: none`, other harnesses, sub-agents, credential pass-through, push/PR instructions,
   a changed shell allowlist or write path, and unknown agents.
 - **O1 helpers:** `cockpit.mjs probe-api` records the real `/v1/agents` and `/v1/hosts` responses
@@ -184,7 +200,7 @@ user: pushes and merges the branches in order (ORCH-P never does)
 - **Steps** are the same `orchestrate.mjs` commands, unchanged: the sandbox profile, Step 0,
   scope check, containerized gate, commit binding and review provenance all apply. The
   reviewer is `orch-reviewer` started through `cockpit.mjs` (`omnigent run … -p "Review task
-  <copy>."` in a pseudo-terminal), so it keeps its sandbox and CEL allowlist and records the
+  <copy>."` in a pseudo-terminal), so it keeps its sandbox and permission prompts and records the
   review itself; autopilot only waits for the record (`ORCH_REVIEW_TIMEOUT_MS`, default 45 min)
   and then ends that REPL (the session stays in the UI).
 - **Retries** (once each, never past a safety stop): gate exit 70 → `run-gate.mjs reap`
@@ -192,7 +208,11 @@ user: pushes and merges the branches in order (ORCH-P never does)
   `implement` refused for a stale or missing Step 0 → rerun that Step 0 (`step0-probe.mjs` or
   `step0-omnigent.mjs`) and implement again, which still decides whether Step 0 passed;
   `implement` exiting non-zero without a refusal, a block, a timeout or an interruption →
-  implement again on the same worktree.
+  implement again on the same worktree; `commit` exit 3 (the implementer changed nothing, e.g.
+  it reported blocked) → implement again; a reviewer session that ends without a review →
+  start it again. Before every BE implement after a `verify`, `orchestrate implement` runs
+  `run-gate.mjs repoint` (offline restore, network none) so `obj/` names the prepare packages
+  again instead of the gate's container paths (`/nuget-ro`), which broke `--no-restore` builds.
 - **Stops** (state `stopped` with the reason, nothing undone): a refusal or a failure that
   remains after its one retry in `prepare`, `implement`, `check` or `commit`; gate exit 70
   twice; a gate or review that still fails after `max_rework` rounds (per plan, or per task
@@ -204,6 +224,64 @@ user: pushes and merges the branches in order (ORCH-P never does)
   log in `runs/autopilot/<PLAN>/autopilot.log`. One autopilot per plan and one runner per
   requests directory (`.runner.lock`); while a plan runs, the runner refuses single-step
   requests. `stop` with the plan's `plan` and `plan_sha256` stops it.
+
+## FE implementer (Claude)
+
+FE tasks run on Claude Code with Claude in Chrome (`"runner": "claude"`, a Claude model id such as
+`claude-opus-5-5`, effort low…max); BE tasks stay on Codex. Accepted risk `fe-claude-chrome`
+(omnigent/pin.json) is required.
+
+- `orchestrate implement` runs `claude -p --chrome --permission-mode acceptEdits --settings
+  <run settings> --json-schema <report.schema.json>` in the FE worktree with the allowlisted
+  environment plus `TMPDIR`, `ORCH_IMPLEMENTER=1` and `API_BASE_URL`: the backend the user runs,
+  from `ORCH_FE_API_BASE_URL`, else `fe_api_base_url` in `runs/config.json` (read at every implement,
+  no runner restart), else `http://127.0.0.1:8098`.
+- The prompt lets it start the dev server (`pnpm dev -p ${ORCH_FE_DEV_PORT:-3101}`), check the
+  page in Chrome on desktop and mobile width, run the unit tests, and list browser checks in its
+  report. Prompt only: it is told to open localhost pages only.
+- Run settings (`lib/claude-runner.mjs`): shell commands in Claude Code's bwrap sandbox, writes
+  only in the worktree and the run's temp dir, reads of SSH/GPG/cloud/gh/docker/npm credentials,
+  `~/.codex`, `~/.omnigent`, BE-P/FE-P `.env` and `ORCH-P/runs` denied, network only to
+  localhost (local binding allowed); file edits only in the worktree; Git history commands,
+  `gh`, `curl`, `wget`, package installs, WebFetch/WebSearch and sub-agents denied.
+- Claude Code runs commands **unsandboxed with only a warning** when `bwrap` or `socat` is
+  missing (observed 2026-10-16). `implement` refuses without both, and a run whose output
+  reports the sandbox disabled blocks the side.
+  Probe with both installed (2026-10-16, Claude Code 2.1.300): `~/.ssh` masked (empty), write to
+  `~` → read-only file system, write in the worktree works, `fetch https://example.com` →
+  `EAI_AGAIN`, BE-P `.env` → permission denied, a local HTTP server on 127.0.0.1 works.
+- Live progress: `live/agents/fe.claude.json` (command count, last command, last message),
+  relayed by `autopilot wait`. The report comes from the result's structured output
+  (`last-message.md`).
+- Scope check, Git metadata check, containerized gate, commit binding and review are unchanged.
+  The reviewer stays Claude (another session); `review-record` refuses when
+  `ORCH_IMPLEMENTER` is set.
+
+## Omnigent defaults
+
+Accepted risk `orch-defaults` (2026-10-16): the user asked ORCH-P to keep Omnigent's and Codex's
+defaults so agents can use as much as possible.
+
+- Codex implementers (Omnigent and `codex-exec`) run with `sandbox_mode="workspace-write"` and
+  `sandbox_workspace_write.network_access=true` instead of the ORCH-P permission profile:
+  network and loopback on (BE can run `dotnet test`, FE the dev server; the Omnigent API and the
+  internet are reachable), the home directory readable, writes only in the worktree and temp dirs.
+- Step 0 is not required; hub Codex config with MCP servers, hooks or profiles is copied with a
+  warning instead of refused.
+- Kept: Omnigent session policies (worktree guard, push gate, tool cap, loop guard), the
+  environment allowlist, scope check, Git metadata check, containerized gate, commit binding and
+  review. Remove the pin entry to go back to the ORCH-P profile and Step 0.
+
+## Claude fallback to Codex
+
+When Claude is out of tokens (usage, rate or spend limit: `lib/claude-limit.mjs`):
+
+| Role | Normally | Fallback |
+|---|---|---|
+| FE implementer | Claude Code + Chrome (`runner: claude`) | the task's `fallback` (`{runner, model[, effort]}`, a Codex model, checked against the catalog): `implement` records the Claude attempt and runs Codex on the same worktree, told to read the partial changes first. No `fallback` → implement fails and says so. |
+| BE implementer | Codex | — |
+| Reviewer | orch-reviewer (Claude) | when the reviewer session ends twice without a review or times out, autopilot asks Claude for one word; only a usage-limit answer switches to `orchestrate.mjs review-codex <task>`: `codex exec -s read-only` in the workspace root answers with the review (review.schema.json), ORCH-P records it with provenance `reviewer: codex-fallback`. Accepted risk `codex-review-fallback`. |
+| Coordinator | orch-coordinator in Omnigent (Claude) | started by hand: `node orchestrate/cockpit.mjs coordinator-codex` runs interactive `codex` with the coordinator prompt, writable only in `runs/proposals`. It cannot write a request, so it gives the user `autopilot.mjs run <plan>` to type (the approval). |
 
 ## Task file
 

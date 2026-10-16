@@ -40,7 +40,20 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
    `KNOWN_RISKS`). Active since 2026-10-14: `codex-read-isolation` (Codex sessions in Omnigent can
    read outside the worktree; see docs/omnigent-evaluation.md#options-while-codex-ignores-the-profile).
    Active since 2026-10-15: `debby-unsandboxed` (Omnigent's built-in debby, for brainstorming
-   complex features only; see docs/omnigent-evaluation.md#debby-for-complex-features).
+   complex features only; see docs/omnigent-evaluation.md#debby-for-complex-features) and
+   `agent-prompt-preapproval` (Claude's own prompt pre-answered for the bundle agents' allowlisted
+   calls, never for runs/requests; see docs/omnigent-evaluation.md#fewer-prompts-for-the-bundle-agents)
+   and `agent-no-cel` (coordinator and reviewer without the CEL tool allowlist; see
+   docs/omnigent-evaluation.md#no-cel-allowlist-for-the-bundle-agents) and `agent-autonomous`
+   (every Bash command and read pre-approved for the bundle agents so autopilot runs without
+   prompts; push, merge, gh, curl, wget denied; see
+   docs/omnigent-evaluation.md#autonomous-bundle-agents).
+   Active since 2026-10-16: `fe-claude-chrome` (FE tasks implemented by Claude Code with Claude
+   in Chrome, which drives the user's real Chrome; see docs/orchestration.md#fe-implementer-claude),
+   `codex-review-fallback` (Codex reviews when Claude is out of tokens; see
+   docs/orchestration.md#claude-fallback-to-codex) and `orch-defaults` (Codex implementers use
+   Codex's default sandbox with network and loopback, no Step 0 requirement; see
+   docs/orchestration.md#omnigent-defaults).
    Never add or widen an accepted risk without that decision.
 3. Changes that alter what ORCH-P expects from BE-P or FE-P (`INTERFACES` in
    `orchestrate/orchestrate.mjs`) need the matching change in that repository first.
@@ -51,15 +64,12 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
    (docs/orchestration.md#autopilot); nothing else may approve a task or a plan.
 5. GitHub CI stays manual-only; run the gate locally before any push.
 6. Never put secrets, tokens or `.env` values in prompts, task files, logs or evidence.
-7. A third-party orchestration platform or agent framework (e.g. Omnigent, Paperclip) may be
-   adopted only after a written static evaluation in `docs/` (as for Ruflo) shows all of:
-   version pinned with integrity, no install scripts or auto-update; telemetry off and no other
-   unrequested outbound calls; any listener on loopback only; agents run on subscription CLIs
-   with no API-key or gateway fallback; Step 0-equivalent proof that agents cannot read
-   credentials, `.env` or paths outside the worktree and have no network; ORCH-P gates, approval
-   binding and review provenance still decide the outcome; no push, merge, deploy or PR. Then
-   the user approves it in writing. Until then, evaluate statically only: no install, no run.
-   Omnigent is the chosen agent hub and passed the static part (docs/omnigent-evaluation.md).
-   Keep `node orchestrate/cockpit.mjs lint` green; Codex implementers are created only by
-   `orchestrate.mjs implement` with the Step 0 profile, never dispatched as Omnigent sub-agents;
-   no agent gets task approval, `sandbox: none`, a permission bypass or another harness.
+7. Third-party tools (agent hubs, task boards, UIs such as Omnigent, Vibe Kanban, Paperclip)
+   may be tried once the user says so, after a short note in `docs/`: the version used, what it
+   runs, what it can read and write, and its network use. A full static evaluation and a Step
+   0-equivalent proof are no longer required (relaxed by the user on 2026-10-15). What stays:
+   ORCH-P gates, approval binding and review provenance decide the outcome; no agent pushes,
+   merges, deploys or opens PRs; code that is committed for a task comes from
+   `orchestrate.mjs implement` (that is what binds it to the gate and the commit). Omnigent is
+   the current hub (docs/omnigent-evaluation.md); keep `node orchestrate/cockpit.mjs lint` green
+   or change the lint together with the bundle.

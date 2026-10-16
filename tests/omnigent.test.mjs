@@ -4,15 +4,16 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import {
-  chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { probeApi, shapeOf, startProblems } from '../orchestrate/cockpit.mjs';
+import { coordinatorCodexCommand, probeApi, shapeOf, startProblems } from '../orchestrate/cockpit.mjs';
 import {
-  BUNDLE_AGENTS, COORDINATOR_SHELL, KNOWN_RISKS, lintBundle, step0Acceptance, OMNIGENT_OPT_OUTS, omnigentEnv, parseVersion, readPin,
+  BUNDLE_AGENTS, claudeSettings, KNOWN_RISKS, lintBundle, step0Acceptance, OMNIGENT_OPT_OUTS, omnigentEnv, parseVersion, readPin,
+  syncClaudeSettings,
 } from '../orchestrate/lib/omnigent.mjs';
 import {
   codexLaunchArgs, codexProfileName, codexProfileToml, codexSandboxPolicies, codexUserConfigProblems, lastAssistantText, sandboxPolicyProblems, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
@@ -30,6 +31,8 @@ let root;
 before(() => { mkdirSync(ROOT_PARENT, { recursive: true }); root = mkdtempSync(join(ROOT_PARENT, '.omnigent-test-')); });
 after(() => rmSync(root, { recursive: true, force: true }));
 const fresh = (name) => { const d = join(root, `${name}-${Math.random().toString(36).slice(2)}`); mkdirSync(d, { recursive: true }); return d; };
+// Where cockpit installs the agents' Claude settings in a test (never the real workspace root).
+const claudeSettingsFile = () => join(fresh('ws'), '.claude', 'settings.json');
 
 /** A copy of the repository bundle, optionally edited. */
 function bundleCopy({ agent = (t) => t, server = (t) => t, pin = (p) => p } = {}) {
@@ -88,7 +91,16 @@ test('the repository bundle passes the lint; the pin is approved and records onl
   assert.equal(pin.status, 'approved');
   assert.ok(pin.approval.source && pin.approval.approved_by);
   for (const risk of pin.accepted_risks ?? []) assert.deepEqual(risk.checks, KNOWN_RISKS[risk.id]);
-  assert.ok(readFileSync(join(BUNDLE, AGENT), 'utf8').includes(`r'${COORDINATOR_SHELL}'`));
+  assert.ok(pin.accepted_risks.some((r) => r.id === 'agent-no-cel'), 'the agents run without CEL only under the recorded decision');
+});
+
+test('without the agent-no-cel decision the lint requires the CEL allowlist again', () => {
+  const withdrawn = (p) => ({ ...p, accepted_risks: p.accepted_risks.filter((r) => r.id !== 'agent-no-cel') });
+  const problems = lintBundle(bundleCopy({ pin: withdrawn }));
+  for (const agent of ['orch-coordinator', 'orch-reviewer']) {
+    assert.ok(problems.includes(`${agent}/config.yaml: missing: the orch_tool_allowlist policy`), JSON.stringify(problems));
+    assert.ok(problems.includes(`${agent}/config.yaml: missing: a cel_policy guardrail`), JSON.stringify(problems));
+  }
 });
 
 test('the lint refuses every setting that undoes the posture', () => {
@@ -101,8 +113,6 @@ test('the lint refuses every setting that undoes the posture', () => {
     [(t) => t.replace('spec_version: 1', 'spec_version: 1\nspawn: true'), /spawn/],
     [(t) => t.replace('cwd: .', 'cwd: .\n  env_passthrough: ["HOME"]'), /env_passthrough/],
     [(t) => t.replace('write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude", "/tmp/omnigent-1000"]', 'write_paths: ["."]'), /write_paths must be exactly/],
-    [(t) => t.replace('? {"result": "ASK", "reason": "Run this ORCH-P step?', '? {"result": "ASK", "reason": "Run this ORCH-P step?').replace("(status|validate) [A-Za-z0-9", "(status|validate|cleanup) [A-Za-z0-9"), /shell allowlist differs/],
-    [(t) => t.replace('(status|validate) [A-Za-z0-9', '(status|validate|implement) [A-Za-z0-9'), /shell allowlist differs/],
     [(t) => t.replace(/ {4}loop_guard:[\s\S]*$/, ''), /detect_loop/],
     [(t) => `${t}\n# then run gh pr create\n`, /push, merge or PR/],
   ];
@@ -112,14 +122,13 @@ test('the lint refuses every setting that undoes the posture', () => {
   }
 });
 
-test('the reviewer config is linted for its own shell allowlist and write paths', () => {
+test('the reviewer config is linted for its own sandbox and write paths', () => {
   const reviewer = join('orch-reviewer', 'config.yaml');
   const edit = (fn) => {
     const dir = bundleCopy();
     writeFileSync(join(dir, reviewer), fn(readFileSync(join(dir, reviewer), 'utf8')));
     return lintBundle(dir);
   };
-  assert.ok(edit((t) => t.replace('(show|diff|log)', '(show|diff|log|push)')).some((p) => /orch-reviewer.*shell allowlist differs/.test(p)));
   assert.ok(edit((t) => t.replace('write_paths: ["ORCH-P/runs", "~/.claude", "/tmp/omnigent-1000"]', 'write_paths: ["."]')).some((p) => /orch-reviewer.*write_paths/.test(p)));
   assert.ok(edit((t) => t.replace('type: linux_bwrap', 'type: none')).some((p) => /orch-reviewer.*sandbox type none/.test(p)));
   assert.ok(edit((t) => t.replace('read_paths: ["~/.nvm"]', 'read_paths: ["~/"]')).some((p) => /orch-reviewer.*read_paths must be exactly/.test(p)));
@@ -149,6 +158,53 @@ test('accepted risks: only known ones, exactly their checks, with the user\'s de
   assert.match(step0Acceptance({ ...reads, script_completed: false }, pin).reason, /did not complete/);
   assert.equal(step0Acceptance({ ready: true }, {}).ok, true);
   assert.equal(step0Acceptance({ error: 'boom' }, pin).ok, false);
+});
+
+test('agent Claude settings: installed only while the risk is accepted, never over the user\'s own, never for requests', () => {
+  const workspace = fresh('ws');
+  const file = join(workspace, '.claude', 'settings.json');
+  const risk = { id: 'agent-prompt-preapproval', checks: [], approved_by: 'user', source: 's', date: '2026-10-15' };
+  const allow = claudeSettings(workspace).permissions.allow;
+  assert.ok(allow.includes(`Edit(/${workspace}/ORCH-P/runs/proposals/**)`));
+  assert.ok(!allow.some((rule) => /runs\/requests\/|implement|commit|autopilot\.mjs run|git |curl/.test(rule)), JSON.stringify(allow));
+  assert.deepEqual(Object.keys(claudeSettings(workspace)), ['permissions']);
+  assert.deepEqual(Object.keys(claudeSettings(workspace).permissions), ['allow']);
+
+  assert.deepEqual(syncClaudeSettings({ workspace, pin: {}, file }), []);
+  assert.ok(!existsSync(file), 'nothing without the accepted risk');
+  assert.deepEqual(syncClaudeSettings({ workspace, pin: { accepted_risks: [risk] }, file }), []);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), claudeSettings(workspace));
+  assert.deepEqual(syncClaudeSettings({ workspace, pin: { accepted_risks: [risk] }, file }), [], 'idempotent');
+  assert.deepEqual(syncClaudeSettings({ workspace, pin: {}, file }), []);
+  assert.ok(!existsSync(file), 'removed once the risk is withdrawn');
+  writeFileSync(file, '{"permissions":{"allow":["Bash(*)"]}}\n');
+  assert.match(syncClaudeSettings({ workspace, pin: { accepted_risks: [risk] }, file })[0], /differs from the ORCH-P agent settings/);
+  assert.equal(readFileSync(file, 'utf8'), '{"permissions":{"allow":["Bash(*)"]}}\n', 'the user\'s settings are left alone');
+  syncClaudeSettings({ workspace, pin: {}, file });
+  assert.ok(existsSync(file), 'and never removed');
+  rmSync(file);
+
+  // agent-autonomous: every shell command and read pre-answered, push/merge/PR/HTTP denied.
+  const auto = { id: 'agent-autonomous', checks: [], approved_by: 'user', source: 's', date: '2026-10-15' };
+  const loose = claudeSettings(workspace, { autonomous: true }).permissions;
+  for (const rule of ['Bash', 'Read', 'Grep', 'Glob']) assert.ok(loose.allow.includes(rule), rule);
+  for (const rule of ['Bash(git push:*)', 'Bash(git merge:*)', 'Bash(gh:*)', 'Bash(curl:*)', 'Bash(wget:*)']) assert.ok(loose.deny.includes(rule), rule);
+  assert.deepEqual(syncClaudeSettings({ workspace, pin: { accepted_risks: [risk] }, file }), []);
+  assert.deepEqual(syncClaudeSettings({ workspace, pin: { accepted_risks: [risk, auto] }, file }), [], 'the ORCH-P copy is upgraded in place');
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), claudeSettings(workspace, { autonomous: true }));
+  assert.deepEqual(syncClaudeSettings({ workspace, pin: { accepted_risks: [risk] }, file }), [], 'and downgraded once withdrawn');
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), claudeSettings(workspace));
+  syncClaudeSettings({ workspace, pin: { accepted_risks: [risk, auto] }, file });
+  syncClaudeSettings({ workspace, pin: {}, file });
+  assert.ok(!existsSync(file), 'an ORCH-P copy of either kind is removed with agent-prompt-preapproval');
+  // A copy from an earlier ORCH-P version (fewer rules) is upgraded, not reported.
+  const older = claudeSettings(workspace, { autonomous: true });
+  older.permissions.allow = older.permissions.allow.filter((rule) => !rule.includes('autopilot.mjs wait'));
+  writeFileSync(file, `${JSON.stringify(older, null, 2)}\n`);
+  assert.deepEqual(syncClaudeSettings({ workspace, pin: { accepted_risks: [risk, auto] }, file }), []);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), claudeSettings(workspace, { autonomous: true }));
+  rmSync(file);
+  assert.ok(readPin(BUNDLE).pin.accepted_risks.some((r) => r.id === 'agent-prompt-preapproval'), 'the repository pin records the user\'s decision');
 });
 
 test('the lint refuses telemetry on and a loose or unapproved pin', () => {
@@ -184,7 +240,7 @@ test('cockpit start runs the coordinator from the workspace root with the allowl
   const result = spawnSync(process.execPath, [join(REPO, 'orchestrate', 'cockpit.mjs'), 'start'], {
     encoding: 'utf8',
     env: {
-      PATH: process.env.PATH, HOME: home, ORCH_OMNIGENT_BIN: bin, ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }),
+      PATH: process.env.PATH, HOME: home, ORCH_CLAUDE_PROJECT_SETTINGS: claudeSettingsFile(), ORCH_OMNIGENT_BIN: bin, ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }),
       ANTHROPIC_API_KEY: 'must-not-pass', OPENAI_API_KEY: 'must-not-pass', OMNIGENT_ANALYTICS: '1',
     },
   });
@@ -211,7 +267,7 @@ require('node:fs').writeFileSync(process.env.HOME + '/.claude/settings.json', '{
 `);
   chmodSync(bin, 0o755);
   const r = spawnSync(process.execPath, [join(REPO, 'orchestrate', 'cockpit.mjs'), 'start'], {
-    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home, ORCH_OMNIGENT_BIN: bin, ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }) },
+    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home, ORCH_CLAUDE_PROJECT_SETTINGS: claudeSettingsFile(), ORCH_OMNIGENT_BIN: bin, ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }) },
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stderr, /changed ~\/\.claude\/settings\.json; review them/);
@@ -219,7 +275,7 @@ require('node:fs').writeFileSync(process.env.HOME + '/.claude/settings.json', '{
 
 test('cockpit start reviewer starts the reviewer agent; other names are refused', () => {
   const env = {
-    PATH: process.env.PATH, HOME: homeWith('telemetry: false\n'), ORCH_OMNIGENT_BIN: stubOmnigent('0.18.0'), ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }),
+    PATH: process.env.PATH, HOME: homeWith('telemetry: false\n'), ORCH_CLAUDE_PROJECT_SETTINGS: claudeSettingsFile(), ORCH_OMNIGENT_BIN: stubOmnigent('0.18.0'), ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }),
   };
   const cockpit = join(REPO, 'orchestrate', 'cockpit.mjs');
   const reviewer = spawnSync(process.execPath, [cockpit, 'start', 'reviewer'], { encoding: 'utf8', env });
@@ -231,7 +287,7 @@ test('cockpit start reviewer starts the reviewer agent; other names are refused'
 
 test('cockpit start refuses with exit 2 on an unapproved bundle', () => {
   const result = spawnSync(process.execPath, [join(REPO, 'orchestrate', 'cockpit.mjs'), 'start'], {
-    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: homeWith('telemetry: false\n'), ORCH_OMNIGENT_BIN: stubOmnigent('0.18.0'), ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: unapproved }) },
+    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: homeWith('telemetry: false\n'), ORCH_CLAUDE_PROJECT_SETTINGS: claudeSettingsFile(), ORCH_OMNIGENT_BIN: stubOmnigent('0.18.0'), ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: unapproved }) },
   });
   assert.equal(result.status, 2);
   assert.match(result.stderr, /evaluated, not approved/);
@@ -399,64 +455,6 @@ test('probe-api records the real response shapes and checks the Codex agent and 
   await assert.rejects(probeApi({ url: 'http://10.0.0.5:6767', outDir: fresh('probe') }), /loopback/);
 });
 
-// ── CEL allowlists (runs where cel-python and PyYAML exist, e.g. the Omnigent venv) ──
-const PYTHON = process.env.ORCH_CEL_PYTHON ?? join(REPO, 'tools', 'omnigent', '.venv', 'bin', 'python');
-const celPython = [PYTHON, 'python3'].find((py) => spawnSync(py, ['-I', '-c', 'import celpy, yaml'], { encoding: 'utf8' }).status === 0);
-const tool = (name, args) => ({ type: 'tool_call', data: { name, arguments: args } });
-
-function decide(agent, events) {
-  const r = spawnSync(celPython, ['-I', join(REPO, 'tests', 'cel_check.py'), join(BUNDLE, agent, 'config.yaml')], { input: JSON.stringify(events), encoding: 'utf8' });
-  assert.equal(r.status, 0, r.stderr);
-  return JSON.parse(r.stdout).map((d) => d.result);
-}
-
-test('coordinator CEL allowlist compiles and decides as intended', { skip: !celPython && 'cel-python / PyYAML not installed' }, () => {
-  const request = JSON.stringify({ id: 'r1', task: 'ORCH-P/runs/proposals/T.json', task_sha256: 'a'.repeat(64), command: 'implement', side: 'be' });
-  const cases = [
-    [tool('Bash', { command: 'node ORCH-P/orchestrate/orchestrate.mjs status ORCH-P/tasks/T.json' }), 'ALLOW'],
-    [tool('Bash', { command: 'node ORCH-P/orchestrate/orchestrate.mjs status ../x.json' }), 'DENY'],
-    [tool('Bash', { command: 'curl http://127.0.0.1:6767/v1/sessions' }), 'DENY'],
-    [tool('Bash', { command: 'node ORCH-P/orchestrate/orchestrate.mjs implement T.json be' }), 'DENY'],
-    [tool('Bash', { command: 'node ORCH-P/orchestrate/autopilot.mjs check ORCH-P/runs/proposals/P.plan.json' }), 'ALLOW'],
-    [tool('Bash', { command: 'node ORCH-P/orchestrate/autopilot.mjs run ORCH-P/runs/proposals/P.plan.json' }), 'DENY'],
-    [tool('Read', { file_path: '/w/LOG/ORCH-P/AGENTS.md' }), 'ALLOW'],
-    [tool('Read', { file_path: '/w/LOG/BE-P/.env' }), 'DENY'],
-    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/orch-T/state.json' }), 'DENY'],
-    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/requests/r1.result.json' }), 'ALLOW'],
-    [tool('Grep', { pattern: 'x' }), 'DENY'],
-    [tool('Grep', { pattern: 'x', path: '/w/LOG/BE-P/src' }), 'ALLOW'],
-    [tool('Write', { file_path: '/w/LOG/ORCH-P/runs/proposals/T.json', content: '{}' }), 'ALLOW'],
-    [tool('Write', { file_path: '/w/LOG/ORCH-P/runs/requests/r1.json', content: request }), 'ASK'],
-    [tool('Edit', { file_path: '/w/LOG/ORCH-P/runs/requests/r1.json', old_string: 'be', new_string: 'fe' }), 'DENY'],
-    [tool('Write', { file_path: '/w/LOG/BE-P/src/a.cs', content: 'x' }), 'DENY'],
-    [tool('WebFetch', { url: 'https://example.com' }), 'DENY'],
-    [tool('mcp__omnigent__sys_session_send', {}), 'DENY'],
-    [{ type: 'request', data: { user_content: 'hi' } }, 'ALLOW'],
-  ];
-  assert.deepEqual(decide('orch-coordinator', cases.map(([e]) => e)), cases.map(([, d]) => d));
-  const r = spawnSync(celPython, ['-I', join(REPO, 'tests', 'cel_check.py'), join(BUNDLE, 'orch-coordinator', 'config.yaml')], { input: JSON.stringify([cases[13][0]]), encoding: 'utf8' });
-  assert.ok(JSON.parse(r.stdout)[0].reason.includes('"command": "implement"') || JSON.parse(r.stdout)[0].reason.includes('"command":"implement"'), 'the ASK shows the request');
-});
-
-test('reviewer CEL allowlist compiles and decides as intended', { skip: !celPython && 'cel-python / PyYAML not installed' }, () => {
-  const cases = [
-    [tool('Bash', { command: 'git -C BE-P show 0123abc' }), 'ALLOW'],
-    [tool('Bash', { command: 'git -C FE-P diff aaa..bbb' }), 'ALLOW'],
-    [tool('Bash', { command: 'git -C BE-P diff --output=/tmp/x aaa..bbb' }), 'DENY'],
-    [tool('Bash', { command: 'git -C BE-P push origin main' }), 'DENY'],
-    [tool('Bash', { command: 'node ORCH-P/orchestrate/orchestrate.mjs review-record ORCH-P/tasks/T.json ORCH-P/runs/reviews/T.json' }), 'ALLOW'],
-    [tool('Bash', { command: 'node ORCH-P/orchestrate/orchestrate.mjs commit ORCH-P/tasks/T.json be' }), 'DENY'],
-    [tool('Write', { file_path: '/w/LOG/ORCH-P/runs/reviews/T.json', content: '{}' }), 'ALLOW'],
-    [tool('Write', { file_path: '/w/LOG/ORCH-P/runs/orch-T/state.json', content: '{}' }), 'DENY'],
-    [tool('Read', { file_path: '/w/LOG/BE-P/.git/config' }), 'DENY'],
-    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/proposals/SHIPDOC-01.json' }), 'ALLOW'],
-    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/autopilot/SHIPDOC/tasks/SHIPDOC-02.json' }), 'ALLOW'],
-    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/autopilot/SHIPDOC/state.json' }), 'DENY'],
-    [tool('Read', { file_path: '/w/LOG/ORCH-P/runs/orch-SHIPDOC-01/state.json' }), 'DENY'],
-  ];
-  assert.deepEqual(decide('orch-reviewer', cases.map(([e]) => e)), cases.map(([, d]) => d));
-});
-
 // ── Step 0 through Omnigent (verdict logic; the real run needs a model call) ──
 const CANARY = 'ORCH-CANARY-abc123';
 const outputItems = (lines) => [
@@ -491,4 +489,16 @@ test('the Omnigent Step 0 check script is valid JavaScript and names every check
   assert.equal(spawnSync(process.execPath, ['--check', file]).status, 0);
   const text = readFileSync(file, 'utf8');
   for (const c of CHECKS) assert.ok(text.includes(c), c);
+});
+
+test('coordinator-codex: the coordinator prompt on Codex, writable only in runs/proposals, no request writes', () => {
+  const { command, args, cwd } = coordinatorCodexCommand({ bundle: BUNDLE, workspace: '/ws', codex: 'codex' });
+  assert.equal(command, 'codex');
+  assert.equal(cwd, '/ws/ORCH-P/runs/proposals');
+  assert.deepEqual(args.slice(0, 6), ['-C', '/ws/ORCH-P/runs/proposals', '-s', 'workspace-write', '-a', 'on-request']);
+  const prompt = args[6];
+  assert.match(prompt, /^You are the ORCH-P coordinator/);
+  assert.match(prompt, /cannot write ORCH-P\/runs\/requests/);
+  assert.match(prompt, /autopilot\.mjs run <plan path>/);
+  assert.ok(!args.some((a) => /danger|bypass|never/.test(a) && a !== prompt));
 });

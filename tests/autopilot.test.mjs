@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { acquireLock, checkPlan, nextStep, runPlan } from '../orchestrate/autopilot.mjs';
+import { acquireLock, brief, checkPlan, commandOf, nextStep, progressOf, runPlan, waitPlan } from '../orchestrate/autopilot.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT_PARENT = process.env.ORCH_TEST_ROOT ?? join(HERE, '..', 'runs');
@@ -34,6 +34,11 @@ const [cmd, file, side] = process.argv.slice(2);
 const task = JSON.parse(fs.readFileSync(file, 'utf8'));
 const dir = path.join(process.env.ORCH_STATE_ROOT, 'orch-' + task.id); const f = path.join(dir, 'state.json');
 const at = () => new Date(Date.now() + (globalThis.n = (globalThis.n || 0) + 1)).toISOString();
+if (cmd === 'review-codex') {
+  const st = JSON.parse(fs.readFileSync(f, 'utf8'));
+  st.review = { status: 'ready_for_human_merge', file: 'review-codex-' + Date.now() };
+  fs.writeFileSync(f, JSON.stringify(st)); console.log('review: ready_for_human_merge'); process.exit(0);
+}
 if (cmd === 'prepare') {
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(f, JSON.stringify({ id: task.id, base: task.base_revision, review: null,
@@ -104,7 +109,8 @@ function reviewer(stateRoot, verdicts) {
 const opts = (env, extra = {}) => ({
   workspace: env.ws, stateRoot: env.stateRoot, cli: env.cli, env: { PATH: process.env.PATH, ORCH_STATE_ROOT: env.stateRoot, ...extra.env },
   gateRunner: env.gateRunner, step0: env.step0,
-  resolveRef: () => 'b'.repeat(40), reviewPollMs: 5, reviewTimeoutMs: 2000, log: () => {}, approval: 'test', ...extra.opts,
+  resolveRef: () => 'b'.repeat(40), reviewPollMs: 5, reviewTimeoutMs: 2000, log: () => {}, approval: 'test',
+  claudeAvailable: async () => ({ ok: true, limited: false }), ...extra.opts,
 });
 
 test('checkPlan binds every proposal by sha256 and checks order, bases and task fields', () => {
@@ -176,12 +182,23 @@ test('the plan stops with a reason when the rework budget is spent, and a change
   assert.match(lines.join('\n'), /another version of the plan/);
 });
 
-test('a reviewer that records nothing stops the plan', async () => {
+test('a reviewer that records nothing is restarted once, then stops the plan', async () => {
   const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
-  const silent = async () => ({ exited: () => true, stop: () => {} });
-  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: silent } })), 1);
+  let starts = 0;
+  const silent = async () => { starts += 1; return { exited: () => true, stop: () => {} }; };
+  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: silent, claudeAvailable: async () => ({ ok: true, limited: false }) } })), 1);
+  assert.equal(starts, 2);
   const state = JSON.parse(readFileSync(join(env.stateRoot, 'autopilot', 'PLAN-T', 'state.json'), 'utf8'));
-  assert.match(state.stopped, /reviewer session ended without recording a review/);
+  assert.match(state.stopped, /reviewer session ended twice without recording a review/);
+
+  const flaky = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
+  const rev = reviewer(flaky.stateRoot, ['accept']);
+  let first = true;
+  const once = async (prompt) => {
+    if (first) { first = false; return { exited: () => true, stop: () => {} }; }
+    return rev.start(prompt);
+  };
+  assert.equal(await runPlan(flaky.planPath, opts(flaky, { opts: { startReviewer: once } })), 0, 'the second reviewer session records the review');
 });
 
 test('nextStep resumes a side where its run stands', () => {
@@ -220,6 +237,12 @@ test('transient failures are retried once: gate infrastructure after a reap, imp
   assert.match(readFileSync(join(flaky.stateRoot, 'autopilot', 'PLAN-T', 'autopilot.log'), 'utf8'), /implement exit 1, retrying once/);
 });
 
+test('an implement that changed nothing (commit exit 3) is run once more', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
+  assert.equal(await runPlan(env.planPath, opts(env, { env: { STUB_FIRST_COMMIT: '3:nothing to commit' }, opts: { startReviewer: reviewer(env.stateRoot, []).start } })), 0);
+  assert.match(readFileSync(join(env.stateRoot, 'autopilot', 'PLAN-T', 'autopilot.log'), 'utf8'), /made no changes, implementing once more/);
+});
+
 test('a refusal or a second infrastructure failure still stops the plan', async () => {
   const refused = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
   assert.equal(await runPlan(refused.planPath, opts(refused, { env: { STUB_FIRST_IMPLEMENT: '2:refused: prompt contains secret-like text' }, opts: { startReviewer: reviewer(refused.stateRoot, []).start } })), 1);
@@ -237,4 +260,65 @@ test('a task can carry its own rework budget', () => {
   plan.tasks[0].max_rework = 4;
   writeFileSync(env.planPath, JSON.stringify(plan));
   assert.ok(checkPlan(env.planPath, { workspace: env.ws }).problems.some((p) => /tasks\[0\]\.max_rework/.test(p)));
+});
+
+test('wait reports a finished plan, and gives a just-approved plan time to start before reporting an old stop', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
+  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: reviewer(env.stateRoot, []).start } })), 0);
+  let clock = Date.now() + 60_000;
+  const fake = { workspace: env.ws, stateRoot: env.stateRoot, now: () => clock, sleep: async (ms) => { clock += ms; }, pollMs: 15_000 };
+  const start = clock;
+  const old = await waitPlan(env.planPath, fake);
+  assert.equal(old.exit, 0);
+  assert.ok(clock - start >= 120_000, 'a result older than the wait is reported only after the start window');
+  assert.match(brief(old.status), /plan PLAN-T: done\n  TASK-A: ready_for_human_merge/);
+  const state = join(env.stateRoot, 'autopilot', 'PLAN-T', 'state.json');
+  writeFileSync(state, JSON.stringify({ ...JSON.parse(readFileSync(state, 'utf8')), status: 'running' }));
+  clock = Date.now();
+  const running = await waitPlan(env.planPath, { ...fake, minutes: 1 });
+  assert.equal(running.exit, 3, 'still running when the minutes pass');
+});
+
+test('progress relays the running side, its Codex session and latest message, withholding secret-like text', async () => {
+  const dir = mkdtempSync(join(root, 'progress-'));
+  const agents = join(dir, 'orch-TASK-A', 'live', 'agents');
+  mkdirSync(agents, { recursive: true });
+  writeFileSync(join(agents, 'fe.json'), JSON.stringify({ stage: 'implement', active: true, state: 'running' }));
+  writeFileSync(join(agents, 'fe.session.json'), JSON.stringify({ session_id: 's1', title: 'TASK-A · fe · implement #1' }));
+  const status = { plan: 'P', status: 'running', tasks: { 'TASK-A': { status: 'running', step: 'fe: implement' }, 'TASK-B': { status: 'pending' } } };
+  const lines = await progressOf(status, { stateRoot: dir, sessionProgress: async (id) => (id === 's1' ? { message: 'Adding the rescan button.', command: 'pnpm exec eslint src/a.js', commands: 7 } : null) });
+  assert.deepEqual(lines, [
+    '▶ TASK-A fe: implement (running)', '  Codex session: TASK-A · fe · implement #1 (s1)',
+    '  Codex ran 7 commands; last: pnpm exec eslint src/a.js', '  Codex: Adding the rescan button.',
+  ]);
+  const secret = await progressOf(status, { stateRoot: dir, sessionProgress: async () => ({ message: `token ${'gh'}p_${'a'.repeat(36)}` }) });
+  assert.equal(commandOf({ arguments: JSON.stringify({ command: "/usr/bin/zsh -lc 'pnpm exec prettier --check a.js'" }) }), 'pnpm exec prettier --check a.js');
+  assert.match(secret.at(-1), /withheld/);
+});
+
+test('wait returns early (exit 4) when the progress changes, after the gap', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
+  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: reviewer(env.stateRoot, []).start } })), 0);
+  const state = join(env.stateRoot, 'autopilot', 'PLAN-T', 'state.json');
+  writeFileSync(state, JSON.stringify({ ...JSON.parse(readFileSync(state, 'utf8')), status: 'running' }));
+  let clock = Date.now();
+  let n = 0;
+  const result = await waitPlan(env.planPath, {
+    workspace: env.ws, stateRoot: env.stateRoot, now: () => clock, sleep: async (ms) => { clock += ms; },
+    progress: async () => { n += 1; return [n < 6 ? 'Codex: reading' : 'Codex: editing']; },
+  });
+  assert.equal(result.exit, 4);
+  assert.deepEqual(result.lines, ['Codex: editing']);
+  assert.ok(clock - Date.now() >= 170_000, 'not before the three-minute gap');
+});
+
+test('a reviewer that stops while Claude is at its usage limit is replaced by a Codex review', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
+  const silent = async () => ({ exited: () => true, stop: () => {} });
+  const limited = async () => ({ ok: false, limited: true });
+  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: silent, claudeAvailable: limited } })), 0);
+  assert.match(readFileSync(join(env.stateRoot, 'autopilot', 'PLAN-T', 'autopilot.log'), 'utf8'), /Claude is at its usage limit, Codex reviews instead/);
+  const other = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
+  const fine = async () => ({ ok: true, limited: false });
+  assert.equal(await runPlan(other.planPath, opts(other, { opts: { startReviewer: silent, claudeAvailable: fine } })), 1, 'other reviewer failures still stop the plan');
 });

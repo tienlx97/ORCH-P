@@ -37,6 +37,9 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { readJson, writeJsonAtomic } from './lib/agent-state.mjs';
+import { lastAssistantText, loopbackUrl, omnigentClient } from './lib/omnigent-runner.mjs';
+import { claudeAvailable as claudeCheck } from './lib/claude-limit.mjs';
+import { scanSecrets } from './lib/secrets.mjs';
 import { validateTask } from './orchestrate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -213,6 +216,7 @@ async function sideToCommit(ctx, item, side, { from = 'implement' } = {}) {
   const t = item.runFile;
   let step = from;
   let gateRounds = 0;
+  let emptyRetried = false;
   for (;;) {
     ctx.progress(item, `${side}: ${step}`);
     if (step === 'review') return;
@@ -240,6 +244,14 @@ async function sideToCommit(ctx, item, side, { from = 'implement' } = {}) {
       step = 'implement';
     } else if (step === 'commit') {
       const r = await runCli(ctx, ['commit', t, side]);
+      // Exit 3: Codex changed nothing (e.g. it was blocked); give it one more run.
+      if (r.exit === 3 && !emptyRetried) {
+        emptyRetried = true;
+        ctx.progress(item, `${side}: the implementer made no changes, implementing once more`);
+        step = 'implement';
+        continue;
+      }
+      if (r.exit === 3) throw new Stop(`${item.id} ${side}: the implementer made no changes twice; read its last report in runs/orch-${item.id}/`);
       if (r.exit !== 0) throw new Stop(`${item.id} ${side}: commit exit ${r.exit}${tailLine(r.output)}`);
       return;
     }
@@ -275,24 +287,39 @@ const tailLine = (output) => {
   return line ? ` — ${line.slice(0, 300)}` : '';
 };
 
-/** Starts the orch-reviewer agent in Omnigent and waits until it records a review of the current commits. */
-async function review(ctx, item) {
+/**
+ * Starts the orch-reviewer agent in Omnigent and waits until it records a
+ * review of the current commits. A session that ends without one is started
+ * once more before the plan stops.
+ */
+async function review(ctx, item, attempt = 1) {
   const before = taskState(ctx, item.id)?.review?.file ?? null;
   const prompt = `Review task ${relative(WORKSPACE, item.runFile)}.`;
-  ctx.progress(item, 'review');
+  ctx.progress(item, attempt === 1 ? 'review' : 'review (reviewer restarted)');
   const reviewer = await ctx.startReviewer(prompt);
+  let failure = null;
   try {
     const deadline = Date.now() + ctx.reviewTimeoutMs;
     for (;;) {
       const recorded = taskState(ctx, item.id)?.review;
       if (recorded?.file && recorded.file !== before) return recorded.status;
-      if (reviewer.exited()) throw new Stop(`${item.id}: the reviewer session ended without recording a review (see the orch-reviewer session in Omnigent)`);
-      if (Date.now() > deadline) throw new Stop(`${item.id}: no review recorded within ${Math.round(ctx.reviewTimeoutMs / 60_000)} minutes (see the orch-reviewer session in Omnigent)`);
+      if (reviewer.exited() && attempt === 1) break;
+      if (reviewer.exited()) { failure = `${item.id}: the reviewer session ended twice without recording a review (see the orch-reviewer session in Omnigent)`; break; }
+      if (Date.now() > deadline) { failure = `${item.id}: no review recorded within ${Math.round(ctx.reviewTimeoutMs / 60_000)} minutes (see the orch-reviewer session in Omnigent)`; break; }
       await new Promise((r) => { setTimeout(r, ctx.reviewPollMs); });
     }
   } finally {
     reviewer.stop();
   }
+  if (!failure) return review(ctx, item, attempt + 1);
+  // Claude out of tokens: Codex reviews instead (accepted risk codex-review-fallback).
+  const claude = await ctx.claudeAvailable();
+  if (!claude.limited) throw new Stop(failure);
+  ctx.progress(item, 'review: Claude is at its usage limit, Codex reviews instead');
+  const r = await runCli(ctx, ['review-codex', item.runFile]);
+  const recorded = taskState(ctx, item.id)?.review;
+  if (recorded?.file && recorded.file !== before) return recorded.status;
+  throw new Stop(`${item.id}: Claude is at its usage limit and the Codex review failed (exit ${r.exit})${tailLine(r.output)}`);
 }
 
 /** The approved copy autopilot runs: the proposal with resolved bases and the plan approval. */
@@ -335,7 +362,12 @@ async function runTask(ctx, item) {
     if (r.exit !== 0) throw new Stop(`${item.id}: prepare exit ${r.exit}${tailLine(r.output)}`);
   }
   for (const side of item.sides) {
-    await sideToCommit(ctx, item, side, { from: nextStep(taskState(ctx, item.id)?.sides?.[side]) });
+    const s = taskState(ctx, item.id)?.sides?.[side];
+    let from = nextStep(s);
+    // A resumed side waiting on gate findings verifies again first: the findings
+    // are read afresh (an earlier ORCH-P may have misread the gate log).
+    if (from === 'implement' && (s?.rework ?? []).some((f) => f.source === 'gate')) from = 'verify';
+    await sideToCommit(ctx, item, side, { from });
   }
   for (let round = 0; ; round += 1) {
     const verdict = await review(ctx, item);
@@ -380,6 +412,7 @@ export async function runPlan(planPath, {
   approval = 'typed `autopilot run` in a terminal', workspace = WORKSPACE, stateRoot = STATE_ROOT, cli = CLI, env = process.env,
   gateRunner = GATE_RUNNER, step0 = STEP0,
   startReviewer = startReviewerSession, reviewTimeoutMs = REVIEW_TIMEOUT_MS, reviewPollMs = REVIEW_POLL_MS,
+  claudeAvailable = async () => claudeCheck({ env }),
   resolveRef = (side, ref) => gitRevParse(REPOS[side], ref), log = (m) => console.log(m),
 } = {}) {
   const checked = checkPlan(planPath, { workspace });
@@ -422,7 +455,7 @@ export async function runPlan(planPath, {
   state.runs = [...(state.runs ?? []), { approval, at: now(), pid: process.pid }];
   delete state.stopped;
   const ctx = {
-    plan, digest, dir, state, cli, env, gateRunner, step0, stateRoot, approval, startReviewer, reviewTimeoutMs, reviewPollMs, child: null,
+    plan, digest, dir, state, cli, env, gateRunner, step0, stateRoot, approval, startReviewer, reviewTimeoutMs, reviewPollMs, claudeAvailable, child: null,
     log: (m) => writeFileSync(logFile, `[${now()}] ${m}\n`, { flag: 'a', mode: 0o600 }),
     progress: (item, what) => {
       state.tasks[item.id].status = 'running';
@@ -479,10 +512,10 @@ function gitRevParse(repo, ref) {
 }
 
 // ── entry ────────────────────────────────────────────────────────────────
-function statusOf(planPath) {
-  const checked = checkPlan(planPath);
+function statusOf(planPath, { workspace = WORKSPACE, stateRoot = STATE_ROOT } = {}) {
+  const checked = checkPlan(planPath, { workspace });
   const id = checked.plan?.id;
-  const state = id ? readState(planDir(id)) : null;
+  const state = id ? readState(planDir(id, stateRoot)) : null;
   if (!state) return { plan: id ?? null, status: 'not_started', problems: checked.problems ?? [] };
   return {
     plan: state.plan, status: state.status, current: state.current ?? null, stopped: state.stopped ?? null,
@@ -490,10 +523,118 @@ function statusOf(planPath) {
   };
 }
 
+/** One line per task plus the plan's state, for the coordinator to relay. */
+export function brief(status) {
+  const tasks = Object.entries(status.tasks ?? {}).map(([id, t]) => `  ${id}: ${t.status}${t.step ? ` (${t.step})` : ''}`);
+  return [`plan ${status.plan}: ${status.status}${status.stopped ? ` — ${status.stopped}` : ''}`, ...tasks,
+    ...(status.summary ? [status.summary] : [])].join('\n');
+}
+
+/**
+ * What the running task is doing now, for the coordinator's chat: each side's
+ * live stage and, while Codex implements in Omnigent, its session, latest
+ * message, last command and command count (read over the loopback API; text
+ * that looks like a secret is withheld).
+ */
+export async function progressOf(status, { stateRoot = STATE_ROOT, sessionProgress = codexProgress } = {}) {
+  const lines = [];
+  const quote = (text) => (scanSecrets(text, 'codex').length ? '(withheld: secret-like text)' : text.replace(/\s+/g, ' ').slice(0, 400));
+  for (const [id, task] of Object.entries(status.tasks ?? {})) {
+    if (task.status !== 'running') continue;
+    const agents = join(stateRoot, `orch-${id}`, 'live', 'agents');
+    for (const side of ['be', 'fe']) {
+      const live = readJson(join(agents, `${side}.json`));
+      if (!live) continue;
+      lines.push(`▶ ${id} ${side}: ${live.stage}${live.active ? ' (running)' : ` (${live.state})`}${live.summary ? ` — ${String(live.summary).slice(0, 200)}` : ''}`);
+      if (live.stage !== 'implement' || !live.active) continue;
+      // runner "claude" (FE): orchestrate.mjs publishes the stream's progress next to the snapshot.
+      const claude = readJson(join(agents, `${side}.claude.json`));
+      if (claude && Date.parse(claude.at ?? 0) >= Date.parse(live.since ?? 0)) {
+        if (claude.commands) lines.push(`  Claude ran ${claude.commands} commands; last: ${quote(claude.command ?? '')}`);
+        if (claude.message) lines.push(`  Claude: ${quote(claude.message)}`);
+        continue;
+      }
+      const session = readJson(join(agents, `${side}.session.json`));
+      if (!session?.session_id) continue;
+      lines.push(`  Codex session: ${session.title} (${session.session_id})`);
+      const seen = await sessionProgress(session.session_id).catch(() => null);
+      if (seen?.commands) lines.push(`  Codex ran ${seen.commands} commands; last: ${quote(seen.command ?? '')}`);
+      if (seen?.message) lines.push(`  Codex: ${quote(seen.message)}`);
+    }
+    if (task.step === 'review') lines.push(`  ${id}: orch-reviewer is reviewing (its session is in the Omnigent UI)`);
+  }
+  return lines;
+}
+
+/** Shell command of a Codex function_call item, without the `zsh -lc '…'` wrapper. */
+export function commandOf(item) {
+  let command = '';
+  try { command = JSON.parse(item.arguments ?? '{}').command ?? ''; } catch { return ''; }
+  if (Array.isArray(command)) command = command.join(' ');
+  return String(command).replace(/^\S*\/?(ba|z)?sh -l?c '([\s\S]*)'$/, '$2');
+}
+
+// Per session: the last item read, so each poll fetches only what is new.
+const seenSessions = new Map();
+
+async function codexProgress(sessionId, client = omnigentClient(loopbackUrl(process.env.ORCH_OMNIGENT_URL ?? undefined))) {
+  const seen = seenSessions.get(sessionId) ?? { after: null, message: null, command: null, commands: 0 };
+  const items = await client.items(sessionId, { after: seen.after });
+  for (const item of items) {
+    if (item.type === 'function_call' && item.name === 'shell') { seen.commands += 1; seen.command = commandOf(item); }
+    if (item.type === 'message' && item.role === 'assistant') seen.message = lastAssistantText([item]) ?? seen.message;
+  }
+  if (items.length) seen.after = items.at(-1).id;
+  seenSessions.set(sessionId, seen);
+  return seen;
+}
+
+/**
+ * Blocks until the plan is done or stopped (exit 0 done, 1 stopped), a task
+ * moves to another step (exit 4 at once), Codex's progress changes (exit 4, at
+ * most once per `gapMs`), or `minutes` pass
+ * (exit 3). A plan that is not running yet (the runner has not picked up a
+ * just-approved request) gets up to two minutes to start, so an earlier stop
+ * is not reported as this run's result.
+ */
+export async function waitPlan(planPath, {
+  minutes = 9, pollMs = 15_000, startMs = 120_000, gapMs = 180_000, progress = null,
+  now = Date.now, sleep = (ms) => new Promise((r) => { setTimeout(r, ms); }), ...where
+} = {}) {
+  const begin = now();
+  const deadline = begin + minutes * 60_000;
+  let seenRunning = false;
+  let first = null;
+  for (;;) {
+    const status = statusOf(planPath, where);
+    if (status.status === 'running') seenRunning = true;
+    const settled = status.status === 'done' || status.status === 'stopped';
+    if (settled && (seenRunning || now() - begin >= startMs || Date.parse(status.updated_at ?? 0) >= begin)) {
+      return { exit: status.status === 'done' ? 0 : 1, status, lines: [] };
+    }
+    const lines = progress && status.status === 'running' ? await progress(status) : [];
+    const steps = brief(status);
+    const key = JSON.stringify(lines);
+    if (first === null) first = { steps, key };
+    else if (steps !== first.steps || (key !== first.key && now() - begin >= gapMs)) return { exit: 4, status, lines };
+    if (now() >= deadline) return { exit: 3, status, lines };
+    await sleep(pollMs);
+  }
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [command, planArg, ...rest] = process.argv.slice(2);
-  const usage = 'usage: node orchestrate/autopilot.mjs check|status|run <plan.json> [--approval <source>]';
-  if (!['check', 'status', 'run'].includes(command) || !planArg) { console.error(usage); process.exit(2); }
+  const usage = 'usage: node orchestrate/autopilot.mjs check|status|wait|run <plan.json> [--approval <source>] [--minutes <n>]';
+  if (!['check', 'status', 'wait', 'run'].includes(command) || !planArg) { console.error(usage); process.exit(2); }
+  if (command === 'wait') {
+    const m = rest.indexOf('--minutes');
+    const minutes = m >= 0 ? Math.min(Math.max(Number(rest[m + 1]) || 9, 1), 9) : 9;
+    const { exit, status, lines } = await waitPlan(resolve(planArg), { minutes, progress: (st) => progressOf(st) });
+    console.log(brief(status));
+    for (const line of lines) console.log(line);
+    if (exit === 3 || exit === 4) console.log('still running; post these lines and run wait again');
+    process.exit(exit);
+  }
   const planPath = resolve(planArg);
   if (command === 'check') {
     const { digest, tasks, problems } = checkPlan(planPath);
