@@ -111,7 +111,7 @@ process.stdin.on('end', async () => {
   }
   process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } }) + '\\n');
   if (plan.leak) process.stdout.write(plan.leak + '\\n');
-  const o = args[args.indexOf('-o') + 1]; if (o) fs.writeFileSync(o, '{"status":"implemented"}');
+  const o = args[args.indexOf('-o') + 1]; if (o) fs.writeFileSync(o, plan.output ? JSON.stringify(plan.output) : '{"status":"implemented"}');
   process.exit(plan.exit ?? 0);
 });
 `);
@@ -129,7 +129,8 @@ process.stdin.on('end', async () => {
 import { spawnSync } from 'node:child_process';
 const [side, worktree, ...rest] = process.argv.slice(2);
 appendFileSync(process.env.HOME + '/runner-calls.jsonl', JSON.stringify({ side, worktree, rest }) + '\\n');
-if (side === 'restore') process.exit(Number(process.env.STUB_RESTORE_EXIT ?? 0));
+if (side === 'restore' || side === 'repoint') process.exit(Number(process.env.STUB_RESTORE_EXIT ?? 0));
+if (side === 'test') { console.log('Passed!  - Failed: 0, Passed: 3'); process.exit(Number(process.env.STUB_TEST_EXIT ?? 0)); }
 const change = rest.includes('--change') ? ['--change', rest[rest.indexOf('--change') + 1]] : [];
 const r = spawnSync('./harness/verify.sh', change, { cwd: worktree, stdio: 'inherit' });
 writeFileSync(rest[rest.indexOf('--record') + 1], JSON.stringify({ steps: [{ name: 'gate', exit: r.status }], cleanup_complete: true, image: { id: 'sha256:stub' } }));
@@ -188,6 +189,8 @@ function orchEnv(ctx, env = {}) {
     ORCH_STATE_ROOT: join(ctx.ws, 'state'),
     ORCH_MODEL_CATALOG: join(root, 'catalog.json'),
     ORCH_STEP0_REPORT: join(root, 'step0-ready.json'),
+    // The repository pin accepts orch-defaults; most tests check the ORCH-P profile.
+    ORCH_DEFAULTS: '0',
     ORCH_GATE_RUNNER: join(root, 'gate-runner.mjs'),
     FAKE_API_KEY: 'should-never-reach-codex',
     SSH_AUTH_SOCK: '/tmp/fake-agent.sock',
@@ -290,6 +293,119 @@ test('model and effort are checked against the catalog; effort defaults by compl
   assert.match(r.stderr, /supports low, not high/);
 });
 
+test('runner claude takes a Claude model id and effort, not the Codex catalog', () => {
+  const ctx = setup();
+  ctx.task.sides.fe = { ...ctx.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5' };
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  let r = orch(ctx, ['validate', ctx.taskFile]);
+  assert.equal(r.status, 0, r.stderr);
+  ctx.task.sides.fe.model = 'test-model';
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  r = orch(ctx, ['validate', ctx.taskFile]);
+  assert.match(r.stderr, /not a Claude model id/);
+});
+
+test('runner claude: claude -p --chrome in the worktree, sandbox settings, implementer marker, progress and report', () => {
+  const ctx = setup();
+  ctx.task.sides.fe = { ...ctx.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5' };
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+  const stub = join(root, 'claude-impl.cjs');
+  writeFileSync(stub, `#!/usr/bin/env node
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+fs.writeFileSync(process.env.HOME + '/claude-call.json', JSON.stringify({ args, cwd: process.cwd(), env: Object.keys(process.env), api: process.env.API_BASE_URL }));
+fs.writeFileSync('src/app.txt', 'v3\\n');
+const out = (e) => process.stdout.write(JSON.stringify(e) + '\\n');
+process.stdin.resume(); process.stdin.on('data', () => {}); process.stdin.on('end', () => {
+  out({ type: 'assistant', message: { content: [{ type: 'text', text: 'Checking the header in Chrome.' }, { type: 'tool_use', name: 'Bash', input: { command: 'pnpm run test:unit' } }] } });
+  out({ type: 'result', is_error: false, result: 'done', structured_output: { status: 'implemented', summary: 's', changed_files: ['src/app.txt'], checks: [], not_verified: [], risks: [] } });
+  process.exit(0);
+});
+`);
+  chmodSync(stub, 0o755);
+  // Claude Code's sandbox needs bwrap and socat; without them implement refuses.
+  const bare = orch(ctx, ['implement', ctx.taskFile, 'fe'], { ORCH_CLAUDE_BIN: stub, ORCH_CLAUDE_SANDBOX_TOOLS: 'orch-no-such-tool' });
+  assert.equal(bare.status, 2);
+  assert.match(bare.stderr, /sandbox needs orch-no-such-tool/);
+  const withTools = { ORCH_CLAUDE_SANDBOX_TOOLS: 'sh' };
+  const r = orch(ctx, ['implement', ctx.taskFile, 'fe'], { ORCH_CLAUDE_BIN: stub, ORCH_FE_API_BASE_URL: 'http://127.0.0.1:5099', ...withTools });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /accepted risk fe-claude-chrome/);
+  const call = JSON.parse(readFileSync(join(root, 'home', 'claude-call.json'), 'utf8'));
+  const s = state(ctx).sides.fe;
+  assert.equal(call.cwd, s.worktree);
+  for (const flag of ['-p', '--chrome', '--json-schema', '--settings']) assert.ok(call.args.includes(flag), flag);
+  assert.ok(!('$schema' in JSON.parse(call.args[call.args.indexOf('--json-schema') + 1])), 'Claude Code rejects the draft-2020-12 meta-schema');
+  assert.equal(call.args[call.args.indexOf('--model') + 1], 'claude-opus-5-5');
+  assert.equal(call.args[call.args.indexOf('--permission-mode') + 1], 'acceptEdits');
+  assert.ok(!call.args.some((a) => /dangerously|bypass/.test(a)));
+  assert.equal(call.api, 'http://127.0.0.1:5099');
+  // Without the variable, runs/config.json names the backend (read at every implement).
+  writeFileSync(join(ctx.ws, 'state', 'config.json'), JSON.stringify({ fe_api_base_url: 'http://127.0.0.1:8081' }));
+  assert.equal(orch(ctx, ['implement', ctx.taskFile, 'fe'], { ORCH_CLAUDE_BIN: stub, ...withTools }).status, 0);
+  assert.equal(JSON.parse(readFileSync(join(root, 'home', 'claude-call.json'), 'utf8')).api, 'http://127.0.0.1:8081');
+  assert.ok(call.env.includes('ORCH_IMPLEMENTER') && !call.env.includes('FAKE_API_KEY') && !call.env.includes('SSH_AUTH_SOCK'));
+  const settings = JSON.parse(readFileSync(call.args[call.args.indexOf('--settings') + 1], 'utf8'));
+  assert.equal(settings.sandbox.enabled, true);
+  assert.equal(settings.sandbox.allowUnsandboxedCommands, false);
+  assert.ok(settings.sandbox.filesystem.denyRead.includes(join(root, 'home', '.ssh')));
+  assert.ok(settings.sandbox.filesystem.denyRead.includes(join(ctx.be, '.env')));
+  assert.deepEqual(settings.sandbox.network.allowedDomains, ['localhost', '127.0.0.1']);
+  assert.ok(settings.permissions.deny.includes('Bash(git push:*)') && settings.permissions.deny.includes('WebFetch'));
+  assert.equal(s.steps.implement.exit, 0);
+  assert.equal(s.steps.implement.report_status, 'implemented');
+  const progress = JSON.parse(readFileSync(join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'live', 'agents', 'fe.claude.json'), 'utf8'));
+  assert.equal(progress.commands, 1);
+  assert.equal(progress.command, 'pnpm run test:unit');
+  assert.equal(progress.message, 'Checking the header in Chrome.');
+  // A run in which Claude Code reported its sandbox disabled blocks the side.
+  writeFileSync(stub, readFileSync(stub, 'utf8').replace("process.stdin.resume();", "process.stderr.write('Sandbox disabled: socat not installed\\n'); process.stdin.resume();"));
+  const unsandboxed = orch(ctx, ['implement', ctx.taskFile, 'fe'], { ORCH_CLAUDE_BIN: stub, ...withTools });
+  assert.notEqual(unsandboxed.status, 0);
+  assert.equal(state(ctx).sides.fe.status, 'blocked');
+  assert.match(unsandboxed.stderr, /sandbox disabled/);
+});
+
+test('runner claude: at the usage limit the task falls back to its Codex model on the same worktree', () => {
+  const ctx = setup();
+  ctx.task.sides.fe = { ...ctx.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5', fallback: { runner: 'codex-exec', model: 'test-model' } };
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+  const stub = join(root, 'claude-limited.cjs');
+  writeFileSync(stub, `#!/usr/bin/env node
+process.stdin.resume(); process.stdin.on('data', () => {}); process.stdin.on('end', () => {
+  process.stdout.write(JSON.stringify({ type: 'result', is_error: true, result: 'Claude AI usage limit reached|1792100000' }) + '\\n');
+  process.exit(1);
+});
+`);
+  chmodSync(stub, 0o755);
+  rmSync(join(root, 'home', 'codex-calls.jsonl'), { force: true });
+  const r = orch(ctx, ['implement', ctx.taskFile, 'fe'], { ORCH_CLAUDE_BIN: stub, ORCH_CLAUDE_SANDBOX_TOOLS: 'sh' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stderr, /usage limit; running the fallback codex-exec test-model/);
+  const call = JSON.parse(readFileSync(join(root, 'home', 'codex-calls.jsonl'), 'utf8').trim());
+  assert.equal(call.args[call.args.indexOf('-m') + 1], 'test-model');
+  const s = state(ctx);
+  assert.equal(s.sides.fe.steps.implement.runner, 'codex-exec');
+  assert.deepEqual(s.log.filter((e) => e.side === 'fe' && e.step === 'implement').map((e) => e.exit), [1, 0], 'the Claude attempt, then Codex');
+  // Without a fallback the run fails and says so.
+  const bare = setup();
+  bare.task.sides.fe = { ...bare.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5' };
+  writeFileSync(bare.taskFile, JSON.stringify(bare.task));
+  orch(bare, ['prepare', bare.taskFile]);
+  const none = orch(bare, ['implement', bare.taskFile, 'fe'], { ORCH_CLAUDE_BIN: stub, ORCH_CLAUDE_SANDBOX_TOOLS: 'sh' });
+  assert.equal(none.status, 1);
+  assert.match(none.stderr, /names no fallback/);
+});
+
+test('an implementer session cannot record a review', () => {
+  const ctx = setup();
+  const r = orch(ctx, ['review-record', ctx.taskFile, ctx.taskFile], { CLAUDECODE: '1', ORCH_IMPLEMENTER: '1' });
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /implementer cannot review its own work/);
+});
+
 // ── prepare / implement ──────────────────────────────────────────────────
 test('prepare creates worktrees on agent branches at the exact base', () => {
   const ctx = setup();
@@ -345,6 +461,19 @@ test('codex gets only allowlisted env, the sandbox, model and effort; its exit c
   assert.equal(a[a.indexOf('-m') + 1], 'test-model');
   assert.ok(a.includes('model_reasoning_effort="high"'));
   assert.ok(!a.some((x) => x.includes('dangerously')));
+});
+
+test('orch-defaults: Codex gets its default workspace-write sandbox with network, and no Step 0 requirement', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  rmSync(join(root, 'home', 'codex-calls.jsonl'), { force: true });
+  const r = orch(ctx, ['implement', ctx.taskFile, 'be'], { ORCH_DEFAULTS: '', ORCH_STEP0_REPORT: join(root, 'step0-not-ready.json') });
+  assert.equal(r.status, 0, r.stderr);
+  const a = JSON.parse(readFileSync(join(root, 'home', 'codex-calls.jsonl'), 'utf8').trim()).args;
+  assert.ok(a.includes('sandbox_mode="workspace-write"') && a.includes('sandbox_workspace_write.network_access=true'), a.join(' '));
+  assert.ok(!a.some((x) => x.startsWith('permissions.orch')), 'no ORCH-P profile');
+  assert.ok(!a.some((x) => /dangerously|danger-full-access/.test(x)));
+  assert.match(readFileSync(join(state(ctx).sides.be.steps.implement.dir, 'prompt.md'), 'utf8'), /dotnet test --no-restore/);
 });
 
 test('secret-like text in codex output blocks the side without echoing it', () => {
@@ -455,6 +584,26 @@ test('review needs Claude Code provenance and matching commits; blocking finding
   r = viaClaude();
   assert.equal(r.status, 0, r.stderr);
   assert.equal(JSON.parse(orch(ctx, ['status', ctx.taskFile]).stdout).overall, 'ready_for_human_merge');
+});
+
+test('review-codex: Codex reviews read-only when the risk is accepted, and this process records it', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  runToCommit(ctx, 'be');
+  runToCommit(ctx, 'fe');
+  const s = state(ctx);
+  const commits = { be: s.sides.be.steps.commit.commit, fe: s.sides.fe.steps.commit.commit };
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ output: { commits, verdict: 'accept', acceptance: [], findings: [] } }));
+  rmSync(join(root, 'home', 'codex-calls.jsonl'), { force: true });
+  const r = orch(ctx, ['review-codex', ctx.taskFile]);
+  assert.equal(r.status, 0, r.stderr);
+  const call = JSON.parse(readFileSync(join(root, 'home', 'codex-calls.jsonl'), 'utf8').trim());
+  assert.equal(call.args[call.args.indexOf('-s') + 1], 'read-only');
+  assert.ok(call.args.includes(join(dirname(CLI), 'review.schema.json')));
+  assert.equal(state(ctx).review.status, 'ready_for_human_merge');
+  const stored = JSON.parse(readFileSync(state(ctx).review.file, 'utf8'));
+  assert.equal(stored.provenance.reviewer, 'codex-fallback');
+  assert.equal(orch(ctx, ['review-codex', ctx.taskFile], { ORCH_IMPLEMENTER: '1' }).status, 2, 'never from an implementer');
 });
 
 test('nothing is ever pushed, merged or sent to GitHub', () => {
@@ -614,6 +763,34 @@ test('prepare restores BE packages for offline builds and the prompt says how to
   assert.doesNotMatch(degraded, /--no-restore/);
 });
 
+test('test runs one BE test project of the verified commit in the gate container, offline, and changes no state', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const project = ['--project', 'tests/Demo.UnitTests/Demo.UnitTests.csproj'];
+  assert.match(orch(ctx, ['test', ctx.taskFile, 'be', ...project]).stderr, /no verified commit/);
+  runToCommit(ctx, 'be');
+  assert.match(orch(ctx, ['test', ctx.taskFile, 'fe', ...project]).stderr, /BE test projects only/);
+  assert.match(orch(ctx, ['test', ctx.taskFile, 'be', '--project', '../x.csproj']).stderr, /tests\/<path>\.csproj/);
+  assert.match(orch(ctx, ['test', ctx.taskFile, 'be', ...project, '--filter', '--logger:x']).stderr, /--filter/);
+  const before = state(ctx);
+  rmSync(join(root, 'home', 'runner-calls.jsonl'), { force: true });
+  const r = orch(ctx, ['test', ctx.taskFile, 'be', ...project, '--filter', 'FullyQualifiedName~Demo']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /Passed: 3/);
+  const [call] = readFileSync(join(root, 'home', 'runner-calls.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const arg = (name) => call.rest[call.rest.indexOf(name) + 1];
+  assert.equal(call.side, 'test');
+  assert.equal(call.worktree, before.sides.be.worktree);
+  assert.equal(arg('--base'), ctx.task.base_revision.be);
+  assert.equal(arg('--packages'), before.sides.be.steps.restore.packages);
+  assert.equal(arg('--project'), 'tests/Demo.UnitTests/Demo.UnitTests.csproj');
+  assert.equal(arg('--filter'), 'FullyQualifiedName~Demo');
+  assert.deepEqual(state(ctx).sides, before.sides, 'no task state changes');
+  assert.equal(orch(ctx, ['test', ctx.taskFile, 'be', ...project], { STUB_TEST_EXIT: '1' }).status, 1, 'the test exit code is returned');
+  writeFileSync(join(before.sides.be.worktree, 'src', 'app.txt'), 'edited after commit\n');
+  assert.match(orch(ctx, ['test', ctx.taskFile, 'be', ...project]).stderr, /uncommitted changes/);
+});
+
 test('gate findings: compiler errors and failed tests, deduplicated, relative, secrets dropped', () => {
   const dir = mkdtempSync(join(TEST_ROOT_PARENT, '.orch-evidence-'));
   const wt = '/home/u/orch-worktrees/T-be';
@@ -648,6 +825,44 @@ test('gate findings: compiler errors and failed tests, deduplicated, relative, s
   assert.equal(scanSecrets(summaries.join('\n'), 'f').length, 0, 'no secret-like line survives');
   assert.match(summaries.at(-1), /1 gate lines omitted because they looked like secrets/);
   assert.match(gateFindings({ output: '', evidenceDir: null, worktree: wt })[0].summary, /without a recognizable failing step/);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test('gate findings: a gate that stops before its steps is quoted, not referred to gate.log', () => {
+  const output = [
+    'CONTAINER-GATE fe exit=1 tree=e24dce65492aa761bcb27d92745459eb67fd800c',
+    'file:///w/harness/lib/workflow.mjs:71',
+    "  if (!task) throw new Error(taskId ? `Task ${taskId} no longer exists` : `No unchecked numbered task in ${change}`);",
+    'Error: No unchecked numbered task in shipment-document-folders-v2',
+    '    at taskContext (file:///w/harness/lib/workflow.mjs:71:20)',
+  ].join('\n');
+  const findings = gateFindings({ output, evidenceDir: null, worktree: '/w' });
+  assert.deepEqual(findings.map((f) => f.summary), ['gate stopped before its steps: Error: No unchecked numbered task in shipment-document-folders-v2']);
+});
+
+test('gate findings: node --test failures come from the failing-tests summary, never from passing tests', () => {
+  const dir = mkdtempSync(join(TEST_ROOT_PARENT, '.orch-evidence-'));
+  const wt = '/home/u/orch-worktrees/T-fe';
+  writeFileSync(join(dir, 'unit-tests.log'), [
+    '✔ waiver mutation surfaces backend 400 failure (0.54ms)',
+    '✔ a failed permission preview is an error, not an empty permission set (0.74ms)',
+    '✖ nothing outside the wrappers imports TextInput straight from Astryx (2.8ms)',
+    '✖ failing tests:',
+    '',
+    'test at src/shared/components/readonly-input-wrappers.test.js:72:1',
+    '✖ nothing outside the wrappers imports TextInput straight from Astryx (2.8ms)',
+    '  AssertionError [ERR_ASSERTION]: these files should import from shared/components/text-input.jsx instead',
+    '  + actual - expected',
+    "  +   'features/logistics-contracts/components/shipment-files-checklist.jsx'",
+    `      at TestContext.<anonymous> (file://${wt}/src/shared/components/readonly-input-wrappers.test.js:83:10)`,
+    "    code: 'ERR_ASSERTION',",
+    '[ELIFECYCLE] Command failed with exit code 1.',
+  ].join('\n'));
+  const findings = gateFindings({ output: '    ✘ unit-tests FAILED — see unit-tests.log', evidenceDir: dir, worktree: wt });
+  assert.equal(findings.length, 1, JSON.stringify(findings));
+  assert.match(findings[0].summary, /^unit-tests: test failed nothing outside the wrappers imports TextInput straight from Astryx \(src\/shared\/components\/readonly-input-wrappers\.test\.js:72:1\) — AssertionError/);
+  assert.match(findings[0].summary, /shipment-files-checklist\.jsx/);
+  assert.doesNotMatch(findings[0].summary, /waiver|ERR_ASSERTION'/);
   rmSync(dir, { recursive: true, force: true });
 });
 

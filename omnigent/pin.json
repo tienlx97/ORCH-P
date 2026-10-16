@@ -36,6 +36,69 @@
       "source": "Claude Code conversation 2026-10-15, the user's words: \"Chấp nhận debby chạy không sandbox, đọc được mọi file của user.\" (docs/omnigent-evaluation.md#debby-for-complex-features)",
       "date": "2026-10-15",
       "until": "the user withdraws it, or an orch-debby with no os_env replaces debby"
+    },
+    {
+      "id": "agent-prompt-preapproval",
+      "checks": [],
+      "reason": "Claude's own permission prompt in the coordinator and reviewer is pre-answered (workspace-root .claude/settings.json, installed by cockpit.mjs) for the calls their CEL allowlists already allow: ORCH-P status/validate/review-record, autopilot check/status, and writes to runs/proposals, runs/reviews and runs/test-requests. The CEL policies remain the gate (deny everything else, ASK before every runs/requests write, which is never pre-approved). The per-command approval that docs/omnigent-evaluation.md question 5 counted on against the open network is gone for those calls; any Claude Code session started in the workspace root also gets these pre-approvals.",
+      "scope": "the allow rules in orchestrate/lib/omnigent.mjs claudeSettings only; never runs/requests, never another command",
+      "approved_by": "user",
+      "source": "Claude Code conversation 2026-10-15: the user asked to loosen checks so Omnigent runs smoothly (\"Dự án hiện tại có quá nhiều giới hạn check, dẫn đến bị fail / đòi quyền rất nhiều. Bạn hãy nói lỏng\") and chose: drop the duplicate prompts, widen the coordinator's read commands, reviewer tests through the verification container",
+      "date": "2026-10-15",
+      "until": "the user withdraws it"
+    },
+    {
+      "id": "agent-no-cel",
+      "checks": [],
+      "reason": "The coordinator and reviewer run without the CEL tool allowlist (orch_tool_allowlist), like Omnigent's default agents. What remains: linux_bwrap ($HOME unmounted except ~/.claude, ~/.claude.json and ~/.nvm; dot-paths in the workspace masked except .git, .nvm, .claude; writes only to runs/ subdirectories), permission_mode default, the pre-approved calls of agent-prompt-preapproval, tool cap and loop guard. Lost: the OS-independent denial of network commands (the agents' network is open, including the unauthenticated Omnigent API at 127.0.0.1:6767, which can approve pending prompts) and of reads under runs/ (Codex session histories may carry prompt injection) and of ~/.claude credentials; each now rests on the user declining that call in Claude's prompt. The approval of a runs/requests write is Claude's prompt, so a session switched to acceptEdits or bypass in the UI, or an 'always allow' for broad Bash, removes it. The reviewer can also write runs/proposals without a prompt (its sandbox writes all of runs/).",
+      "scope": "orch-coordinator and orch-reviewer; Codex implementers keep the Step 0 profile and session policies",
+      "approved_by": "user",
+      "source": "Claude Code conversation 2026-10-15: the user wrote \"CEL làm lệch hướng quá nhiều, default ominiagent ko có\" and, shown the risks, chose \"Bỏ hẳn CEL\" over a deny-only CEL and the current allowlist",
+      "date": "2026-10-15",
+      "until": "the user withdraws it; restore orch_tool_allowlist from git history (commit before this change) and the lint requires it again"
+    },
+    {
+      "id": "agent-autonomous",
+      "checks": [],
+      "reason": "Autopilot's reviewer sessions have nobody watching Claude's prompt, so every call outside the pre-approved list (git show/diff, cat) was denied and the plan stopped at each review. Claude's prompt is now pre-answered for every Bash command, Read, Grep, Glob, TodoWrite and the Omnigent MCP tools in the coordinator and reviewer (workspace-root .claude/settings.json); only git push, git merge, gh, curl and wget are denied. What remains: linux_bwrap (writes only to runs/ subdirectories, $HOME unmounted except ~/.claude, ~/.claude.json, ~/.nvm), tool cap, loop guard, and the plan approval (Write/Edit of runs/requests still asks). Lost: the user's per-command approval for everything else, including network commands other than curl/wget (e.g. node or python fetching 127.0.0.1:6767, the unauthenticated Omnigent API), reads of ~/.claude credentials and of Codex session histories under runs/, and shell writes to runs/requests by an agent that ignores its prompt. Any Claude Code session started in the workspace root gets the same pre-approvals.",
+      "scope": "orch-coordinator and orch-reviewer (and any Claude Code session in the workspace root); Codex implementers keep the Step 0 profile and session policies",
+      "approved_by": "user",
+      "source": "Claude Code conversation 2026-10-15, the user's words: \"YÊU CẦU: CHỈNH SỬA MỌI THỨ / GIẢM SECURITY ĐỂ OMINIAGENT TỰ CHẠY\", then \"làm đi\"",
+      "date": "2026-10-15",
+      "until": "the user withdraws it; remove this entry and `node orchestrate/cockpit.mjs` reinstalls the narrow settings"
+    },
+    {
+      "id": "fe-claude-chrome",
+      "checks": [],
+      "reason": "FE tasks with runner \"claude\" are implemented by Claude Code (claude -p --chrome) instead of Codex. Claude in Chrome drives the user's everyday Chrome, so the implementer can open any site the user is signed in to (GitHub, mail, banking) and read or act there; the prompt limits it to localhost pages, nothing enforces that. Its shell commands run in Claude Code's bwrap sandbox (writes only in the worktree and the run's temp dir; reads of ~/.ssh, ~/.codex, ~/.omnigent, gh/docker/npm credentials, BE-P/FE-P .env and ORCH-P/runs denied; network only to localhost); its file tools are limited to the worktree; git commit/push/merge/reset/checkout/config, gh, curl, wget, package installs, WebFetch/WebSearch and sub-agents are denied. ORCH-P's scope check, Git metadata check, containerized gate, commit binding and review still apply. The FE reviewer stays Claude (another session), so review is no longer by a different model; ORCH_IMPLEMENTER stops the implementer recording a review.",
+      "scope": "FE side, runner claude only; BE stays Codex with the Step 0 profile",
+      "approved_by": "user",
+      "source": "Claude Code conversation 2026-10-16, the user's words: \"với FE agent hãy dùng claude --chorme, với BE task dùng codex\"; chose \"Chrome đang dùng\" over a separate profile, runs the backend themselves, kept the Claude reviewer",
+      "date": "2026-10-16",
+      "until": "the user withdraws it, or moves the FE agent to a separate Chrome profile"
+    },
+    {
+      "id": "codex-review-fallback",
+      "checks": [],
+      "reason": "When the Claude reviewer stops without a review and a one-word Claude call answers with a usage-limit message, autopilot runs `orchestrate.mjs review-codex`: `codex exec -s read-only` in the workspace root writes the review as its final answer (review.schema.json) and ORCH-P records it with provenance reviewer=codex-fallback. For BE tasks the reviewer is then the same model family as the implementer, so the review is no longer independent of the implementer's model; it cannot run focused test requests. The read-only sandbox, the gate, commit binding and the review's commit check still apply.",
+      "scope": "autopilot review step only, after a detected Claude usage limit",
+      "approved_by": "user",
+      "source": "Claude Code conversation 2026-10-16, the user's words: \"Review dùng claude -> hết token dùng codex, coordinator dùng claude -> hết token dùng codex\"",
+      "date": "2026-10-16",
+      "until": "the user withdraws it"
+    },
+    {
+      "id": "orch-defaults",
+      "checks": [
+        "NETWORK",
+        "LOOPBACK_OMNIGENT"
+      ],
+      "reason": "Codex implementers run with Codex's default workspace-write sandbox and network on (loopback included) instead of the ORCH-P permission profile; Step 0 is no longer required and hub Codex config with MCP servers, hooks or profiles is allowed (warned). Codex can now run dotnet test and the FE dev server, use Omnigent's MCP tools, reach the internet and the unauthenticated Omnigent API on 127.0.0.1:6767 (which can approve pending prompts and start other sessions), and read the whole home directory. Kept: writes only in the worktree and temp dirs, Omnigent session policies (worktree guard, push gate, tool cap, loop guard), the environment allowlist, scope check, Git metadata check, containerized gate, commit binding and review.",
+      "scope": "Codex implementers (omnigent and codex-exec runners)",
+      "approved_by": "user",
+      "source": "Claude Code conversation 2026-10-16, the user's words: \"bạn ko cần chặn loopback, nói chung: ở ORCH-P bạn hãy đề mặc định, để dùng được nhiếu nhất khả năng của ominigen\", then \"làm đi\"",
+      "date": "2026-10-16",
+      "until": "the user withdraws it; removing this entry restores the ORCH-P profile and the Step 0 requirement"
     }
   ]
 }

@@ -156,3 +156,32 @@ test('only one runner watches a requests directory', () => {
   assert.ok(again, 'a dead runner\'s lock is taken over');
   again();
 });
+
+test('test requests: their own directory accepts only BE test runs, which may run while a plan runs', async () => {
+  const { ws, runner, sha, planSha } = planWorkspace();
+  const write = (dir, id, body) => writeFileSync(join(dir, `${id}.json`), JSON.stringify({ id, task: 'task.json', task_sha256: sha, ...body }));
+  const result = (dir, id) => JSON.parse(readFileSync(join(dir, `${id}.result.json`), 'utf8'));
+  assert.equal(runner.testDir, join(dirname(runner.dir), 'test-requests'));
+  writeFileSync(join(runner.dir, 'p1.json'), JSON.stringify({ id: 'p1', command: 'autopilot', plan: 'p.plan.json', plan_sha256: planSha }));
+  const [plan] = runner.scan();
+  write(runner.testDir, 't1', { command: 'test', side: 'be', project: 'tests/A.UnitTests/A.UnitTests.csproj', filter: 'FullyQualifiedName~Checklist' });
+  write(runner.testDir, 't2', { command: 'implement', side: 'be' });
+  write(runner.testDir, 't3', { command: 'test', side: 'fe', project: 'tests/A/A.csproj' });
+  write(runner.testDir, 't4', { command: 'test', side: 'be', project: '../BE-P/tests/A.csproj' });
+  write(runner.testDir, 't5', { command: 'test', side: 'be', project: 'tests/A/A.csproj', filter: '--logger x' });
+  write(runner.testDir, 't6', { command: 'autopilot', plan: 'p.plan.json', plan_sha256: planSha });
+  await Promise.all(runner.scan());
+  const t1 = result(runner.testDir, 't1');
+  assert.equal(t1.exit, 0, JSON.stringify(t1));
+  assert.deepEqual(JSON.parse(t1.output.split('\n')[0]),
+    ['test', join(ws, 'task.json'), 'be', '--project', 'tests/A.UnitTests/A.UnitTests.csproj', '--filter', 'FullyQualifiedName~Checklist']);
+  assert.match(result(runner.testDir, 't2').refused, /accepts only test requests/);
+  assert.match(result(runner.testDir, 't3').refused, /side be/);
+  assert.match(result(runner.testDir, 't4').refused, /tests\/<path>\.csproj/);
+  assert.match(result(runner.testDir, 't5').refused, /filter/);
+  assert.match(result(runner.testDir, 't6').refused, /accepts only test requests/);
+  assert.ok(!existsSync(join(runner.dir, 't1.result.json')), 'results stay next to their request');
+  writeFileSync(join(runner.dir, 'p9.json'), JSON.stringify({ id: 'p9', command: 'stop', plan: 'p.plan.json', plan_sha256: planSha }));
+  runner.scan();
+  await plan;
+});

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Orchestrated review (Codex fallback reviewer)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["commits", "verdict", "acceptance", "findings"],
+  "properties": {
+    "commits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["be", "fe"],
+      "properties": { "be": { "type": ["string", "null"] }, "fe": { "type": ["string", "null"] } }
+    },
+    "verdict": { "type": "string", "enum": ["accept", "rework_required"] },
+    "acceptance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["side", "criterion", "tests", "covered"],
+        "properties": {
+          "side": { "type": "string", "enum": ["be", "fe"] },
+          "criterion": { "type": "string" },
+          "tests": { "type": "array", "items": { "type": "string" } },
+          "covered": { "type": "boolean" }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["side", "severity", "file", "summary"],
+        "properties": {
+          "side": { "type": "string", "enum": ["be", "fe"] },
+          "severity": { "type": "string", "enum": ["blocking", "minor"] },
+          "file": { "type": "string" },
+          "summary": { "type": "string" }
+        }
+      }
+    }
+  }
+}

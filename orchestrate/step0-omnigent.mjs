@@ -131,6 +131,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       client: omnigentClient(url), agentName: process.env.ORCH_OMNIGENT_CODEX_AGENT ?? 'codex-native-ui',
       hostId: process.env.ORCH_OMNIGENT_HOST, worktree: ws, title: 'ORCH-P Step 0 (Omnigent)', launchArgs,
       policies: sessionPolicies(ws), timeoutMs: 600_000, pollMs: 2000,
+      // Experiment (docs/omnigent-evaluation.md#codex-as-a-child-session): the same session as a child of another one.
+      parentSessionId: process.env.ORCH_PROBE_PARENT_SESSION || null,
       prompt: ['Run exactly this one command in the current directory and nothing else:', 'node orch-check.mjs',
         'Then reply with its complete output verbatim. Do not modify or inspect any file.'].join('\n'),
     });
@@ -142,7 +144,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       omnigent_version: (run(BIN, ['--version']).stdout.match(/\d+\.\d+\.\d+\S*/) ?? [null])[0],
       pinned_version: pin.version,
       codex_version: run(CODEX, ['--version']).stdout.trim(),
-      session_id: result.sessionId, status: result.status, permission_changed: result.permissionChanged,
+      session_id: result.sessionId, parent_session_id: process.env.ORCH_PROBE_PARENT_SESSION || null,
+      status: result.status, permission_changed: result.permissionChanged,
       launch_args: launchArgs, reply: (lastAssistantText(masked) ?? '').slice(0, 2000),
       ...verdict({ items: result.items, canary, status: result.status }),
     };

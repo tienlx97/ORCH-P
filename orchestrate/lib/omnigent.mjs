@@ -11,8 +11,8 @@
 // and a static lint of the agent bundle in omnigent/. The lint is a text
 // guard, not a YAML parser: it refuses settings that would undo the security
 // posture and requires the guardrails the coordinator depends on.
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const PASS_ENV = ['HOME', 'PATH', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'COLORTERM', 'NO_COLOR', 'LANG', 'LC_ALL', 'TMPDIR', 'TZ'];
 
@@ -80,11 +80,96 @@ export function readPin(bundleDir) {
 // Nothing else can be accepted: write isolation, network, loopback, credential
 // variables, the private TMPDIR and the secret scan always have to hold for
 // Codex implementers. `debby-unsandboxed` covers no Step 0 check: it concerns
-// Omnigent's built-in debby, which never runs a pipeline step.
+// Omnigent's built-in debby, which never runs a pipeline step. Neither does
+// `agent-prompt-preapproval`: it concerns Claude's own permission prompt in
+// the bundle agents (claudeSettings below), not the Codex sandbox.
 export const KNOWN_RISKS = Object.freeze({
   'codex-read-isolation': Object.freeze(['CANARY_READ', 'SSH_KEY_READ', 'CODEX_AUTH_READ', 'OMNIGENT_STATE_READ', 'BE_ENV_READ']),
   'debby-unsandboxed': Object.freeze([]),
+  'agent-prompt-preapproval': Object.freeze([]),
+  'agent-no-cel': Object.freeze([]),
+  'agent-autonomous': Object.freeze([]),
+  'fe-claude-chrome': Object.freeze([]),
+  'codex-review-fallback': Object.freeze([]),
+  'orch-defaults': Object.freeze(['NETWORK', 'LOOPBACK_OMNIGENT']),
 });
+
+const accepts = (pin, id) => (pin?.accepted_risks ?? []).some((r) => r?.id === id);
+
+/**
+ * Claude Code project settings for the workspace root, where the coordinator
+ * and reviewer run: Claude's own permission prompt is pre-answered for the
+ * read-only ORCH-P commands and the agents' own output directories. Every
+ * other call still asks the user; runs/requests is never listed here,
+ * because that prompt is the user's approval of a step or plan (a request on
+ * disk is one the user approved). Installed only while the pin accepts
+ * `agent-prompt-preapproval`.
+ *
+ * With `autonomous` (the pin accepts `agent-autonomous`) every shell command
+ * and read is pre-answered too, so a session autopilot starts, whose prompts
+ * nobody watches, runs to the end. bwrap still limits writes to runs/
+ * subdirectories; the deny rules keep the agents off push, merge, PRs and
+ * plain HTTP clients.
+ */
+export function claudeSettings(workspace, { autonomous = false } = {}) {
+  const runs = (dir) => `Edit(/${join(workspace, 'ORCH-P', 'runs', dir)}/**)`;
+  const allow = [
+    'Bash(node ORCH-P/orchestrate/orchestrate.mjs status:*)',
+    'Bash(node ORCH-P/orchestrate/orchestrate.mjs validate:*)',
+    'Bash(node ORCH-P/orchestrate/orchestrate.mjs review-record:*)',
+    'Bash(node ORCH-P/orchestrate/autopilot.mjs check:*)',
+    'Bash(node ORCH-P/orchestrate/autopilot.mjs status:*)',
+    'Bash(node ORCH-P/orchestrate/autopilot.mjs wait:*)',
+    runs('proposals'), runs('reviews'), runs('test-requests'),
+  ];
+  if (!autonomous) return { permissions: { allow } };
+  return {
+    permissions: {
+      allow: [...allow, 'Bash', 'Read', 'Grep', 'Glob', 'TodoWrite', 'mcp__omnigent'],
+      deny: ['Bash(git push:*)', 'Bash(git merge:*)', 'Bash(gh:*)', 'Bash(curl:*)', 'Bash(wget:*)'],
+    },
+  };
+}
+
+/**
+ * Whether settings text is a copy ORCH-P wrote, of this or an earlier version:
+ * only `permissions`, and every rule one claudeSettings writes (ORCH-P
+ * commands, the runs/ edit rules, the autonomous rules). Anything the user
+ * added makes it theirs.
+ */
+function isOrchSettings(text, workspace) {
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return false; }
+  const loose = claudeSettings(workspace, { autonomous: true }).permissions;
+  const runs = `Edit(/${join(workspace, 'ORCH-P', 'runs')}/`;
+  const allowOk = (rule) => loose.allow.includes(rule) || rule.startsWith('Bash(node ORCH-P/orchestrate/') || rule.startsWith(runs);
+  const { permissions, ...rest } = parsed ?? {};
+  if (Object.keys(rest).length || !permissions || typeof permissions !== 'object') return false;
+  const { allow = [], deny = [], ...other } = permissions;
+  return !Object.keys(other).length && Array.isArray(allow) && Array.isArray(deny)
+    && allow.every(allowOk) && deny.every((rule) => loose.deny.includes(rule));
+}
+
+/**
+ * Installs claudeSettings at `file` while the pin accepts the risk, removes a
+ * copy ORCH-P installed once it does not, and never overwrites settings the
+ * user wrote: those are reported for a manual merge.
+ */
+export function syncClaudeSettings({ workspace, pin, file = join(workspace, '.claude', 'settings.json') }) {
+  const expected = `${JSON.stringify(claudeSettings(workspace, { autonomous: accepts(pin, 'agent-autonomous') }), null, 2)}\n`;
+  const accepted = accepts(pin, 'agent-prompt-preapproval');
+  const current = existsSync(file) ? readFileSync(file, 'utf8') : null;
+  const ours = current !== null && isOrchSettings(current, workspace);
+  if (!accepted) {
+    if (ours) rmSync(file);
+    return [];
+  }
+  if (current === expected) return [];
+  if (current !== null && !ours) return [`${file} differs from the ORCH-P agent settings (agent-prompt-preapproval); merge them by hand or move that file away`];
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, expected);
+  return [];
+}
 
 /**
  * Whether a Step 0-through-Omnigent report allows Codex sessions: READY, or
@@ -124,10 +209,14 @@ const FORBIDDEN = [
 const REQUIRED = [
   [/^\s*type\s*:\s*linux_bwrap\b/m, 'os_env.sandbox.type: linux_bwrap'],
   [/^\s*permission_mode\s*:\s*default\s*$/m, 'permission_mode: default'],
-  [/^\s{4}orch_tool_allowlist\s*:/m, 'the orch_tool_allowlist policy'],
-  [/path\s*:\s*omnigent\.policies\.builtins\.cel\.cel_policy\b/, 'a cel_policy guardrail'],
   [/path\s*:\s*omnigent\.policies\.builtins\.safety\.max_tool_calls_per_session\b/, 'max_tool_calls_per_session'],
   [/path\s*:\s*omnigent\.policies\.builtins\.safety\.detect_loop\b/, 'detect_loop'],
+];
+
+// The CEL tool allowlist, required unless the pin accepts `agent-no-cel`.
+const REQUIRED_CEL = [
+  [/^\s{4}orch_tool_allowlist\s*:/m, 'the orch_tool_allowlist policy'],
+  [/path\s*:\s*omnigent\.policies\.builtins\.cel\.cel_policy\b/, 'a cel_policy guardrail'],
 ];
 
 // The only shell commands each agent may run, as its CEL policy states them,
@@ -136,13 +225,14 @@ const REQUIRED = [
 // creates their sessions with the Step 0 profile (lib/omnigent-runner.mjs).
 export const COORDINATOR_SHELL = '^node ORCH-P/orchestrate/orchestrate\\.mjs (status|validate) [A-Za-z0-9._/-]+\\.json$';
 export const COORDINATOR_AUTOPILOT = '^node ORCH-P/orchestrate/autopilot\\.mjs (check|status) [A-Za-z0-9._/-]+\\.plan\\.json$';
+export const COORDINATOR_GIT = '^git -C (BE-P|FE-P) (show|diff|log|status|rev-parse|branch --list)( [A-Za-z0-9._/:^~ -]+)?$';
 export const REVIEWER_GIT = '^git -C (BE-P|FE-P) (show|diff|log) [A-Za-z0-9._/:^~ -]+$';
-export const REVIEWER_ORCH = '^node ORCH-P/orchestrate/orchestrate\\.mjs (status [A-Za-z0-9._/-]+\\.json|review-record [A-Za-z0-9._/-]+\\.json ORCH-P/runs/reviews/[A-Za-z0-9_-]+\\.json)$';
+export const REVIEWER_ORCH = '^node ORCH-P/orchestrate/orchestrate\\.mjs ((status|validate) [A-Za-z0-9._/-]+\\.json|review-record [A-Za-z0-9._/-]+\\.json ORCH-P/runs/reviews/[A-Za-z0-9_-]+\\.json)$';
 const CLAUDE_SANDBOX = { read_paths: '["~/.nvm"]', write_files: '["~/.claude.json"]' };
 export const BUNDLE_AGENTS = Object.freeze({
   'orch-coordinator': {
-    shell: [COORDINATOR_SHELL, COORDINATOR_AUTOPILOT],
-    sandbox: { ...CLAUDE_SANDBOX, write_paths: '["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude", "/tmp/omnigent-1000"]', cwd_allow_hidden: '[".nvm", ".claude", ".credentials.json"]' },
+    shell: [COORDINATOR_SHELL, COORDINATOR_AUTOPILOT, COORDINATOR_GIT],
+    sandbox: { ...CLAUDE_SANDBOX, write_paths: '["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude", "/tmp/omnigent-1000"]', cwd_allow_hidden: '[".git", ".nvm", ".claude", ".credentials.json"]' },
   },
   'orch-reviewer': {
     shell: [REVIEWER_GIT, REVIEWER_ORCH],
@@ -156,7 +246,9 @@ function agentDirs(bundleDir) {
 
 /** Static checks of omnigent/: pin, server config, every agent config. */
 export function lintBundle(bundleDir) {
-  const problems = [...readPin(bundleDir).problems];
+  const { pin, problems: pinProblems } = readPin(bundleDir);
+  const problems = [...pinProblems];
+  const cel = !accepts(pin, 'agent-no-cel');
   const server = join(bundleDir, 'config.yaml');
   if (!existsSync(server)) problems.push('omnigent/config.yaml (server config) is missing');
   else if (!/^telemetry\s*:\s*false\s*$/m.test(readFileSync(server, 'utf8'))) problems.push('omnigent/config.yaml must set telemetry: false');
@@ -171,7 +263,7 @@ export function lintBundle(bundleDir) {
     if (!existsSync(file)) continue;
     const text = readFileSync(file, 'utf8');
     for (const [pattern, what] of FORBIDDEN) if (pattern.test(text)) problems.push(`${name}: forbidden: ${what}`);
-    for (const [pattern, what] of REQUIRED) if (!pattern.test(text)) problems.push(`${name}: missing: ${what}`);
+    for (const [pattern, what] of [...REQUIRED, ...(cel ? REQUIRED_CEL : [])]) if (!pattern.test(text)) problems.push(`${name}: missing: ${what}`);
     for (const [key, expected] of Object.entries(spec.sandbox)) {
       const found = [...text.matchAll(new RegExp(`^\\s*${key}\\s*:\\s*(\\[.*\\])\\s*$`, 'gm'))].map((m) => m[1]);
       if (found.length !== 1 || found[0] !== expected) problems.push(`${name}: ${key} must be exactly ${expected}`);
@@ -179,7 +271,7 @@ export function lintBundle(bundleDir) {
     if (/^\s*egress_rules\s*:/m.test(text)) problems.push(`${name}: egress_rules break REST-created sessions (docs/omnigent-evaluation.md, question 5); remove them or fix the proxy first`);
     if (/^\s*egress_allow_private_destinations\s*:\s*true/m.test(text)) problems.push(`${name}: forbidden: egress_allow_private_destinations`);
     const shells = [...text.matchAll(/\.matches\(r'(\^(?:git|node) [^']*)'\)/g)].map((m) => m[1]);
-    if (JSON.stringify(shells) !== JSON.stringify(spec.shell)) problems.push(`${name}: the shell allowlist differs from orchestrate/lib/omnigent.mjs`);
+    if (cel && JSON.stringify(shells) !== JSON.stringify(spec.shell)) problems.push(`${name}: the shell allowlist differs from orchestrate/lib/omnigent.mjs`);
   }
   return problems;
 }

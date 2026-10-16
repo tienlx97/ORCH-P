@@ -88,7 +88,7 @@ File references below are at `v0.18.0` unless marked `main`.
 | Part | Where it runs | Why |
 |---|---|---|
 | Live view, shared history, approvals of requested steps, stop | Omnigent web UI (loopback) | One place for every agent session |
-| Coordinator (planning, proposals, step requests, status) | Omnigent session `omnigent/orch-coordinator` | Claude subscription, `linux_bwrap`, CEL allowlist; requests need an ASK approval |
+| Coordinator (planning, proposals, step requests, status) | Omnigent session `omnigent/orch-coordinator` | Claude subscription, `linux_bwrap`, Claude's permission prompts (no CEL since 2026-10-15); requests need the user's approval |
 | Codex implementers | Omnigent `codex-native-ui` sessions **created by `orchestrate.mjs implement`** | Top-level sessions accept the Step 0 profile as launch args; dispatched sub-agents get a full bypass by default (`_derive_terminal_launch_args_from_spec`) |
 | Executing approved requests | `orchestrate/runner.mjs`, started by the user outside any sandbox | The coordinator's sandbox has no worktrees, state or Docker |
 | Reviewer | Omnigent session `omnigent/orch-reviewer` | Claude, read-only git, writes only its review; `review-record` provenance (Claude, not Codex) |
@@ -192,6 +192,100 @@ user."* Recorded as `debby-unsandboxed` in `omnigent/pin.json`.
 - **Lower-risk replacement, if wanted later:** an `orch-debby` copy with no `os_env` (no file or
   shell tools) and the same `debate` skill; the `codex` head's built-in shell must be checked
   first.
+
+## Fewer prompts for the bundle agents
+
+Decided 2026-10-15 by the user, who asked to loosen the checks so Omnigent runs smoothly
+(*"Dự án hiện tại có quá nhiều giới hạn check, dẫn đến bị fail / đòi quyền rất nhiều"*) and
+chose three of the offered changes. Recorded as `agent-prompt-preapproval` in
+`omnigent/pin.json`.
+Later the same day the CEL allowlist itself was dropped ([below](#no-cel-allowlist-for-the-bundle-agents));
+where this section says the CEL policy still denies or asks, Claude's prompt now does.
+
+- **Why the prompts doubled.** With `permission_mode: default`, Omnigent's PreToolUse hook only
+  enforces DENY (and ASK, server-side); a call the CEL policy allows gets "no opinion", so Claude's
+  own permission prompt still fires (`native/native_policy_hook.py`
+  `evaluation_response_to_hook_output`). Every allowlisted `status`, `validate` or proposal write
+  asked the user, and a request write asked twice.
+- **Change 1, accepted risk.** Workspace-root `.claude/settings.json` (installed by `cockpit.mjs`)
+  pre-approves the allowlisted ORCH-P commands and writes to `runs/proposals`, `runs/reviews`
+  and `runs/test-requests`. `permission_mode` stays `default` and the lint still rejects
+  bypasses. `runs/requests` is never pre-approved: the CEL ASK there is the user's approval
+  of a step or plan. Residual risk: the per-command approval that question 5 below counted on
+  against the open network is gone for those calls (the CEL allowlist, which admits no network
+  command, remains), and any Claude Code session started in the workspace root gets the same
+  pre-approvals.
+- **Change 2, allowlist.** The coordinator may run read-only `git -C BE-P|FE-P
+  show|diff|log|status|rev-parse|branch --list` (`.git` unmasked read-only in its sandbox);
+  both agents' tool cap is 400 (was 150 / 200).
+- **Change 3, reviewer tests without new access.** Offered and rejected: `dotnet test` inside
+  the reviewer sandbox, which would run Codex-written test code next to `~/.claude/.credentials.json`
+  with an open network. Chosen instead: the reviewer writes `runs/test-requests/<id>.json` and
+  the runner runs `orchestrate.mjs test` in a gate container (network none, no host home).
+- **Not changed:** Codex still has no loopback, so it still cannot run `dotnet test` (an agent
+  with loopback can approve pending ASKs through the unauthenticated API); the gate and
+  autopilot's gate rework cover tests.
+
+## No CEL allowlist for the bundle agents
+
+Decided 2026-10-15 by the user: *"CEL làm lệch hướng quá nhiều, default ominiagent ko có"*;
+shown the risks below, the user chose to drop CEL entirely over a deny-only CEL or keeping the
+allowlist. Recorded as `agent-no-cel` in `omnigent/pin.json`; `cockpit.mjs lint` requires the
+`orch_tool_allowlist` CEL policy again as soon as that entry is removed.
+
+- **What remains.** `linux_bwrap` (`$HOME` unmounted except `~/.claude`, `~/.claude.json`,
+  `~/.nvm`; workspace read-only, dot-paths masked except `.git`, `.nvm`, `.claude`; writes only
+  to the listed `runs/` directories), `permission_mode: default` (the lint still rejects
+  anything else), the pre-approvals of `agent-prompt-preapproval`, tool cap and loop guard.
+  Codex implementers are unchanged.
+- **What rests on the user's prompt now** (it was a DENY before): network commands, including
+  calls to the unauthenticated API at `127.0.0.1:6767` that can approve pending prompts; reads
+  under `runs/` (Codex session histories can carry prompt injection) and of `~/.claude`
+  credentials; any command other than the ORCH-P ones; Omnigent's own tools.
+- **The request approval** is Claude's prompt for the `runs/requests` write. Switching a session
+  to `acceptEdits` or bypass in the UI, or an "always allow" for broad Bash, removes it.
+- The reviewer can write `runs/proposals` without a prompt (its sandbox writes all of `runs/`);
+  plan and task digests still bind what the user approved.
+- **To restore:** remove `agent-no-cel` from the pin and bring `orch_tool_allowlist` back from
+  the Git history of `omnigent/*/config.yaml` (with `tests/cel_check.py` and its tests).
+
+## Autonomous bundle agents
+
+Accepted risk `agent-autonomous` (2026-10-15). The reviewer sessions autopilot starts have nobody
+watching Claude's prompt: `git -C BE-P show <commit>` came back "Permission denied by hook", the
+reviewer stopped without a review, and the plan stopped at every task (SHIPDOC-R3, 02A). The user
+asked to lower security so Omnigent runs on its own.
+
+- `claudeSettings(workspace, { autonomous: true })` adds `Bash`, `Read`, `Grep`, `Glob`,
+  `TodoWrite` and `mcp__omnigent` to the allow list and denies `git push`, `git merge`, `gh`,
+  `curl` and `wget`. `cockpit.mjs` upgrades the ORCH-P copy of `.claude/settings.json` in place.
+- Autopilot restarts a reviewer session that ends without a review once before it stops.
+- **Still in place:** bwrap (writes only to `runs/` subdirectories), tool cap, loop guard, the
+  Codex Step 0 profile, the containerized gate, commit binding, review provenance, and the plan
+  approval (a Write/Edit of `runs/requests` still asks).
+- **Lost:** the per-command prompt for every other command: network calls not through
+  curl/wget (including the unauthenticated Omnigent API on 127.0.0.1:6767), reads of
+  `~/.claude` credentials and Codex session histories under `runs/`, and shell writes to
+  `runs/requests` by an agent that ignores its prompt. Any Claude Code session started in the
+  workspace root gets the same pre-approvals.
+- **To restore:** remove `agent-autonomous` from the pin and run `node orchestrate/cockpit.mjs`.
+
+Observed 2026-10-15: Omnigent, outside any sandbox, writes `core.untrackedCache = true` (and a
+`.git/omnigent-untracked-cache.lock`) into a repository the first time it opens a Codex session
+there. ORCH-P's Git metadata check blocked SHIPDOC-04A on it; `gitMetadataDigest` now leaves the
+`untrackedCache` line out. Every other config, hook, info or ref change still blocks.
+
+## Codex as a child session
+
+Tried 2026-10-16 (`ORCH_PROBE_PARENT_SESSION` in `step0-omnigent.mjs`, report in
+`runs/orch-step0-child/`): a Codex session created with `parent_session_id` = the coordinator's
+session runs on the coordinator's runner, and its sandbox checks match a top-level session (only
+the reads `codex-read-isolation` accepts; writes outside the worktree, network, loopback and
+credential variables denied). The UI shows it only as an inbox notification "sub-agent task …
+completed" in the coordinator's chat, which cannot be opened, and the coordinator cannot list
+it; the child's final message also lands in the coordinator's context (a prompt-injection path).
+Not adopted: Codex stays a top-level session, and `autopilot.mjs wait` relays its progress to the
+coordinator's chat instead (TEST-A-B.md).
 
 ## Open questions for the O1 probe
 

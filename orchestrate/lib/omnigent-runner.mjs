@@ -61,9 +61,9 @@ export function omnigentClient(base, { fetchImpl = fetch } = {}) {
     session: (id) => call('GET', `/v1/sessions/${encodeURIComponent(id)}`),
     interrupt: (id) => call('POST', `/v1/sessions/${encodeURIComponent(id)}/events`, { type: 'interrupt' }),
     archive: (id) => call('PATCH', `/v1/sessions/${encodeURIComponent(id)}`, { archived: true }),
-    async items(id) {
+    async items(id, { after: from = null } = {}) {
       const all = [];
-      let after = null;
+      let after = from;
       for (let page = 0; page < 1000; page += 1) {
         const body = await call('GET', `/v1/sessions/${encodeURIComponent(id)}/items?limit=100${after ? `&after=${encodeURIComponent(after)}` : ''}`);
         const batch = listOf(body);
@@ -242,7 +242,7 @@ const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
  */
 export async function runCodexSession({
   client, agentName, hostId, worktree, title, launchArgs, policies, prompt,
-  timeoutMs, pollMs = 2000, startGraceMs = 120_000, labelGraceMs = 20_000, signal, onHeartbeat = () => {}, onStatus = () => {},
+  timeoutMs, pollMs = 2000, startGraceMs = 120_000, labelGraceMs = 20_000, signal, onHeartbeat = () => {}, onStatus = () => {}, onSession = () => {}, parentSessionId = null,
 }) {
   const agents = await client.agents();
   const agent = agents.find((a) => nameOf(a) === agentName);
@@ -255,9 +255,11 @@ export async function runCodexSession({
   }
   const created = await client.createSession({
     agent_id: idOf(agent), host_id: host, workspace: worktree, title, terminal_launch_args: launchArgs,
+    ...(parentSessionId ? { parent_session_id: parentSessionId } : {}),
   });
   const sessionId = created?.id;
   if (!sessionId) throw new Error('Omnigent did not return a session id');
+  onSession(sessionId);
   const fail = async (message) => {
     await client.interrupt(sessionId).catch(() => {});
     await client.archive(sessionId).catch(() => {});

@@ -18,7 +18,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { lintBundle, omnigentEnv, orchHostStatus, parseVersion, readPin } from './lib/omnigent.mjs';
+import { lintBundle, omnigentEnv, orchHostStatus, parseVersion, readPin, syncClaudeSettings } from './lib/omnigent.mjs';
 import { codexUserConfigProblems, loopbackUrl } from './lib/omnigent-runner.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -28,6 +28,14 @@ const BUNDLE = resolve(process.env.ORCH_OMNIGENT_BUNDLE ?? join(ORCH_REPO, 'omni
 const BIN = resolve(process.env.ORCH_OMNIGENT_BIN ?? join(ORCH_REPO, 'tools', 'omnigent', '.venv', 'bin', 'omnigent'));
 export const HOST_RECORD = resolve(process.env.ORCH_OMNIGENT_HOST_RECORD ?? join(ORCH_REPO, 'runs', 'omnigent-host.json'));
 const AGENTS = { coordinator: 'ORCH-P/omnigent/orch-coordinator', reviewer: 'ORCH-P/omnigent/orch-reviewer' };
+// Claude Code project settings of the workspace root, where both agents run.
+const CLAUDE_PROJECT_SETTINGS = resolve(process.env.ORCH_CLAUDE_PROJECT_SETTINGS ?? join(WORKSPACE, '.claude', 'settings.json'));
+const RUN_DIRS = ['proposals', 'requests', 'reviews', 'test-requests'];
+
+/** Installs (or removes) the agents' Claude settings as the pin's accepted risks say. */
+export function agentSettingsProblems(bundle = BUNDLE, file = CLAUDE_PROJECT_SETTINGS) {
+  return syncClaudeSettings({ workspace: WORKSPACE, pin: readPin(bundle).pin, file });
+}
 
 /** Problems that block `start` (and `host`, which skips the approval for the O1 probe). */
 export function startProblems({ bundle = BUNDLE, bin = BIN, env = omnigentEnv(), requireApproval = true } = {}) {
@@ -55,8 +63,8 @@ export function startProblems({ bundle = BUNDLE, bin = BIN, env = omnigentEnv(),
  * environment and working directory as `start reviewer`.
  */
 export function reviewerCommand(prompt, { bin = BIN, env = omnigentEnv() } = {}) {
-  const problems = startProblems({ bin, env });
-  for (const dir of ['proposals', 'requests', 'reviews']) mkdirSync(join(ORCH_REPO, 'runs', dir), { recursive: true, mode: 0o700 });
+  const problems = [...startProblems({ bin, env }), ...agentSettingsProblems()];
+  for (const dir of RUN_DIRS) mkdirSync(join(ORCH_REPO, 'runs', dir), { recursive: true, mode: 0o700 });
   return { command: bin, args: ['run', AGENTS.reviewer, '-p', prompt], env, cwd: WORKSPACE, problems };
 }
 
@@ -117,12 +125,43 @@ function report(problems, ok) {
   return problems.length === 0 ? 0 : 2;
 }
 
+/**
+ * The coordinator on Codex, for when Claude is out of tokens
+ * (docs/orchestration.md#claude-fallback-to-codex): interactive `codex` with the
+ * coordinator's prompt, writable only in runs/proposals. It cannot write
+ * runs/requests, so the plan's approval is the user typing
+ * `autopilot.mjs run` (AGENTS.md rule 4).
+ */
+export function coordinatorCodexCommand({ bundle = BUNDLE, workspace = WORKSPACE, codex = process.env.ORCH_CODEX_BIN ?? 'codex' } = {}) {
+  const config = readFileSync(join(bundle, 'orch-coordinator', 'config.yaml'), 'utf8');
+  const block = /^prompt: \|\n((?:  .*\n|\n)+)/m.exec(config)?.[1] ?? '';
+  const base = block.split('\n').map((l) => l.replace(/^ {2}/, '')).join('\n').trim();
+  const proposals = join(workspace, 'ORCH-P', 'runs', 'proposals');
+  const prompt = [
+    base, '',
+    'CODEX FALLBACK (overrides the text above where they differ): Claude is out of tokens, so you are the coordinator on Codex.',
+    `Your working directory is ${proposals} and it is the only place you can write. The workspace root is ${workspace}:`,
+    `run every command from there (\`cd ${workspace} && ...\`). You cannot write ORCH-P/runs/requests. Where the text says to`,
+    'write a request, give the user instead the exact command to type in a terminal:',
+    `\`node ${join(workspace, 'ORCH-P', 'orchestrate', 'autopilot.mjs')} run <plan path>\` (typing it is their approval of the plan),`,
+    'then follow the plan with `autopilot.mjs wait` as described. Now wait for the user\'s request.',
+  ].join('\n');
+  return { command: codex, args: ['-C', proposals, '-s', 'workspace-write', '-a', 'on-request', prompt], cwd: proposals };
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [command, ...rest] = process.argv.slice(2);
   const agent = command === 'start' ? AGENTS[rest[0] ?? 'coordinator'] : null;
-  if (!['lint', 'check', 'start', 'host', 'host-stop', 'probe-api'].includes(command)) {
-    console.error('usage: node orchestrate/cockpit.mjs lint|check|start [coordinator|reviewer]|host|host-stop|probe-api');
+  if (!['lint', 'check', 'start', 'coordinator-codex', 'host', 'host-stop', 'probe-api'].includes(command)) {
+    console.error('usage: node orchestrate/cockpit.mjs lint|check|start [coordinator|reviewer]|coordinator-codex|host|host-stop|probe-api');
     process.exit(2);
+  }
+  if (command === 'coordinator-codex') {
+    mkdirSync(join(ORCH_REPO, 'runs', 'proposals'), { recursive: true, mode: 0o700 });
+    const { command: bin, args, cwd } = coordinatorCodexCommand();
+    console.error('cockpit: coordinator on Codex (Claude out of tokens); it writes only runs/proposals, you approve a plan by typing autopilot.mjs run');
+    const result = spawnSync(bin, args, { stdio: 'inherit', cwd });
+    process.exit(result.error ? 127 : result.status ?? 1);
   }
   if (command === 'start' ? rest.length > 1 || !agent : rest.length) process.exit(report([`unexpected arguments: ${rest.join(' ')}`]));
   if (command === 'lint') {
@@ -137,7 +176,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     // session they start inherits it too. stdin is closed: with a pipe the CLI
     // waits for input (observed 2026-10-14).
     const env = omnigentEnv();
-    const problems = startProblems({ env, requireApproval: false });
+    const problems = [...startProblems({ env, requireApproval: false }), ...agentSettingsProblems()];
     const hubConfig = join(env.CODEX_HOME, 'config.toml');
     if (!existsSync(join(env.CODEX_HOME, 'auth.json'))) {
       problems.push(`the hub Codex home ${env.CODEX_HOME} has no auth.json: run \`CODEX_HOME=${env.CODEX_HOME} codex login\` (or link ~/.codex/auth.json there)`);
@@ -169,10 +208,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     }
   }
   const env = omnigentEnv();
-  const code = report(startProblems({ env }), `cockpit: starting ${agent} on the loopback server`);
+  const code = report([...startProblems({ env }), ...agentSettingsProblems()], `cockpit: starting ${agent} on the loopback server`);
   if (code !== 0) process.exit(code);
   // An agent sandbox can only bind write paths that exist.
-  for (const dir of ['proposals', 'requests', 'reviews']) mkdirSync(join(ORCH_REPO, 'runs', dir), { recursive: true, mode: 0o700 });
+  for (const dir of RUN_DIRS) mkdirSync(join(ORCH_REPO, 'runs', dir), { recursive: true, mode: 0o700 });
   const before = configSnapshot(env.HOME);
   const result = spawnSync(BIN, ['run', agent], { stdio: 'inherit', env, cwd: WORKSPACE });
   const changed = configChanges(before, configSnapshot(env.HOME));

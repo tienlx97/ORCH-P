@@ -34,19 +34,35 @@ prompt: |
      ORCH-P/runs/proposals/<ID>.json following
      ORCH-P/orchestrate/task.example.json, with "status": "proposed" and
      "approval": null: objective, the narrowest allowed_paths, acceptance
-     criteria a test can prove, complexity, a model from the Codex catalog,
-     and "context": the part of the spec this task needs (Codex sees only its
-     worktree and this task). The first task of each OpenSpec change also
+     criteria a test can prove, complexity, the implementer and "context":
+     the part of the spec this task needs (the implementer sees only its
+     worktree and this task). Implementer per side: BE uses Codex ("runner":
+     "omnigent", a model from the Codex catalog); FE uses Claude Code with
+     Claude in Chrome ("runner": "claude", "model": "claude-opus-5-5", and
+     "fallback": {"runner": "omnigent", "model": <Codex model>} for when
+     Claude is out of tokens), which
+     can run the dev server against the user's backend and check the UI in
+     the browser, so FE acceptance criteria may include what the page must
+     show ("browser: header buttons are 32px tall on hover"). The first task of each OpenSpec change also
      writes openspec/changes/<change>/proposal.md and tasks.md (put that path
-     in allowed_paths). Leave base_revision out; the plan sets the bases.
+     in allowed_paths). Never make "tasks.md <n> marked done" an FE
+     acceptance criterion: the FE gate verifies the first unchecked task, so
+     Codex leaves it unchecked and the user ticks it after the gate passes.
+     Leave base_revision out; the plan sets the bases.
      Set contract_check and say why.
+     allowed_paths must also cover the files the change is coupled to: before
+     writing them, search for tests and code that tie the new code to other
+     files (e.g. a test asserting that Contracts enums mirror Domain enums,
+     mappers, DI registrations, snapshot or API docs) and include those files.
+     Codex cannot edit outside allowed_paths; a missing coupled file means a
+     failed gate and a blocked rework round.
   3. Write the plan ORCH-P/runs/proposals/<PLAN>.plan.json:
      {"id": "<PLAN>", "status": "proposed", "max_rework": 2,
       "tasks": [{"file": "ORCH-P/runs/proposals/<ID>.json", "sha256": "<digest>",
                  "base": {"be": "main"}},
                 {"file": "...", "sha256": "...", "base": {"be": "after:<earlier ID>"}}]}
      Tasks run in this order. "base" per side is a branch name (resolved when
-     the plan starts), a full SHA, or "after:<earlier task id>" to build on
+     the plan starts; check it exists with `git -C BE-P rev-parse --verify <branch>`), a full SHA, or "after:<earlier task id>" to build on
      that task's reviewed commit. Run
      `node ORCH-P/orchestrate/autopilot.mjs check <plan>`: it prints each
      task's sha256 and the plan's; fix every problem it lists.
@@ -59,12 +75,21 @@ prompt: |
      the plan. The ORCH-P runner then runs each task (prepare, implement,
      check, verify with gate rework, commit, review by orch-reviewer with
      review rework) without further approvals.
-  5. Report progress with `node ORCH-P/orchestrate/autopilot.mjs status <plan>`
-     when the user asks; per task use
+  5. Once the request is written, follow the plan yourself; never ask the
+     user to say "continue" or to come back later. Run
+     `node ORCH-P/orchestrate/autopilot.mjs wait <plan>`. It returns at once
+     when a task moves to another step, otherwise at most every 3 minutes
+     with Codex's progress, or after 9 minutes: exit 4 or 3 means still
+     running, so post what it printed (task states, the step each side is
+     on, the Codex session, its command count and last command, and Codex's
+     latest message, quoted)
+     as one short message and run wait again, as many times as it takes;
+     exit 0 means done, exit 1 stopped. Per task details:
      `node ORCH-P/orchestrate/orchestrate.mjs status <run_file from autopilot status>`.
-     When the plan stops, report its reason as status gives it. When it is
-     done, list the branches the user pushes and merges, in order, and any
-     task that needs the manual contract pilot.
+     When the plan stops, report its reason as status gives it, read the
+     findings it names and say what is needed. When it is done, list the
+     branches the user pushes and merges, in order, and any task that needs
+     the manual contract pilot.
   To stop a running plan, write a request with "command": "stop" and the same
   plan and plan_sha256. Single steps of a task the user approved by hand still
   work as before: {"id", "task", "task_sha256" (from
@@ -76,8 +101,9 @@ prompt: |
   approved; change a proposal after its plan request was written (write a new
   plan id instead); run any other command; read run evidence under runs/;
   fetch from the web; start sub-agents; push, merge, deploy or open pull
-  requests. Policies enforce this. When one blocks you, tell the user what
-  you needed and stop; do not look for another way.
+  requests. The user approves every command and write outside the
+  pre-approved ones; when the user declines, say what you needed and stop;
+  do not look for another way.
 
 os_env:
   type: caller_process
@@ -88,67 +114,32 @@ os_env:
     # for `node ORCH-P/...`, and Omnigent's runtime dir /tmp/omnigent-<uid>
     # (its hooks in Claude write the settings/bridge files there; observed
     # 2026-10-15 — without it Claude never accepts a message). $HOME is
-    # otherwise not mounted. The tool allowlist
-    # still denies every Read/Write of a dot-path, so only the Claude process
-    # itself uses them.
+    # otherwise not mounted. With no tool allowlist, Claude's permission
+    # prompt is what stands between the agent and those files (reads and
+    # commands outside the pre-approved list ask the user).
     read_paths: ["~/.nvm"]
     write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude", "/tmp/omnigent-1000"]
     write_files: ["~/.claude.json"]
-    cwd_allow_hidden: [".nvm", ".claude", ".credentials.json"]
+    cwd_allow_hidden: [".git", ".nvm", ".claude", ".credentials.json"]
     # No egress_rules: with them, sessions created through the REST API cannot reach
     # Omnigent's egress proxy and Claude never reaches the API (observed 2026-10-15).
-    # The network is open, so the CEL allowlist (no network commands) and the user's
-    # per-command approval are what keep this agent off the local Omnigent API.
+    # The network is open, so the user's per-command approval is what keeps this
+    # agent off the local Omnigent API: never approve curl/wget/nc or a broad
+    # "always allow" for Bash.
 
 guardrails:
   policies:
-    # Tool allowlist. Abstains ({}) when a call is allowed so the limits below
-    # still apply; asks the user before every ORCH-P request; denies every tool
-    # not named here, including Omnigent's own.
-    orch_tool_allowlist:
-      type: function
-      on: [tool_call]
-      function:
-        path: omnigent.policies.builtins.cel.cel_policy
-        arguments:
-          reason: "Not allowed for the ORCH-P coordinator."
-          expression: |
-            event.type != "tool_call" ? {} :
-            event.data.name == "TodoWrite" ? {} :
-            event.data.name == "Bash" ?
-              (has(event.data.arguments.command)
-                && (event.data.arguments.command.matches(r'^node ORCH-P/orchestrate/orchestrate\.mjs (status|validate) [A-Za-z0-9._/-]+\.json$')
-                    || event.data.arguments.command.matches(r'^node ORCH-P/orchestrate/autopilot\.mjs (check|status) [A-Za-z0-9._/-]+\.plan\.json$'))
-                && !event.data.arguments.command.contains("..")
-                ? {} : {"result": "DENY", "reason": "Only `node ORCH-P/orchestrate/orchestrate.mjs status|validate <task.json>` and `node ORCH-P/orchestrate/autopilot.mjs check|status <plan>` may run."}) :
-            event.data.name == "Read" ?
-              (has(event.data.arguments.file_path)
-                && !event.data.arguments.file_path.matches(r'(^|/)(\.\.|\.[^/]+)(/|$)')
-                && (!event.data.arguments.file_path.matches(r'(^|/)runs(/|$)')
-                    || event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/(proposals|requests)/[A-Za-z0-9._-]+\.json$'))
-                ? {} : {"result": "DENY", "reason": "Read is limited to workspace files outside runs/ and dot-paths (proposals and request results excepted)."}) :
-            event.data.name in ["Grep", "Glob"] ?
-              (has(event.data.arguments.path)
-                && !event.data.arguments.path.matches(r'(^|/)(\.\.|\.[^/]+|runs)(/|$)')
-                && event.data.arguments.path.matches(r'(^|/)(ORCH-P|BE-P|FE-P)(/|$)')
-                ? {} : {"result": "DENY", "reason": "Search needs an explicit path inside ORCH-P, BE-P or FE-P, outside runs/ and dot-paths."}) :
-            event.data.name in ["Write", "Edit", "MultiEdit"] ?
-              (!has(event.data.arguments.file_path) || event.data.arguments.file_path.contains("..")
-                ? {"result": "DENY", "reason": "Writes need a plain path."} :
-              event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/proposals/[A-Za-z0-9._-]+\.json$') ? {} :
-              event.data.arguments.file_path.matches(r'(^|/)ORCH-P/runs/requests/[A-Za-z0-9_-]+\.json$')
-                ? (event.data.name == "Write" && has(event.data.arguments.content)
-                    ? {"result": "ASK", "reason": "Run this ORCH-P request? " + event.data.arguments.content}
-                    : {"result": "DENY", "reason": "Requests are written whole with Write, never edited."}) :
-              {"result": "DENY", "reason": "Writes are limited to ORCH-P/runs/proposals/<ID>.json and ORCH-P/runs/requests/<id>.json."}) :
-            {"result": "DENY", "reason": "Tool not on the ORCH-P coordinator allowlist."}
+    # No tool allowlist (accepted risk agent-no-cel, omnigent/pin.json): bwrap
+    # and Claude's own permission prompt (permission_mode: default) are the
+    # limits; every call not pre-approved in the workspace .claude/settings.json
+    # asks the user, including every write to ORCH-P/runs/requests.
     tool_cap:
       type: function
       on: [tool_call]
       function:
         path: omnigent.policies.builtins.safety.max_tool_calls_per_session
         arguments:
-          limit: 150
+          limit: 400
     loop_guard:
       type: function
       on: [tool_call]
