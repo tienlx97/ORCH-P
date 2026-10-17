@@ -40,6 +40,7 @@ import { readJson, writeJsonAtomic } from './lib/agent-state.mjs';
 import { lastAssistantText, loopbackUrl, omnigentClient } from './lib/omnigent-runner.mjs';
 import { claudeAvailable as claudeCheck } from './lib/claude-limit.mjs';
 import { scanSecrets } from './lib/secrets.mjs';
+import { browserCriteria } from './lib/browser-verification.mjs';
 import { validateTask } from './orchestrate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -80,7 +81,7 @@ function inWorkspace(path, workspace) {
  * Checks a plan and the proposals it lists. Returns { plan, digest, tasks, problems };
  * tasks carry their parsed content and resolved paths. `run` refuses unless problems is empty.
  */
-export function checkPlan(planPath, { workspace = WORKSPACE } = {}) {
+export function checkPlan(planPath, { workspace = WORKSPACE, stateRoot = STATE_ROOT } = {}) {
   const problems = [];
   if (!existsSync(planPath)) return { problems: ['plan file not found'] };
   const raw = readFileSync(planPath);
@@ -88,6 +89,10 @@ export function checkPlan(planPath, { workspace = WORKSPACE } = {}) {
   try { plan = JSON.parse(raw); } catch { return { problems: ['plan is not JSON'] }; }
   const digest = sha256(raw);
   if (!PLAN_ID.test(plan.id ?? '')) problems.push('plan id must match ^[A-Z][A-Z0-9-]{1,40}$');
+  const existingPlan = PLAN_ID.test(plan.id ?? '') ? readJson(join(stateRoot, 'autopilot', plan.id, 'state.json')) : null;
+  if (existingPlan?.plan_sha256 && existingPlan.plan_sha256 !== digest) {
+    problems.push(`runs/autopilot/${plan.id} belongs to another version of the plan (sha256 ${existingPlan.plan_sha256}); give the new plan a new id`);
+  }
   const maxRework = plan.max_rework ?? 2;
   if (!Number.isInteger(maxRework) || maxRework < 0 || maxRework > MAX_REWORK_LIMIT) problems.push(`max_rework must be an integer from 0 to ${MAX_REWORK_LIMIT}`);
   if (!Array.isArray(plan.tasks) || plan.tasks.length === 0) problems.push('tasks must be a non-empty array');
@@ -132,6 +137,12 @@ export function checkPlan(planPath, { workspace = WORKSPACE } = {}) {
     const own = entry.max_rework ?? maxRework;
     if (!Number.isInteger(own) || own < 0 || own > MAX_REWORK_LIMIT) problems.push(`${where}.max_rework must be an integer from 0 to ${MAX_REWORK_LIMIT}`);
     const item = { maxRework: own, index: i, id: task.id, file, rel: relative(workspace, file), sha256: actual, task, sides: SIDE_ORDER.filter((s) => sides.includes(s)), base, preApproved };
+    const prepared = readJson(join(stateRoot, `orch-${task.id}`, 'state.json'));
+    if (prepared?.task_digest) {
+      const runFile = preApproved ? file : join(stateRoot, 'autopilot', plan.id ?? '', 'tasks', `${task.id}.json`);
+      const sameApprovedTask = existsSync(runFile) && sha256(readFileSync(runFile)) === prepared.task_digest;
+      if (!sameApprovedTask) problems.push(`${where}: task id ${task.id} is already prepared from another approved task or plan; use a new task id`);
+    }
     seen.set(task.id, item);
     tasks.push(item);
   }
@@ -197,9 +208,12 @@ function taskState(ctx, id) {
 
 /** Where an existing run of a side stands, so a resumed plan continues instead of repeating steps. */
 export function nextStep(s) {
+  if (s?.status === 'blocked' || s?.steps?.implement?.blocked || s?.steps?.implement?.secret_hits?.length
+      || s?.steps?.implement?.git_metadata_changed) return 'blocked';
   const at = (step) => (s?.steps?.[step] ? Date.parse(s.steps[step].at) : -1);
   const ok = (step) => s?.steps?.[step]?.exit === 0;
   if (!s?.steps?.implement) return 'implement';
+  if ((s.rework ?? []).some((f) => f.source === 'operator-diagnostic' && Date.parse(f.at) > at('implement'))) return 'implement';
   if (at('commit') >= at('implement') && ok('commit') && at('commit') >= at('verify')) return 'review';
   if (ok('verify') && at('verify') >= at('check') && at('check') >= at('implement')) return 'commit';
   // A failed gate with findings goes back to Codex; one without (infrastructure) is retried.
@@ -219,6 +233,7 @@ async function sideToCommit(ctx, item, side, { from = 'implement' } = {}) {
   let emptyRetried = false;
   for (;;) {
     ctx.progress(item, `${side}: ${step}`);
+    if (step === 'blocked') throw new Stop(`${item.id} ${side}: prior security/scope block requires diagnosis and a clean implementation; automatic resume cannot skip it`);
     if (step === 'review') return;
     if (step === 'implement') {
       await implement(ctx, item, side);
@@ -243,6 +258,20 @@ async function sideToCommit(ctx, item, side, { from = 'implement' } = {}) {
       ctx.progress(item, `${side}: gate failed, rework ${gateRounds}/${item.maxRework}`);
       step = 'implement';
     } else if (step === 'commit') {
+      if (browserCriteria(item.task.sides[side]).length) {
+        ctx.progress(item, `${side}: browser verification`);
+        const browser = await runCli(ctx, ['browser-verify', t, side]);
+        if (browser.exit !== 0) {
+          const s = taskState(ctx, item.id)?.sides?.[side];
+          if (!s?.steps?.browser?.error && s?.steps?.browser?.report_status === 'failed' && gateRounds < item.maxRework) {
+            gateRounds += 1;
+            ctx.progress(item, `${side}: browser failed, rework ${gateRounds}/${item.maxRework}`);
+            step = 'implement'; continue;
+          }
+          throw new Stop(`${item.id} ${side}: browser verification failed or blocked${tailLine(browser.output)}`);
+        }
+        ctx.progress(item, `${side}: commit`);
+      }
       const r = await runCli(ctx, ['commit', t, side]);
       // Exit 3: Codex changed nothing (e.g. it was blocked); give it one more run.
       if (r.exit === 3 && !emptyRetried) {
@@ -294,18 +323,22 @@ const tailLine = (output) => {
  */
 async function review(ctx, item, attempt = 1) {
   const before = taskState(ctx, item.id)?.review?.file ?? null;
+  // Native Claude is a long-lived REPL and may remain open after quota rejection.
+  // Check before starting it rather than waiting through two review timeouts.
+  if (attempt === 1 && (await ctx.claudeAvailable()).limited) return reviewFallback(ctx, item, before);
   const prompt = `Review task ${relative(WORKSPACE, item.runFile)}.`;
   ctx.progress(item, attempt === 1 ? 'review' : 'review (reviewer restarted)');
-  const reviewer = await ctx.startReviewer(prompt);
+  const reviewer = await ctx.startReviewer(prompt, item.task.review_config);
   let failure = null;
   try {
-    const deadline = Date.now() + ctx.reviewTimeoutMs;
+    const deadline = Date.now() + (item.task.review_config?.timeout_minutes ? item.task.review_config.timeout_minutes * 60_000 : ctx.reviewTimeoutMs);
     for (;;) {
       const recorded = taskState(ctx, item.id)?.review;
       if (recorded?.file && recorded.file !== before) return recorded.status;
       if (reviewer.exited() && attempt === 1) break;
       if (reviewer.exited()) { failure = `${item.id}: the reviewer session ended twice without recording a review (see the orch-reviewer session in Omnigent)`; break; }
-      if (Date.now() > deadline) { failure = `${item.id}: no review recorded within ${Math.round(ctx.reviewTimeoutMs / 60_000)} minutes (see the orch-reviewer session in Omnigent)`; break; }
+      if (ctx.interrupted) throw new Stop('interrupted');
+      if (Date.now() > deadline) { failure = `${item.id}: no review recorded within ${item.task.review_config?.timeout_minutes ?? Math.round(ctx.reviewTimeoutMs / 60_000)} minutes (see the orch-reviewer session in Omnigent)`; break; }
       await new Promise((r) => { setTimeout(r, ctx.reviewPollMs); });
     }
   } finally {
@@ -315,6 +348,10 @@ async function review(ctx, item, attempt = 1) {
   // Claude out of tokens: Codex reviews instead (accepted risk codex-review-fallback).
   const claude = await ctx.claudeAvailable();
   if (!claude.limited) throw new Stop(failure);
+  return reviewFallback(ctx, item, before);
+}
+
+async function reviewFallback(ctx, item, before) {
   ctx.progress(item, 'review: Claude is at its usage limit, Codex reviews instead');
   const r = await runCli(ctx, ['review-codex', item.runFile]);
   const recorded = taskState(ctx, item.id)?.review;
@@ -370,6 +407,15 @@ async function runTask(ctx, item) {
     await sideToCommit(ctx, item, side, { from });
   }
   for (let round = 0; ; round += 1) {
+    // Also cover resumes of a previously committed task with missing browser evidence.
+    for (const side of item.sides.filter((s) => browserCriteria(item.task.sides[s]).length)) {
+      const state = taskState(ctx, item.id)?.sides?.[side];
+      if (state?.steps?.browser?.exit === 0 && state.steps.browser.tree === state.steps.commit?.tree
+          && state.steps.browser.verify_at === state.steps.verify?.at) continue;
+      ctx.progress(item, `${side}: browser verification`);
+      const browser = await runCli(ctx, ['browser-verify', item.runFile, side]);
+      if (browser.exit !== 0) throw new Stop(`${item.id} ${side}: browser verification failed or blocked${tailLine(browser.output)}`);
+    }
     const verdict = await review(ctx, item);
     if (verdict === 'ready_for_human_merge') break;
     if (round >= item.maxRework) throw new Stop(`${item.id}: review still requires rework after ${round} rounds; read the review in runs/orch-${item.id}/`);
@@ -389,9 +435,9 @@ async function runTask(ctx, item) {
 }
 
 /** Starts orch-reviewer through cockpit's checks; returns { exited(), stop() }. */
-async function startReviewerSession(prompt) {
+async function startReviewerSession(prompt, role) {
   const { reviewerCommand } = await import('./cockpit.mjs');
-  const { command, args, env, cwd, problems } = reviewerCommand(prompt);
+  const { command, args, env, cwd, problems } = reviewerCommand(prompt, role ? { role } : {});
   if (problems.length) throw new Stop(`cannot start the reviewer: ${problems.join('; ')}`);
   // `omnigent run` is a REPL: give it a terminal (script) and an stdin that stays open.
   const child = spawn('script', ['-qfec', [command, ...args].map(shellQuote).join(' '), '/dev/null'], {
@@ -408,6 +454,34 @@ async function startReviewerSession(prompt) {
 const shellQuote = (s) => `'${String(s).replaceAll("'", "'\\''")}'`;
 
 // ── run ──────────────────────────────────────────────────────────────────
+/** Continue one already-approved task without creating any new task approval. */
+export async function runApprovedTask(taskPath, options = {}) {
+  const workspace = options.workspace ?? WORKSPACE;
+  const stateRoot = options.stateRoot ?? STATE_ROOT;
+  const log = options.log ?? console.log;
+  try {
+    const file = inWorkspace(taskPath, workspace);
+    if (!file || !existsSync(file)) throw new Error('approved task must be inside the workspace');
+    const raw = readFileSync(file);
+    const task = JSON.parse(raw);
+    if (task.status !== 'approved') throw new Error('task must already be approved; use the plan approval flow for proposals');
+    validateTask(task, { resolveCommit: false });
+    const id = `TASK-${sha256(task.id).slice(0, 16).toUpperCase()}`;
+    const dir = planDir(id, stateRoot);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const schedule = join(dir, 'approved-task.plan.json');
+    const content = `${JSON.stringify({ id, status: 'approved', max_rework: 2,
+      tasks: [{ file: relative(workspace, file), sha256: sha256(raw) }] }, null, 2)}\n`;
+    if (existsSync(schedule) && readFileSync(schedule, 'utf8') !== content) throw new Error('approved task changed since its automatic run; use a newly approved task id');
+    if (!existsSync(schedule)) writeFileSync(schedule, content, { mode: 0o600, flag: 'wx' });
+    log(`autopilot: continuing existing approval for ${task.id}; progress file ${schedule}`);
+    return await runPlan(schedule, { ...options, approval: `existing approved task ${task.id} sha256 ${sha256(raw)}; no new approval granted` });
+  } catch (error) {
+    log(`refused: ${error.message}`);
+    return 2;
+  }
+}
+
 export async function runPlan(planPath, {
   approval = 'typed `autopilot run` in a terminal', workspace = WORKSPACE, stateRoot = STATE_ROOT, cli = CLI, env = process.env,
   gateRunner = GATE_RUNNER, step0 = STEP0,
@@ -415,7 +489,7 @@ export async function runPlan(planPath, {
   claudeAvailable = async () => claudeCheck({ env }),
   resolveRef = (side, ref) => gitRevParse(REPOS[side], ref), log = (m) => console.log(m),
 } = {}) {
-  const checked = checkPlan(planPath, { workspace });
+  const checked = checkPlan(planPath, { workspace, stateRoot });
   if (checked.problems.length) {
     log(`refused: plan is not runnable:\n  - ${checked.problems.join('\n  - ')}`);
     return 2;
@@ -482,9 +556,9 @@ export async function runPlan(planPath, {
     state.status = 'done';
     state.summary = summary(state);
   } catch (error) {
-    if (!(error instanceof Stop)) throw error;
     state.status = 'stopped';
-    state.stopped = ctx.interrupted ? 'interrupted' : error.message;
+    const message = error instanceof Stop ? error.message : `runtime error: ${error.message}`;
+    state.stopped = ctx.interrupted ? 'interrupted' : scanSecrets(message, 'error').length ? 'runtime error withheld: secret-like text; inspect locally' : message;
     const current = tasks.find((t) => state.tasks[t.id].status === 'running');
     if (current) state.tasks[current.id].status = 'stopped';
     ctx.log(`STOPPED: ${state.stopped}`);
@@ -546,20 +620,22 @@ export async function progressOf(status, { stateRoot = STATE_ROOT, sessionProgre
       const live = readJson(join(agents, `${side}.json`));
       if (!live) continue;
       lines.push(`▶ ${id} ${side}: ${live.stage}${live.active ? ' (running)' : ` (${live.state})`}${live.summary ? ` — ${String(live.summary).slice(0, 200)}` : ''}`);
-      if (live.stage !== 'implement' || !live.active) continue;
+      if (!['implement', 'browser'].includes(live.stage) || !live.active) continue;
       // runner "claude" (FE): orchestrate.mjs publishes the stream's progress next to the snapshot.
       const claude = readJson(join(agents, `${side}.claude.json`));
-      if (claude && Date.parse(claude.at ?? 0) >= Date.parse(live.since ?? 0)) {
+      const session = readJson(join(agents, `${side}.session.json`));
+      if (claude && Date.parse(claude.at ?? 0) >= Date.parse(live.since ?? 0)
+          && (!session?.started_at || Date.parse(claude.at ?? 0) >= Date.parse(session.started_at))) {
         if (claude.commands) lines.push(`  Claude ran ${claude.commands} commands; last: ${quote(claude.command ?? '')}`);
         if (claude.message) lines.push(`  Claude: ${quote(claude.message)}`);
         continue;
       }
-      const session = readJson(join(agents, `${side}.session.json`));
       if (!session?.session_id) continue;
-      lines.push(`  Codex session: ${session.title} (${session.session_id})`);
+      const provider = session.provider === 'claude' ? 'Claude' : 'Codex';
+      lines.push(`  ${provider} session: ${session.title} (${session.session_id})`);
       const seen = await sessionProgress(session.session_id).catch(() => null);
-      if (seen?.commands) lines.push(`  Codex ran ${seen.commands} commands; last: ${quote(seen.command ?? '')}`);
-      if (seen?.message) lines.push(`  Codex: ${quote(seen.message)}`);
+      if (seen?.commands) lines.push(`  ${provider} ran ${seen.commands} commands; last: ${quote(seen.command ?? '')}`);
+      if (seen?.message) lines.push(`  ${provider}: ${quote(seen.message)}`);
     }
     if (task.step === 'review') lines.push(`  ${id}: orch-reviewer is reviewing (its session is in the Omnigent UI)`);
   }
@@ -624,8 +700,12 @@ export async function waitPlan(planPath, {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [command, planArg, ...rest] = process.argv.slice(2);
-  const usage = 'usage: node orchestrate/autopilot.mjs check|status|wait|run <plan.json> [--approval <source>] [--minutes <n>]';
-  if (!['check', 'status', 'wait', 'run'].includes(command) || !planArg) { console.error(usage); process.exit(2); }
+  const usage = 'usage: node orchestrate/autopilot.mjs check|status|wait|run <plan.json> [--approval <source>] [--minutes <n>]; task <already-approved-task.json>';
+  if (!['check', 'status', 'wait', 'run', 'task'].includes(command) || !planArg) { console.error(usage); process.exit(2); }
+  if (command === 'task') {
+    if (rest.length) { console.error(usage); process.exit(2); }
+    process.exit(await runApprovedTask(resolve(planArg)));
+  }
   if (command === 'wait') {
     const m = rest.indexOf('--minutes');
     const minutes = m >= 0 ? Math.min(Math.max(Number(rest[m + 1]) || 9, 1), 9) : 9;

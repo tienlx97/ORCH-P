@@ -10,13 +10,14 @@ import { dirname, join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { coordinatorCodexCommand, probeApi, shapeOf, startProblems } from '../orchestrate/cockpit.mjs';
+import { coordinatorCodexCommand, healthProblems, probeApi, shapeOf, startCoordinatorCodexSession, startProblems } from '../orchestrate/cockpit.mjs';
+import { CLAUDE_LIMIT } from '../orchestrate/lib/claude-limit.mjs';
 import {
   BUNDLE_AGENTS, claudeSettings, KNOWN_RISKS, lintBundle, step0Acceptance, OMNIGENT_OPT_OUTS, omnigentEnv, parseVersion, readPin,
   syncClaudeSettings,
 } from '../orchestrate/lib/omnigent.mjs';
 import {
-  codexLaunchArgs, codexProfileName, codexProfileToml, codexSandboxPolicies, codexUserConfigProblems, lastAssistantText, sandboxPolicyProblems, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies,
+  codexCodeModeHostDisabled, codexLaunchArgs, codexProfileName, codexProfileToml, codexSandboxPolicies, codexUserConfigProblems, lastAssistantText, sandboxPolicyProblems, loopbackUrl, omnigentClient, runCodexSession, sessionFailureNote, sessionPolicies,
 } from '../orchestrate/lib/omnigent-runner.mjs';
 import { CHECKS, checkScript, enforcementFromItems, verdict } from '../orchestrate/step0-omnigent.mjs';
 import { startOmnigentStub } from './omnigent-stub.mjs';
@@ -60,6 +61,33 @@ process.exit(7);
   return bin;
 }
 
+function stubClaude(replies = [{ text: 'OK', status: 0 }]) {
+  const dir = fresh('claude-bin');
+  const bin = join(dir, 'claude');
+  const count = join(dir, 'calls');
+  writeFileSync(bin, `#!/usr/bin/env node
+const fs = require('node:fs');
+const replies = ${JSON.stringify(replies)};
+const countFile = ${JSON.stringify(count)};
+const n = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8')) : 0;
+fs.writeFileSync(countFile, String(n + 1));
+const reply = replies[Math.min(n, replies.length - 1)];
+process.stdout.write(reply.text + '\\n');
+process.exit(reply.status);
+`);
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+function stubCodex() {
+  const bin = join(fresh('codex-bin'), 'codex');
+  writeFileSync(bin, `#!/usr/bin/env node
+console.log(JSON.stringify({ codex: true, args: process.argv.slice(2), cwd: process.cwd() }));
+`);
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
 function homeWith(config) {
   const home = fresh('home');
   if (config !== null) { mkdirSync(join(home, '.omnigent')); writeFileSync(join(home, '.omnigent', 'config.yaml'), config); }
@@ -81,6 +109,16 @@ test('parseVersion reads the installed version', () => {
   assert.equal(parseVersion('omnigent 0.18.0\n'), '0.18.0');
   assert.equal(parseVersion('0.19.0.dev20261014'), '0.19.0.dev20261014');
   assert.equal(parseVersion('no version'), null);
+});
+
+test('Claude limit detection covers the subscription reset periods emitted by Claude Code', () => {
+  for (const text of [
+    "You've hit your weekly limit · resets Oct 20, 6am (Asia/Bangkok)",
+    'You have hit your daily limit',
+    'rate limit reached',
+    'credit balance too low',
+  ]) assert.match(text, CLAUDE_LIMIT, text);
+  assert.doesNotMatch('network connection failed', CLAUDE_LIMIT);
 });
 
 // ── bundle lint ──────────────────────────────────────────────────────────
@@ -241,12 +279,13 @@ test('cockpit start runs the coordinator from the workspace root with the allowl
     encoding: 'utf8',
     env: {
       PATH: process.env.PATH, HOME: home, ORCH_CLAUDE_PROJECT_SETTINGS: claudeSettingsFile(), ORCH_OMNIGENT_BIN: bin, ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }),
+      ORCH_CLAUDE_BIN: stubClaude(),
       ANTHROPIC_API_KEY: 'must-not-pass', OPENAI_API_KEY: 'must-not-pass', OMNIGENT_ANALYTICS: '1',
     },
   });
   assert.equal(result.status, 7, result.stderr);
   const seen = JSON.parse(result.stdout.trim().split('\n').at(-1));
-  assert.deepEqual(seen.args, ['run', 'ORCH-P/omnigent/orch-coordinator']);
+  assert.deepEqual(seen.args, ['run', 'ORCH-P/omnigent/orch-coordinator', '--model', 'claude-opus-5-5']);
   assert.equal(seen.cwd, join(REPO, '..'));
   assert.equal(seen.env.ANTHROPIC_API_KEY, undefined);
   assert.equal(seen.env.OPENAI_API_KEY, undefined);
@@ -254,6 +293,21 @@ test('cockpit start runs the coordinator from the workspace root with the allowl
   assert.equal(seen.env.OMNIGENT_ANALYTICS, '0');
   assert.equal(seen.env.DO_NOT_TRACK, '1');
   assert.equal(seen.env.OMNIGENT_NO_UPDATE_CHECK, '1');
+});
+
+test('cockpit check-config can pass offline while check refuses a missing daemon/API', () => {
+  const env = { PATH: process.env.PATH, HOME: homeWith('telemetry: false\n'),
+    ORCH_OMNIGENT_BIN: stubOmnigent('0.18.0'), ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }),
+    ORCH_OMNIGENT_URL: 'http://127.0.0.1:1', ORCH_OMNIGENT_HOST_RECORD: join(fresh('record'), 'missing.json') };
+  const cockpit = join(REPO, 'orchestrate', 'cockpit.mjs');
+  const config = spawnSync(process.execPath, [cockpit, 'check-config'], { env, encoding: 'utf8' });
+  assert.equal(config.status, 0, config.stderr);
+  assert.match(config.stdout, /runtime not checked/);
+  const runtime = spawnSync(process.execPath, [cockpit, 'check'], { env, encoding: 'utf8' });
+  assert.equal(runtime.status, 2, runtime.stderr);
+  assert.match(runtime.stderr, /no host record/);
+  assert.match(runtime.stderr, /API unavailable/);
+  assert.doesNotMatch(runtime.stdout, /host and API online/);
 });
 
 test('cockpit start reports Claude/Codex settings the session changed', () => {
@@ -267,7 +321,7 @@ require('node:fs').writeFileSync(process.env.HOME + '/.claude/settings.json', '{
 `);
   chmodSync(bin, 0o755);
   const r = spawnSync(process.execPath, [join(REPO, 'orchestrate', 'cockpit.mjs'), 'start'], {
-    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home, ORCH_CLAUDE_PROJECT_SETTINGS: claudeSettingsFile(), ORCH_OMNIGENT_BIN: bin, ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }) },
+    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: home, ORCH_CLAUDE_PROJECT_SETTINGS: claudeSettingsFile(), ORCH_OMNIGENT_BIN: bin, ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }), ORCH_CLAUDE_BIN: stubClaude() },
   });
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stderr, /changed ~\/\.claude\/settings\.json; review them/);
@@ -279,10 +333,42 @@ test('cockpit start reviewer starts the reviewer agent; other names are refused'
   };
   const cockpit = join(REPO, 'orchestrate', 'cockpit.mjs');
   const reviewer = spawnSync(process.execPath, [cockpit, 'start', 'reviewer'], { encoding: 'utf8', env });
-  assert.deepEqual(JSON.parse(reviewer.stdout.trim().split('\n').at(-1)).args, ['run', 'ORCH-P/omnigent/orch-reviewer']);
+  assert.deepEqual(JSON.parse(reviewer.stdout.trim().split('\n').at(-1)).args, ['run', 'ORCH-P/omnigent/orch-reviewer', '--model', 'claude-opus-5-5']);
   const other = spawnSync(process.execPath, [cockpit, 'start', 'polly'], { encoding: 'utf8', env });
   assert.equal(other.status, 2);
   assert.match(other.stderr, /unexpected arguments: polly/);
+});
+
+test('cockpit start coordinator automatically falls back to Codex when Claude is already limited', () => {
+  const result = spawnSync(process.execPath, [join(REPO, 'orchestrate', 'cockpit.mjs'), 'start'], {
+    encoding: 'utf8',
+    env: {
+      PATH: process.env.PATH, HOME: homeWith('telemetry: false\n'), ORCH_CLAUDE_PROJECT_SETTINGS: claudeSettingsFile(),
+      ORCH_OMNIGENT_BIN: stubOmnigent('0.18.0'), ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }),
+      ORCH_CLAUDE_BIN: stubClaude([{ text: "You've hit your weekly limit · resets Oct 20, 6am (Asia/Bangkok)", status: 1 }]), ORCH_CODEX_BIN: stubCodex(),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Claude is at its usage limit; starting the coordinator on Codex/);
+  const seen = JSON.parse(result.stdout.trim().split('\n').at(-1));
+  assert.equal(seen.codex, true);
+  assert.deepEqual(seen.args.slice(0, 6), ['-C', join(REPO, 'runs', 'proposals'), '-s', 'workspace-write', '-a', 'on-request']);
+  assert.ok(!result.stdout.split('\n').some((line) => line.startsWith('{') && line.includes('ORCH-P/omnigent/orch-coordinator')));
+});
+
+test('cockpit start coordinator falls back when Claude reaches the limit during a failed session', () => {
+  const result = spawnSync(process.execPath, [join(REPO, 'orchestrate', 'cockpit.mjs'), 'start'], {
+    encoding: 'utf8',
+    env: {
+      PATH: process.env.PATH, HOME: homeWith('telemetry: false\n'), ORCH_CLAUDE_PROJECT_SETTINGS: claudeSettingsFile(),
+      ORCH_OMNIGENT_BIN: stubOmnigent('0.18.0'), ORCH_OMNIGENT_BUNDLE: bundleCopy({ pin: approved }),
+      ORCH_CLAUDE_BIN: stubClaude([{ text: 'OK', status: 0 }, { text: 'rate limit reached', status: 1 }]), ORCH_CODEX_BIN: stubCodex(),
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /ORCH-P\/omnigent\/orch-coordinator/);
+  assert.match(result.stdout, /"codex":true/);
+  assert.match(result.stderr, /Claude is at its usage limit; starting the coordinator on Codex/);
 });
 
 test('cockpit start refuses with exit 2 on an unapproved bundle', () => {
@@ -301,6 +387,21 @@ test('loopbackUrl accepts only http on loopback', () => {
   for (const bad of ['http://0.0.0.0:6767', 'http://192.168.1.2:6767', 'https://127.0.0.1:6767', 'http://omnigent.example', 'nonsense']) {
     assert.throws(() => loopbackUrl(bad), /loopback|invalid/, bad);
   }
+});
+
+test('hub API requests time out instead of hanging an unattended flow', async () => {
+  const client = omnigentClient('http://127.0.0.1:6767', { timeoutMs: 10,
+    fetchImpl: (_url, { signal }) => new Promise((_resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout did not abort')), 1000);
+      signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    }) });
+  await assert.rejects(client.agents(), { name: 'TimeoutError' });
+});
+
+test('failed session diagnostics expose quota errors without exposing secret-like values', () => {
+  assert.match(sessionFailureNote({ last_task_error: { message: "You've hit your usage limit; try again at 6:36 PM" } }), /usage limit/);
+  assert.equal(sessionFailureNote({}), 'session failed');
+  assert.match(sessionFailureNote({ last_task_error: { message: `ghp_${'x'.repeat(36)}` } }), /withheld/);
 });
 
 test('codex launch args carry the Step 0 profile, no prompts, a filtered environment, the task model and effort, and no bypass', () => {
@@ -335,10 +436,27 @@ test('a Codex user config that would start processes or swap the profile in the 
   for (const what of [/mcp_servers/, /notify/, /hooks/, /profiles/, /sandbox or approval/, /model provider/]) assert.ok(all.some((p) => what.test(p)), String(what));
 });
 
+test('a hub config explicitly disabling the code-mode execution host is detected', () => {
+  assert.equal(codexCodeModeHostDisabled('[features]\ncode_mode_host = false\n'), true);
+  assert.equal(codexCodeModeHostDisabled('[features]\ncode_mode_host = true\n'), false);
+  assert.equal(codexCodeModeHostDisabled('model = "m"\n'), false);
+});
+
 const sessionArgs = (stub, extra = {}) => ({
   client: omnigentClient(stub.url), agentName: 'codex-native-ui', worktree: '/w/T-be', title: 'T · be · implement #1',
   launchArgs: ['-c', 'default_permissions="orch"'], policies: sessionPolicies('/w/T-be'), prompt: 'do the task',
   timeoutMs: 5_000, pollMs: 5, startGraceMs: 2_000, ...extra,
+});
+
+test('an idle session with a blocked implementation report fails with its reason', async () => {
+  const stub = await startOmnigentStub({ afterMessage: ({ items }) => {
+    items.at(-1).content[0].text = JSON.stringify({ status: 'blocked', summary: 'code-mode host is disabled' });
+  } });
+  try {
+    const result = await runCodexSession(sessionArgs(stub));
+    assert.equal(result.status, 1);
+    assert.match(result.note, /implementer blocked: code-mode host is disabled/);
+  } finally { await stub.close(); }
 });
 
 test('a session is created on the worktree, guarded before the prompt, and exported when idle', async () => {
@@ -437,6 +555,56 @@ test('timeout and abort interrupt the session', async () => {
 });
 
 // ── O1 API probe ─────────────────────────────────────────────────────────
+test('health requires a live recorded daemon, reachable API, selected agent and online host', async () => {
+  const home = homeWith('telemetry: false\n');
+  writeFileSync(join(home, '.omnigent', 'host.pid'), String(process.pid));
+  const record = join(home, 'host.json');
+  writeFileSync(record, JSON.stringify({ pid: process.pid, env: { ...OMNIGENT_OPT_OUTS, CODEX_HOME: '/hub' } }));
+  const stub = await startOmnigentStub();
+  try {
+    const options = { home, record, url: stub.url };
+    assert.deepEqual(await healthProblems(options), []);
+    assert.match((await healthProblems({ ...options, record: join(home, 'missing') })).join('\n'), /no host record/);
+    assert.match((await healthProblems({ ...options, agentName: 'missing' })).join('\n'), /no Omnigent agent named missing/);
+    assert.match((await healthProblems({ ...options, hostId: 'offline' })).join('\n'), /not online/);
+    assert.deepEqual(await healthProblems({ ...options, hostId: 'host_1' }), []);
+    assert.match((await healthProblems({ ...options, fetchImpl: async () => { throw new Error('offline'); } })).join('\n'), /API unavailable/);
+    assert.match((await healthProblems({ ...options, timeoutMs: 10, fetchImpl: (_url, { signal }) => new Promise((_resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout did not abort')), 1000);
+      signal.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    }) })).join('\n'), /API unavailable/);
+    assert.ok(stub.requests.every((r) => r.method === 'GET'));
+  } finally { await stub.close(); }
+});
+
+test('coordinator Codex opens a persistent Web UI chat restricted to proposals; bad sandbox closes it', async () => {
+  for (const unsafe of [false, true]) {
+    const workspace = fresh('coordinator-ws');
+    const stub = await startOmnigentStub();
+    try {
+      const options = { bundle: BUNDLE, workspace, home: fresh('coordinator-home'), url: stub.url, pollMs: 5,
+        inspectSandbox: async () => ({ policies: [unsafe ? 'DangerFullAccess' : 'WorkspaceWrite'] }) };
+      if (unsafe) await assert.rejects(startCoordinatorCodexSession(options), /sandbox not verifiable/);
+      else {
+        const result = await startCoordinatorCodexSession(options);
+        assert.equal(result.status, 0);
+        assert.ok(existsSync(join(result.evidence, 'session-items.jsonl')));
+        assert.ok(!stub.requests.some((r) => r.method === 'PATCH'), 'successful chat stays open');
+      }
+      const create = stub.requests.find((r) => r.method === 'POST' && r.path === '/v1/sessions').body;
+      assert.equal(create.workspace, join(workspace, 'ORCH-P', 'runs', 'proposals'));
+      assert.equal(create.title, 'ORCH-P · coordinator · Codex');
+      assert.ok(create.terminal_launch_args.includes('sandbox_workspace_write.network_access=false'));
+      const policies = stub.requests.filter((r) => r.path.endsWith('/policies'));
+      assert.equal(policies[0].body.factory_params.allowed_root, create.workspace);
+      const prompt = stub.requests.find((r) => r.body?.type === 'message').body.data.content[0].text;
+      assert.match(prompt, /cannot write ORCH-P\/runs\/requests/);
+      assert.match(prompt, /Do not write proposals, approve or execute any plan during initialization/);
+      if (unsafe) assert.ok(stub.requests.some((r) => r.method === 'PATCH' && r.body.archived));
+    } finally { await stub.close(); }
+  }
+});
+
 test('probe-api records the real response shapes and checks the Codex agent and host', async () => {
   assert.deepEqual(shapeOf({ data: [{ id: 'a', n: 1, x: null }], has_more: false }), { data: [{ id: 'string', n: 'number', x: 'null' }], has_more: 'boolean' });
   let stub = await startOmnigentStub();
@@ -496,7 +664,7 @@ test('coordinator-codex: the coordinator prompt on Codex, writable only in runs/
   assert.equal(command, 'codex');
   assert.equal(cwd, '/ws/ORCH-P/runs/proposals');
   assert.deepEqual(args.slice(0, 6), ['-C', '/ws/ORCH-P/runs/proposals', '-s', 'workspace-write', '-a', 'on-request']);
-  const prompt = args[6];
+  const prompt = args.at(-1);
   assert.match(prompt, /^You are the ORCH-P coordinator/);
   assert.match(prompt, /cannot write ORCH-P\/runs\/requests/);
   assert.match(prompt, /autopilot\.mjs run <plan path>/);

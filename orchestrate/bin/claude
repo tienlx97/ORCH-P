@@ -1,0 +1,6 @@
+#!/usr/bin/env node
+// Only the Omnigent host's PATH includes this directory.
+import('../lib/claude-hub.mjs').then(({ launchClaude }) => launchClaude(process.argv.slice(2))).catch((error) => {
+  process.stderr.write(`ORCH Claude launcher refused: ${error.message}\n`);
+  process.exitCode = 2;
+});

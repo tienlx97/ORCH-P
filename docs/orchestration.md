@@ -3,7 +3,7 @@
 Codex implements one side of an approved task in an isolated Git worktree; the existing
 BE/FE gates verify it; Claude Code reviews it; a human pushes and merges. **Omnigent is the hub**
 where the agents run, are coordinated and share their history ([Omnigent hub](#omnigent-hub),
-[evaluation](omnigent-evaluation.md); pinned, not installed until O1 is approved). ORCH-P stays
+[evaluation](omnigent-evaluation.md); installed and approved at the pinned version). ORCH-P stays
 the policy and gate engine: sandbox profile, approvals, scope, gates, evidence. Ruflo is
 [not adopted](ruflo-evaluation.md). Policy: [BE-P coordination](../../BE-P/docs/coordination/README.md).
 
@@ -23,9 +23,10 @@ siblings; override with `ORCH_BE_REPO` / `ORCH_FE_REPO`). Run state goes to `ORC
 |---|---|---|
 | `validate` | Prints the resolved plan (bases, model, effort) | Task not approved; base not a full SHA that is a commit; model/effort not in `codex debug models` |
 | `prepare` | Worktree per side at `base_revision` on `agent/<id>-<side>` under `~/orch-worktrees`; BE package restore for offline builds (`run-gate.mjs restore`, below); FE `pnpm install --frozen-lockfile --prefer-offline` | Already prepared; worktree path or branch exists |
-| `implement` | `runner: omnigent` (default): a Codex session in Omnigent ([below](#omnigent-hub)); `runner: codex-exec`: `codex exec` directly. Both use the generated sandbox profile, model, effort and a prompt from `prompt.md` + task fields + pending rework findings; `codex-exec` also gets the allowlisted environment and private `TMPDIR` | Step 0 not READY; task file edited since prepare; secret-like text in the prompt; `codex`, `node` or (BE) `dotnet` resolves under a path the profile denies; `omnigent`: pin not approved, server not loopback, Step 0 through Omnigent not READY for these versions, `~/.codex/config.toml` with MCP servers, notify, hooks, profiles, sandbox/approval settings or a model provider |
+| `implement` | `runner: omnigent` (default): a Codex session in Omnigent; `runner: codex-exec`: `codex exec` directly. Uses model, effort, private `TMPDIR` and a prompt from task fields and pending findings. Sandbox follows the active [defaults decision](#omnigent-defaults), or the generated profile when that risk is removed | Task changed since prepare; secret-like prompt; pin not approved; server not loopback; host/config unsuitable. Without `orch-defaults`: Step 0 reports not accepted, hidden toolchain or forbidden hub settings |
 | `check` | Changed paths ⊆ `allowed_paths`, no protected paths, secret scan of diff and new files; binds the result to the tree hash | — (fails with exit 1) |
 | `verify` | The repository's own gate in a verification container (`verify-container/run-gate.mjs`), FE `task.mjs status`; preserves evidence and the container record; binds both to the tree hash. A failed gate (not exit 70) records its findings as rework: run `implement`, `check`, `verify` again on the same worktree | `check` did not pass, or the tree changed since `check` |
+| `browser-verify` | FE `browser:` criteria in a separate verifier session; preserves observations, browser transcript and screenshots on the exact gated tree. Codex uses agent-browser; Claude uses claude-in-chrome | Gate missing/stale; missing approved browser target; occupied port; incomplete checks, missing screenshot/tool calls, unsafe environment, source/metadata changes |
 | `commit` | Local commit with `Verified-Tree` / `Verification-Evidence` trailers | Gate not passed; evidence missing; tree changed since verification |
 | `test` | `test <task> be --project tests/<path>.csproj [--filter <expr>]`: one BE test project of the committed worktree, offline restore + `dotnet test` in a gate container with network none (`run-gate.mjs test`); for the reviewer. Changes no task state; log in `runs/orch-<ID>/be-test-<ts>/` | Side not `be`; no verified commit, HEAD not that commit or uncommitted changes; no prepare packages; restore inputs changed from the base; project or filter outside the allowed shape |
 | `contract` | Disabled: the contract-read check would build and serve agent code on the host. A task with `contract_check: true` cannot reach `ready_for_human_merge`; run [pilot.md](../../BE-P/docs/coordination/pilot.md) manually after review | Always |
@@ -51,8 +52,9 @@ restore of the gate's step 1, on the base revision's restore inputs (refused if 
 before any agent code exists. Packages go to `<id>-be-tmp/nuget`, mounted at the same absolute
 path so `obj/project.assets.json` is valid on the host. Inside the sandbox Codex compiles with
 `dotnet build --no-restore -m:1 -nodeReuse:false` (parallel MSBuild nodes fail there with no error
-listed). `dotnet test` cannot run in the sandbox: the vstest host needs a loopback socket and the
-sandbox has no network at all; tests run only in the gate. The package dir is writable by Codex,
+listed). Without `orch-defaults`, `dotnet test` cannot run in the sandbox: vstest needs a
+loopback socket. With the accepted defaults it can run; the container gate still decides
+verification. The package dir is writable by Codex,
 like its `TMPDIR`; nothing outside the sandbox uses it (the gate restores into its own scratch
 dir). A failed restore does not stop `prepare`; the prompt then says compiling is impossible.
 
@@ -60,8 +62,9 @@ dir). A failed restore does not stop `prepare`; the prompt then says compiling i
 
 What each agent is doing, while it does it, without giving observers raw model output. With
 Omnigent as the hub, **the Omnigent web UI is the live view**: every Codex implementer, the
-coordinator and the reviewer are sessions there, with their conversation, tool calls, files and
-terminal, and that history is shared and kept. ORCH-P keeps its own sanitized state for `status`
+coordinator and the reviewer normally have sessions there, with conversation, tool calls,
+files and terminal. Legacy Claude FE implementer/browser CLI runs and hub-outage CLI fallbacks remain
+outside the UI; ORCH-P retains their evidence. ORCH-P keeps sanitized state for `status`
 and for agents that read it:
 
 ```text
@@ -103,73 +106,87 @@ prepare / check / verify / commit / review-record / cleanup ──► lifecycle 
 
 ## Omnigent hub
 
+`node orchestrate/cockpit.mjs check-config` validates the pin, installed version and telemetry
+configuration without requiring a running server. `node orchestrate/cockpit.mjs check` also
+checks the recorded daemon, live loopback API, configured Codex agent and online host, with a
+five-second API timeout. Start a missing daemon with `node orchestrate/cockpit.mjs host`.
+Both checks are read-only and make no model calls.
+
 ```text
-user ⇄ Omnigent web UI (127.0.0.1:6767) — every session below, live, with shared history
-  ├─ orch-coordinator (Claude)  plans, writes runs/proposals/<ID>.json, reads status
-  │      └─ runs/requests/<id>.json ──(ASK: user approves in the UI)──► orchestrate/runner.mjs
-  │                                                     └─► orchestrate.mjs prepare|implement|check|verify|commit|stop
-  ├─ <ID> · be|fe · implement #n (Codex)   created by `implement` with the Step 0 profile
-  └─ orch-reviewer (Claude)     git show/diff, writes runs/reviews/<ID>.json, runs review-record
-         └─ runs/test-requests/<id>.json ──(no ASK)──► runner ──► orchestrate.mjs test (gate container, offline)
-human: approves task files (status "approved") in the terminal; pushes and merges
+user ⇄ Omnigent web UI (127.0.0.1:6767)
+  ├─ orch-coordinator (Claude) / ORCH-P · coordinator · Codex
+  ├─ <ID> · be|fe · implement #n (Codex)
+  ├─ <ID> · browser verification · Codex
+  └─ orch-reviewer (Claude) / <ID> · review · Codex
+ORCH-P runner/autopilot: approval binding, prepare, implement, check, gate,
+                        browser verification, local commit, review, rework
+human: approves plans; pushes and merges
 ```
 
-- **Start:** `node orchestrate/cockpit.mjs start` (coordinator) or `start reviewer`, and
-  `node orchestrate/runner.mjs` in another WSL terminal. `cockpit.mjs` refuses until
-  `omnigent/pin.json` is approved, the installed version equals the pin and
-  `~/.omnigent/config.yaml` sets `telemetry: false`; it passes only an allowlisted environment
-  with `OMNIGENT_ANALYTICS=0`, `DO_NOT_TRACK=1`, `OMNIGENT_NO_UPDATE_CHECK=1`.
-- **Implementers.** `implement` (`runner: omnigent`) creates a top-level `codex-native-ui`
-  session through the loopback REST API (`ORCH_OMNIGENT_URL`, default `http://127.0.0.1:6767`;
-  anything else is refused) on the side's worktree, with launch args = the Step 0 permission
-  profile, `approval_policy="never"`, `shell_environment_policy.inherit="core"` (Codex filters
-  the daemon's environment for every command) with `TMPDIR` set to the run's private temp dir,
-  model and effort. It refuses if the server returns other launch args, and before that unless
-  `orchestrate/step0-omnigent.mjs` reported READY for the pinned Omnigent and the installed Codex
-  (the Step 0 checks, plus loopback to Omnigent, credential variables and the private TMPDIR,
-  run inside a real Omnigent Codex session). Session policies are attached before the prompt (writes only in the worktree,
-  no push or destructive command, tool cap, loop guard); any that fails stops the session. It
-  waits for the session to go idle (timeout → interrupt, 127; Ctrl-C / SIGTERM → interrupt, 128),
-  then exports the session history to the run directory (`session-items.jsonl`, `session.json`,
-  `last-message.md`, 0600), secret-scans it and checks Git metadata as for `codex exec`. **A
-  permission change made in the UI during the run** (the Codex approval-mode label or an
-  approval-mode-change item) **blocks the side**: the Step 0 profile no longer held. Sub-agent
-  dispatch is not used: Omnigent gives dispatched Codex workers a full bypass by default and
-  ignores custom launch args.
-- **Requests (`orchestrate/runner.mjs`).** The coordinator cannot run steps itself (its sandbox has
-  no worktrees, state or Docker). Its write to `runs/requests/<id>.json` triggers an ASK in the
-  UI; the runner, started by the user, runs approved requests: `prepare`, `implement`, `check`,
-  `verify`, `commit`, `status`, `stop`. Each request names the task file inside the workspace and
-  its `task_sha256` (printed by `validate`), which must still match; the task must be approved.
-  One step per task side at a time; `stop` sends SIGTERM to it. Results go to
-  `<id>.result.json` (exit code, sanitized output tail) and `audit.jsonl`. Never through a
-  request: approving or editing a task, `cleanup`, `review-record`, push, merge.
-  `runs/test-requests/` is a second directory the runner watches for the reviewer: it accepts
-  only `test` requests (`side: "be"`, `project`, optional `filter`, same `task_sha256` binding),
-  needs no ASK and may run while a plan runs, because a test run changes nothing and runs in a
-  gate container without network or credentials.
-- **Coordinator and reviewer** are `claude-native` sessions in Omnigent's `linux_bwrap` sandbox
-  ($HOME not mounted, workspace read-only, dot-paths masked); see `omnigent/*/config.yaml`.
-  Since 2026-10-15 they have no CEL tool allowlist (accepted risk `agent-no-cel`,
-  [why](omnigent-evaluation.md#no-cel-allowlist-for-the-bundle-agents)): like Omnigent's default
-  agents, Claude asks the user before every command or write that is not pre-approved, and the
-  prompt for a `runs/requests` write is the approval of that step or plan. Never approve
-  `curl`/`wget`/`nc` or a broad "always allow" for Bash there: the network is open and the
-  local Omnigent API can approve prompts. While the pin accepts `agent-prompt-preapproval`, `cockpit.mjs` (host, start, the
-  autopilot reviewer) installs `<workspace>/.claude/settings.json` from
-  `orchestrate/lib/omnigent.mjs` `claudeSettings`: Claude's own prompt is pre-answered for the
-  ORCH-P status/validate/review-record and autopilot check/status commands and for writes to
-  `runs/proposals`, `runs/reviews` and `runs/test-requests`. It never overwrites a settings file it did not write, and removes
-  its own copy when the risk is withdrawn. `cockpit.mjs lint` (in `harness/verify.sh`) rejects any bypass,
-  `sandbox: none`, other harnesses, sub-agents, credential pass-through, push/PR instructions,
-  a changed shell allowlist or write path, and unknown agents.
-- **O1 helpers:** `cockpit.mjs probe-api` records the real `/v1/agents` and `/v1/hosts` responses
-  (GET only). `cockpit.mjs start` warns when a session changed `~/.claude/settings*.json`,
-  `~/.codex/config.toml` or `~/.codex/hooks.json`.
-- **Status inside a sandbox** uses the cached Codex model catalog (`runs/model-catalog.json`,
-  written whenever `codex debug models` runs) because the `codex` binary is not visible there.
+- **Start:** `node orchestrate/cockpit.mjs up` starts or reuses the host and the background
+  request runner. `node orchestrate/cockpit.mjs ready` checks both, including the live API.
+  Then use `start` (coordinator) or `start reviewer`. The runner's status/log are available
+  through `node orchestrate/runner.mjs status` and `runs/requests/runner.log`; `runner.mjs stop`
+  stops it and its active steps. `runner.mjs` without arguments still runs in the foreground.
+  These processes survive closing the initiating terminal, but require `up` again after a
+  machine/WSL restart. The pin must be
+  approved, installed version must match, and telemetry must be disabled. The launch
+  environment is allowlisted with `OMNIGENT_ANALYTICS=0`, `DO_NOT_TRACK=1` and
+  `OMNIGENT_NO_UPDATE_CHECK=1`; API keys/gateways are not passed.
+- **Implementers:** ORCH-P creates top-level `codex-native-ui` sessions through the loopback
+  API (`ORCH_OMNIGENT_URL`, default `http://127.0.0.1:6767`). With `orch-defaults`, they use
+  workspace-write plus network/loopback. Without it, they require the generated Step 0
+  profile and accepted reports for the installed versions. Every session receives a model,
+  effort, private `TMPDIR` and filtered command environment. Worktree, push, tool-cap and
+  loop policies are attached before the prompt. Changed launch arguments, missing policies,
+  permission-change events or an unverifiable/widened logged sandbox block the run. ORCH-P
+  exports and secret-scans session history and checks source scope and Git metadata. Timeout
+  interrupts with exit 127; user interruption returns 128. Native sub-agent dispatch is not
+  used because it ignores custom launch arguments and defaults to a wider sandbox.
+- **Requests:** Write/Edit of `runs/requests/<id>.json` asks for approval in Claude's UI. The
+  runner binds requests to task/plan SHA-256, checks task approval and permits one step per
+  side at a time. Results and sanitized output are retained with an audit line. Request
+  commands cannot approve or edit tasks, record reviews, push or merge. The reviewer may
+  use `runs/test-requests/` for offline BE tests inside a gate container, without another ASK.
+- **Claude bundle agents:** `linux_bwrap` mounts the workspace read-only except their listed
+  `runs/` paths, plus Claude state and Omnigent runtime paths. The active `agent-no-cel` and
+  `agent-autonomous` decisions remove CEL and pre-approve Bash/reads/MCP tools. A Write/Edit
+  prompt is therefore not an OS boundary: shell writes can reach writable request paths, and
+  other HTTP clients can reach the unauthenticated loopback API. These are recorded accepted
+  risks; plan digests still bind the selected task content. `cockpit` synchronizes only its
+  own workspace Claude settings and refuses to overwrite custom settings. Bundle lint keeps
+  the sandbox, default permission mode, policies and paths consistent with the pin.
+- **Codex coordinator:** fallback initialization opens a persistent hub session with workspace
+  `runs/proposals`, network disabled, on-request approvals and the same four session policies.
+  Initialization verifies the logged sandbox and scans evidence under `runs/coordinator/`.
+  Continue the chat in the Web UI. It cannot write requests; the user approves a plan by
+  typing `autopilot.mjs run <plan>`. A hub unavailable before initialization uses the existing
+  CLI. Failures after attempting hub initialization stop and close the attempted session.
+- **Visibility:** New Claude FE/browser proposals use native hub sessions; older CLI tasks
+  retain their transport. Codex reviewer
+  has a read-only CLI fallback for hub failures. These runs retain ORCH-P evidence even when
+  no live Omnigent chat exists. Autopilot tasks execute sequentially; parallel plan scheduling
+  is not enabled.
+- **Diagnostics:** `cockpit.mjs probe-api` records real agent/host response shapes using GETs
+  only. `cockpit.mjs start` warns about changed personal Claude/Codex settings. Sandboxed
+  status commands use the cached model catalog at `runs/model-catalog.json`.
 
 ## Autopilot
+
+For a task that already has explicit user approval and fixed base revisions, run
+`node orchestrate/autopilot.mjs task <approved-task.json>`. This continues the existing
+task through implementation, scope checks, the isolated repository gate, browser verification,
+local commit and independent review, including at most two rework rounds. It does not approve
+proposals or modify the approved file. The generated single-task schedule binds that file's
+hash; changing it requires a new approved task id. Its printed progress-file path also works
+with `autopilot.mjs status` and `wait`. Re-running the command resumes the same schedule.
+
+Known Claude quota exhaustion is checked before starting the long-lived reviewer; only a
+positive quota result selects the accepted Codex review fallback. Other provider failures
+still stop. A prior security/scope block cannot be skipped by automatic resume or commit.
+Diagnose it first, retain the failed evidence, then run a clean implementation and checks.
+The automatic flow ends at `ready_for_human_merge`; push, merge and deployment remain human
+actions under the workspace policy.
 
 The default flow: the user handles the spec, ORCH-P does the rest.
 
@@ -179,7 +196,7 @@ user ──► debby (/debate) ──► spec ──► coordinator: compares wi
 user: approves the plan ONCE (the ASK for the "autopilot" request; or `autopilot.mjs run` in a terminal)
 runner ──► orchestrate/autopilot.mjs, per task in plan order:
   prepare → per side implement → check → verify ─gate findings→ implement (≤ max_rework)
-          → commit → orch-reviewer session (started by autopilot) → review-record
+          → browser-verify (FE browser: criteria) → commit → reviewer → review-record
           ─rework_required→ implement … commit → review again (≤ max_rework rounds)
 user: pushes and merges the branches in order (ORCH-P never does)
 ```
@@ -196,7 +213,9 @@ user: pushes and merges the branches in order (ORCH-P never does)
   naming the plan digest and how it was approved), and every step runs on that copy, so
   `prepare` binds its digest as for a hand-approved task. A proposal that is already
   `approved` (with full bases) is used as it is. A changed plan is refused once its run exists:
-  use a new plan id.
+  use a new plan id. Task ids are single-run identities: a new plan cannot reuse an id that was
+  already prepared unless it is resuming the exact approved task copy whose digest created that
+  run state. Resume a stopped plan with the original plan; use new task ids for genuinely new work.
 - **Steps** are the same `orchestrate.mjs` commands, unchanged: the sandbox profile, Step 0,
   scope check, containerized gate, commit binding and review provenance all apply. The
   reviewer is `orch-reviewer` started through `cockpit.mjs` (`omnigent run … -p "Review task
@@ -227,7 +246,8 @@ user: pushes and merges the branches in order (ORCH-P never does)
 
 ## FE implementer (Claude)
 
-FE tasks run on Claude Code with Claude in Chrome (`"runner": "claude"`, a Claude model id such as
+FE tasks run on Claude Code with Claude in Chrome (`"runner": "claude"`, optional
+`"claude_transport": "omnigent"` for Web UI sessions, a Claude model id such as
 `claude-opus-5-5`, effort low…max); BE tasks stay on Codex. Accepted risk `fe-claude-chrome`
 (omnigent/pin.json) is required.
 
@@ -271,6 +291,10 @@ defaults so agents can use as much as possible.
 - Kept: Omnigent session policies (worktree guard, push gate, tool cap, loop guard), the
   environment allowlist, scope check, Git metadata check, containerized gate, commit binding and
   review. Remove the pin entry to go back to the ORCH-P profile and Step 0.
+- The Omnigent host's private Codex config must not disable `features.code_mode_host`; current
+  Codex models otherwise have no repository execution tool. `cockpit host` and `implement`
+  refuse that configuration before starting a run. The session sandbox and all Omnigent
+  policies above still apply.
 
 ## Claude fallback to Codex
 
@@ -280,10 +304,106 @@ When Claude is out of tokens (usage, rate or spend limit: `lib/claude-limit.mjs`
 |---|---|---|
 | FE implementer | Claude Code + Chrome (`runner: claude`) | the task's `fallback` (`{runner, model[, effort]}`, a Codex model, checked against the catalog): `implement` records the Claude attempt and runs Codex on the same worktree, told to read the partial changes first. No `fallback` → implement fails and says so. |
 | BE implementer | Codex | — |
-| Reviewer | orch-reviewer (Claude) | when the reviewer session ends twice without a review or times out, autopilot asks Claude for one word; only a usage-limit answer switches to `orchestrate.mjs review-codex <task>`: `codex exec -s read-only` in the workspace root answers with the review (review.schema.json), ORCH-P records it with provenance `reviewer: codex-fallback`. Accepted risk `codex-review-fallback`. |
-| Coordinator | orch-coordinator in Omnigent (Claude) | started by hand: `node orchestrate/cockpit.mjs coordinator-codex` runs interactive `codex` with the coordinator prompt, writable only in `runs/proposals`. It cannot write a request, so it gives the user `autopilot.mjs run <plan>` to type (the approval). |
+| Reviewer | orch-reviewer (Claude) | when the reviewer session ends twice without a review or times out, autopilot asks Claude for one word; only a usage-limit answer switches to `orchestrate.mjs review-codex <task>`. Codex reviews in a new read-only Omnigent session visible as `<task id> · review · Codex`; when the hub is unavailable or the session fails, read-only `codex exec` in ORCH-P backs it up. ORCH-P validates review.schema.json and commit binding and records provenance `reviewer: codex-fallback`, runner and session ID. Accepted risk `codex-review-fallback`. |
+| Coordinator | orch-coordinator in Omnigent (Claude) | `cockpit.mjs start coordinator` probes Claude before starting and again after an unsuccessful exit. Only a confirmed usage/rate/spend limit switches to Codex. With a healthy hub, Codex opens a persistent `ORCH-P · coordinator · Codex` chat on the Web UI, restricted to `runs/proposals` with network disabled. If the hub is unavailable before initialization, the CLI remains available. Hub initialization/security failures stop. The user approves by typing `autopilot.mjs run <plan>`. `cockpit.mjs coordinator-codex` starts the same path manually. |
+
+## Agent configuration
+
+Edit `omnigent/agents.json` for role defaults. It controls coordinator/reviewer Claude models,
+the coordinator Codex fallback model/effort, BE/FE implementer runner/model/timeout, FE Claude
+transport and Codex fallback, reviewer timeout/fallback and browser timeout. Implementer
+reasoning effort defaults by complexity; explicit values in a proposal override defaults.
+Claude coordinator/reviewer effort remains their native harness default because Omnigent
+0.18.0's `run` command does not expose an effort option; this file does not claim to set it.
+Sandbox controls, permission modes, credentials and billing/provider routing are not settings
+in this file. `cockpit lint` validates it with the bundle.
+
+```bash
+node orchestrate/agents.mjs show
+node orchestrate/agents.mjs template fe
+node orchestrate/agents.mjs resolve runs/proposals/NEW-TASK.json
+```
+
+`resolve` prints a proposal with explicit side settings and a `review_config` snapshot. It
+refuses approved tasks. Save that JSON as the proposal before computing its plan digest.
+Changing defaults then affects new proposals and new coordinator sessions; approved side and
+review snapshots keep their values. Existing tasks without snapshots retain their legacy
+reviewer defaults and transport. `ORCH_REVIEW_CODEX_MODEL` remains an explicit operator override.
+
+### Claude FE/browser transport
+
+New FE templates explicitly set `claude_transport: omnigent`; legacy tasks without this field
+keep `cli`. Both transports use the same Claude settings and `fe-claude-chrome` accepted risk.
+The native path creates separately titled implementer/browser sessions visible on the Web UI.
+Start/restart the host through `cockpit host` to install its first-party PATH wrapper. The
+wrapper merges ORCH restrictions after the Omnigent bridge settings, preserves native hooks,
+denies extra Omnigent MCP tools and project MCP auto-approval, sets only approved per-run environment fields, and emits
+an attestation. Missing/mutated settings, permission switches, sandbox warnings, secret hits,
+invalid reports and source/Git metadata changes stop execution; they do not trigger a less
+restricted CLI retry. A verified quota failure may use the task's Codex fallback.
+
+Browser screenshots come from matching successful Chrome image tool results in the native
+transcript. An optional approved `browser.check_command` argv can run fixture setup/browser
+checks after server startup, using only the run's browser session, artifact directory and
+approved loopback origin. It never supplies real account credentials or authorizes production
+writes. Source, gate/tree, screenshots, report digest, commit binding and review requirements
+are the same as for the CLI transport.
 
 ## Task file
+
+### Browser verification
+
+An FE acceptance criterion prefixed `browser:` requires a real browser check after the repository
+gate, before commit and review. The task's approved FE spec supplies:
+
+```json
+"browser": {
+  "url": "http://127.0.0.1:3101/test-page",
+  "start_command": ["pnpm", "dev", "-p", "3101", "--hostname", "127.0.0.1"],
+  "test_data_only": true
+}
+```
+
+The URL needs an explicit loopback port. The verifier starts this command inside the gated
+worktree's agent sandbox and stops its own server afterwards; an occupied port blocks the run
+to avoid checking somebody else's build. Use a fixture/test environment with no production/LAN
+dependencies. Credentials are never put in task files. Missing login/fixtures, mutating-data
+actions, unavailable browser tools or an unclosed server block verification.
+For a backend-backed fixture page, set optional `browser.api_base_url` to the approved local
+HTTP test backend (explicit port). Otherwise the server receives `API_BASE_URL=http://127.0.0.1:1`
+and must use frontend fixtures; browser verification never inherits the implementer's pilot backend.
+
+The provider follows the actual successful implementer (including Claude-to-Codex fallback):
+Codex gets a new Omnigent session `<task> · browser verification · Codex` with agent-browser's
+bundled core skill, a private named browser session and the accepted `orch-defaults` sandbox.
+Claude uses its approved native hub or `claude -p --chrome` transport with the same sandbox
+and accepted `fe-claude-chrome` risk;
+its screenshot image tool results are captured as image evidence. Claude quota errors may use
+the task's Codex fallback via Omnigent. Browser verification never weakens the read-only reviewer.
+
+Evidence is under `runs/orch-<task>/fe-browser-<timestamp>/`: report.json, raw tool events,
+screenshots, provider, session ID, verified tree and gate timestamp. Every browser criterion
+must appear exactly once with observations; all must pass, the correct browser tool must
+actually have been called, and at least one screenshot must exist. Source or Git metadata
+changes block the run. Commit and both review transports require current passing evidence and
+an unchanged report digest. Rework invalidates it; a repeated command reuses still-current evidence.
+
+Observed UI failures go back to implement/check/gate/browser within the shared gate/browser
+rework budget. Blocked/infrastructure failures stop without consuming further model rework.
+Older approved tasks with browser criteria but no browser configuration stop with instructions
+to propose a new task; never edit an already-approved task to add the target.
+
+The agent owns starting/stopping its dev server; ORCH-P checks the port before and after the run.
+These checks and the unchanged source tree bind the intended build but are not an OS-level
+attestation of the page served. Screenshots may contain test data: do not capture secrets or
+use production accounts. No browser call is made by the stub-based unit tests.
+
+Codex review output and session evidence are saved under `runs/orch-<task>/review-codex-*/`.
+Both review transports use the same JSON schema and verified commit checks. Blocking findings
+require rework even with an `accept` verdict. Invalid JSON, changed permissions, an unverified
+read-only sandbox, secret hits or a mismatched commit stop the review without transport fallback.
+An interrupted review is not retried. `ORCH_REVIEW_CODEX_MODEL` overrides the task's Codex model;
+`ORCH_OMNIGENT_CODEX_AGENT` selects the hub agent (default `codex-native-ui`).
 
 See `orchestrate/task.example.json`. `status` must be `approved` with an
 `approval.source`; `base_revision.be` / `.fe` are full commit SHAs (branch names and short
@@ -355,8 +475,8 @@ capabilities (internal network only). Container isolation depends on the local D
 
 ## Step 0
 
-`node orchestrate/step0-probe.mjs` must report READY (`runs/orch-step0/report.json`)
-before `implement` runs. It probes, without a model, the built-in `:workspace` baseline and the
+Without the accepted risk `orch-defaults`, `node orchestrate/step0-probe.mjs` must report READY
+(`runs/orch-step0/report.json`) before `implement` runs. It probes, without a model, the built-in `:workspace` baseline and the
 generated profile in a real BE-P worktree (writes, Git metadata, network, Docker, other
 processes' environment, Windows drives, credential files, canaries), checks that `codex`, `node`
 and `dotnet` on PATH resolve outside every denied path (Codex re-executes itself inside the

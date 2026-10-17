@@ -10,7 +10,7 @@ import { dirname, join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { acquireLock, brief, checkPlan, commandOf, nextStep, progressOf, runPlan, waitPlan } from '../orchestrate/autopilot.mjs';
+import { acquireLock, brief, checkPlan, commandOf, nextStep, progressOf, runApprovedTask, runPlan, waitPlan } from '../orchestrate/autopilot.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT_PARENT = process.env.ORCH_TEST_ROOT ?? join(HERE, '..', 'runs');
@@ -31,7 +31,7 @@ const sha = (text) => createHash('sha256').update(text).digest('hex');
 const STUB = `
 const fs = require('node:fs'); const path = require('node:path');
 const [cmd, file, side] = process.argv.slice(2);
-const task = JSON.parse(fs.readFileSync(file, 'utf8'));
+const raw = fs.readFileSync(file); const task = JSON.parse(raw);
 const dir = path.join(process.env.ORCH_STATE_ROOT, 'orch-' + task.id); const f = path.join(dir, 'state.json');
 const at = () => new Date(Date.now() + (globalThis.n = (globalThis.n || 0) + 1)).toISOString();
 if (cmd === 'review-codex') {
@@ -41,14 +41,14 @@ if (cmd === 'review-codex') {
 }
 if (cmd === 'prepare') {
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(f, JSON.stringify({ id: task.id, base: task.base_revision, review: null,
+  fs.writeFileSync(f, JSON.stringify({ id: task.id, task_digest: require('node:crypto').createHash('sha256').update(raw).digest('hex'), base: task.base_revision, review: null,
     sides: Object.fromEntries(Object.keys(task.sides).map((s) => [s, { branch: 'agent/' + task.id.toLowerCase() + '-' + s, steps: {}, rework: [] }])) }));
   console.log('prepared'); process.exit(0);
 }
 const state = JSON.parse(fs.readFileSync(f, 'utf8')); const s = state.sides[side];
 const counter = path.join(dir, 'verify-count'); let exit = 0;
 // STUB_FIRST_<CMD>=<exit>[:message]: the first run of that command exits so, then it behaves.
-const once = process.env['STUB_FIRST_' + cmd.toUpperCase()]; const mark = path.join(dir, 'first-' + cmd);
+const once = process.env['STUB_FIRST_' + cmd.toUpperCase().replaceAll('-', '_')]; const mark = path.join(dir, 'first-' + cmd);
 if (once && !fs.existsSync(mark)) {
   fs.writeFileSync(mark, ''); const [code, ...msg] = once.split(':');
   if (Number(code) !== 2) { s.steps[cmd] = { exit: Number(code), at: at() }; fs.writeFileSync(f, JSON.stringify(state)); }
@@ -58,6 +58,14 @@ if (cmd === 'verify') {
   const n = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) : 0; fs.writeFileSync(counter, String(n + 1));
   exit = n < Number(process.env.STUB_GATE_FAILS || 0) ? 1 : 0;
   s.rework = [...s.rework.filter((x) => x.source !== 'gate'), ...(exit ? [{ source: 'gate', severity: 'blocking', summary: 'test failed' }] : [])];
+}
+if (cmd === 'browser-verify') {
+  const countFile = path.join(dir, 'browser-count');
+  const n = fs.existsSync(countFile) ? Number(fs.readFileSync(countFile, 'utf8')) : 0; fs.writeFileSync(countFile, String(n + 1));
+  const failed = n < Number(process.env.STUB_BROWSER_FAILS || 0);
+  s.steps.browser = { exit: failed ? 1 : 0, report_status: failed ? 'failed' : 'passed', at: at(), verify_at: s.steps.verify.at, tree: s.steps.verify.tree };
+  s.rework = failed ? [{ source: 'browser', severity: 'blocking', summary: 'UI defect' }] : [];
+  fs.writeFileSync(f, JSON.stringify(state)); console.log(failed ? 'UI defect' : 'browser passed'); process.exit(failed ? 1 : 0);
 }
 s.steps[cmd] = { exit, at: at(), ...(cmd === 'commit' ? { commit: require('node:crypto').createHash('sha1').update(task.id + Date.now() + Math.random()).digest('hex') } : {}) };
 fs.writeFileSync(f, JSON.stringify(state)); console.log(cmd + ' ' + side + ' exit ' + exit); process.exit(exit);
@@ -111,6 +119,38 @@ const opts = (env, extra = {}) => ({
   gateRunner: env.gateRunner, step0: env.step0,
   resolveRef: () => 'b'.repeat(40), reviewPollMs: 5, reviewTimeoutMs: 2000, log: () => {}, approval: 'test',
   claudeAvailable: async () => ({ ok: true, limited: false }), ...extra.opts,
+});
+
+test('automatic single-task continuation preserves approval and rejects proposals or changed tasks', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
+  const file = join(env.stateRoot, 'proposals', 'TASK-A.json');
+  const options = opts(env, { opts: { claudeAvailable: async () => ({ limited: true }) } });
+  assert.equal(await runApprovedTask(file, options), 2, 'a proposal cannot approve itself');
+  const task = JSON.parse(readFileSync(file));
+  task.status = 'approved';
+  task.approval = { approved_by: 'user', source: 'existing explicit approval' };
+  task.base_revision = { be: 'a'.repeat(40) };
+  writeFileSync(file, JSON.stringify(task));
+  const original = readFileSync(file, 'utf8');
+  assert.equal(await runApprovedTask(file, options), 0);
+  assert.equal(readFileSync(file, 'utf8'), original, 'approved input remains byte-identical');
+  assert.equal(await runApprovedTask(file, options), 0, 'completed continuation is idempotent');
+  task.sides.be.objective = 'changed after approval';
+  writeFileSync(file, JSON.stringify(task));
+  assert.equal(await runApprovedTask(file, options), 2);
+});
+
+test('unexpected reviewer transport errors settle the plan as stopped and release its lock', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
+  const options = opts(env, { opts: { startReviewer: async () => { throw new Error('hub unavailable'); } } });
+  assert.equal(await runPlan(env.planPath, options), 1);
+  const dir = join(env.stateRoot, 'autopilot', 'PLAN-T');
+  const state = JSON.parse(readFileSync(join(dir, 'state.json')));
+  assert.equal(state.status, 'stopped');
+  assert.match(state.stopped, /runtime error: hub unavailable/);
+  const release = acquireLock(dir);
+  assert.ok(release);
+  release();
 });
 
 test('checkPlan binds every proposal by sha256 and checks order, bases and task fields', () => {
@@ -177,9 +217,27 @@ test('the plan stops with a reason when the rework budget is spent, and a change
   assert.equal(rev.prompts.length, 0, 'nothing unverified reaches review');
   const plan = JSON.parse(readFileSync(env.planPath, 'utf8'));
   writeFileSync(env.planPath, JSON.stringify({ ...plan, max_rework: 2 }));
+  assert.ok(checkPlan(env.planPath, { workspace: env.ws, stateRoot: env.stateRoot }).problems.some((p) => /belongs to another version of the plan/.test(p)));
   const lines = [];
   assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: rev.start, log: (m) => lines.push(m) } })), 2);
   assert.match(lines.join('\n'), /another version of the plan/);
+});
+
+test('a new plan cannot reuse a task id that another approved task already prepared', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
+  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: reviewer(env.stateRoot, []).start } })), 0);
+
+  const original = JSON.parse(readFileSync(env.planPath, 'utf8'));
+  const next = join(dirname(env.planPath), 'P2.plan.json');
+  writeFileSync(next, JSON.stringify({ ...original, id: 'PLAN-U' }));
+  const checked = checkPlan(next, { workspace: env.ws, stateRoot: env.stateRoot });
+  assert.ok(checked.problems.some((p) => /task id TASK-A is already prepared from another approved task or plan; use a new task id/.test(p)), checked.problems.join(' | '));
+
+  const lines = [];
+  assert.equal(await runPlan(next, opts(env, { opts: { log: (line) => lines.push(line), startReviewer: reviewer(env.stateRoot, []).start } })), 2);
+  assert.match(lines.join('\n'), /task id TASK-A is already prepared from another approved task or plan/);
+  assert.ok(!existsSync(join(env.stateRoot, 'autopilot', 'PLAN-U')), 'the conflicting plan is refused before creating run state');
+  assert.deepEqual(checkPlan(env.planPath, { workspace: env.ws, stateRoot: env.stateRoot }).problems, [], 'the original plan can still resume');
 });
 
 test('a reviewer that records nothing is restarted once, then stops the plan', async () => {
@@ -204,6 +262,11 @@ test('a reviewer that records nothing is restarted once, then stops the plan', a
 test('nextStep resumes a side where its run stands', () => {
   const at = (n) => new Date(1_000_000 + n).toISOString();
   assert.equal(nextStep(undefined), 'implement');
+  assert.equal(nextStep({ status: 'blocked', steps: { implement: { exit: 0, at: at(1) } } }), 'blocked');
+  assert.equal(nextStep({ steps: { implement: { exit: 0, at: at(1), secret_hits: ['output:1'] } } }), 'blocked');
+  const reviewedTree = { implement: { exit: 0, at: at(1) }, check: { exit: 0, at: at(2) }, verify: { exit: 0, at: at(3) } };
+  assert.equal(nextStep({ steps: reviewedTree, rework: [{ source: 'operator-diagnostic', at: at(4) }] }), 'implement', 'new operator diagnosis requires rework before reusing a gate');
+  assert.equal(nextStep({ steps: reviewedTree, rework: [{ source: 'operator-diagnostic', at: at(0) }] }), 'commit', 'already-addressed diagnosis does not create a loop');
   assert.equal(nextStep({ steps: { implement: { exit: 0, at: at(1) } } }), 'check');
   assert.equal(nextStep({ steps: { implement: { exit: 0, at: at(1) }, check: { exit: 0, at: at(2) } } }), 'verify');
   const failed = { implement: { exit: 0, at: at(1) }, check: { exit: 0, at: at(2) }, verify: { exit: 1, at: at(3) } };
@@ -262,6 +325,27 @@ test('a task can carry its own rework budget', () => {
   assert.ok(checkPlan(env.planPath, { workspace: env.ws }).problems.some((p) => /tasks\[0\]\.max_rework/.test(p)));
 });
 
+test('browser verification runs after the FE gate and before commit/review; failure stops review', async () => {
+  const make = () => setup({ tasks: [{ id: 'TASK-UI', sides: ['fe'], base: { fe: 'main' }, extra: { sides: { fe: {
+    change: 'ui', objective: 'UI', model: 'm1', runner: 'codex-exec', allowed_paths: ['src/**'],
+    acceptance_criteria: ['browser: select a folder'], browser: { url: 'http://127.0.0.1:3101/test', start_command: ['pnpm', 'dev', '-p', '3101'], test_data_only: true },
+  } } } }] });
+  const env = make();
+  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: reviewer(env.stateRoot, []).start } })), 0);
+  const log = readFileSync(join(env.stateRoot, 'autopilot', 'PLAN-T', 'autopilot.log'), 'utf8');
+  assert.ok(log.indexOf('$ orchestrate verify ') < log.indexOf('$ orchestrate browser-verify '));
+  assert.ok(log.indexOf('$ orchestrate browser-verify ') < log.indexOf('$ orchestrate commit '));
+  const failed = make();
+  const rev = reviewer(failed.stateRoot, []);
+  assert.equal(await runPlan(failed.planPath, opts(failed, { env: { STUB_FIRST_BROWSER_VERIFY: '2:blocked' }, opts: { startReviewer: rev.start } })), 1);
+  assert.equal(rev.prompts.length, 0);
+  const rework = make();
+  assert.equal(await runPlan(rework.planPath, opts(rework, { env: { STUB_BROWSER_FAILS: '1' }, opts: { startReviewer: reviewer(rework.stateRoot, []).start } })), 0);
+  const reworkLog = readFileSync(join(rework.stateRoot, 'autopilot', 'PLAN-T', 'autopilot.log'), 'utf8');
+  assert.match(reworkLog, /browser failed, rework 1\/2/);
+  assert.equal((reworkLog.match(/\$ orchestrate implement /g) ?? []).length, 2);
+});
+
 test('wait reports a finished plan, and gives a just-approved plan time to start before reporting an old stop', async () => {
   const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
   assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: reviewer(env.stateRoot, []).start } })), 0);
@@ -312,11 +396,11 @@ test('wait returns early (exit 4) when the progress changes, after the gap', asy
   assert.ok(clock - Date.now() >= 170_000, 'not before the three-minute gap');
 });
 
-test('a reviewer that stops while Claude is at its usage limit is replaced by a Codex review', async () => {
+test('known Claude quota falls back before starting a long-lived reviewer; unrelated failures stop', async () => {
   const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
   const silent = async () => ({ exited: () => true, stop: () => {} });
   const limited = async () => ({ ok: false, limited: true });
-  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: silent, claudeAvailable: limited } })), 0);
+  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: async () => { throw new Error('quota-limited reviewer must not start'); }, claudeAvailable: limited } })), 0);
   assert.match(readFileSync(join(env.stateRoot, 'autopilot', 'PLAN-T', 'autopilot.log'), 'utf8'), /Claude is at its usage limit, Codex reviews instead/);
   const other = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
   const fine = async () => ({ ok: true, limited: false });

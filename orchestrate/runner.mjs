@@ -45,8 +45,54 @@ const STATE_ROOT = resolve(process.env.ORCH_STATE_ROOT ?? join(ORCH_REPO, 'runs'
 const CLI = resolve(process.env.ORCH_RUNNER_CLI ?? join(HERE, 'orchestrate.mjs'));
 const AUTOPILOT = resolve(process.env.ORCH_RUNNER_AUTOPILOT ?? join(HERE, 'autopilot.mjs'));
 
-export const RUNNER_COMMANDS = Object.freeze(['prepare', 'implement', 'check', 'verify', 'commit', 'test', 'status', 'stop', 'autopilot']);
-const SIDED = new Set(['implement', 'check', 'verify', 'commit', 'test', 'stop']);
+export function runnerStatus({ dir = join(STATE_ROOT, 'requests'), entry = fileURLToPath(import.meta.url) } = {}) {
+  const file = join(dir, '.runner.lock');
+  if (!existsSync(file)) return { ok: false, reason: 'request runner is not started' };
+  const pid = Number(readFileSync(file, 'utf8').trim());
+  if (!Number.isInteger(pid) || pid <= 1) return { ok: false, reason: 'invalid request runner lock' };
+  try { process.kill(pid, 0); } catch { return { ok: false, reason: 'request runner is no longer running', pid }; }
+  try {
+    const args = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+    if (args[1] !== entry) return { ok: false, reason: 'runner lock belongs to another process; inspect it before restarting', pid, conflict: true };
+  } catch { return { ok: false, reason: 'cannot verify request runner process', pid, conflict: true }; }
+  return { ok: true, pid, dir };
+}
+
+export async function startRunner({ dir = join(STATE_ROOT, 'requests'), entry = fileURLToPath(import.meta.url), env = process.env } = {}) {
+  if (resolve(dir) !== join(dirname(resolve(dir)), 'requests')) return { ok: false, reason: 'runner directory must be named requests' };
+  const current = runnerStatus({ dir, entry });
+  if (current.ok || current.conflict) return current;
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const log = join(dir, 'runner.log');
+  const fd = openSync(log, 'a', 0o600);
+  let child;
+  try { child = spawn(process.execPath, [entry], { cwd: ORCH_REPO, env: { ...env, ORCH_STATE_ROOT: dirname(resolve(dir)) }, detached: true, stdio: ['ignore', fd, fd] }); }
+  finally { closeSync(fd); }
+  let error = null;
+  child.on('error', (e) => { error = e; });
+  child.unref();
+  for (let i = 0; i < 50; i++) {
+    await new Promise((done) => setTimeout(done, 100));
+    const status = runnerStatus({ dir, entry });
+    if (status.ok) return { ...status, log };
+    if (error || child.exitCode !== null) break;
+  }
+  return { ok: false, reason: `request runner did not start; inspect ${log}` };
+}
+
+export async function stopRunner(options = {}) {
+  const status = runnerStatus(options);
+  if (!status.ok) return status;
+  process.kill(status.pid, 'SIGTERM');
+  for (let i = 0; i < 50; i++) {
+    await new Promise((done) => setTimeout(done, 100));
+    try { process.kill(status.pid, 0); } catch { return { ok: true, stopped: status.pid }; }
+  }
+  return { ok: false, reason: 'request runner did not stop within five seconds; inspect it locally' };
+}
+
+export const RUNNER_COMMANDS = Object.freeze(['prepare', 'implement', 'check', 'verify', 'browser-verify', 'commit', 'test', 'status', 'stop', 'autopilot']);
+const SIDED = new Set(['implement', 'check', 'verify', 'browser-verify', 'commit', 'test', 'stop']);
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 /** Validates one request; returns { request } or { error }. */
@@ -217,7 +263,13 @@ export class Runner {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  if (process.argv.length > 2) { console.error('usage: node orchestrate/runner.mjs'); process.exit(2); }
+  const command = process.argv[2];
+  if (command && ['start', 'status', 'stop'].includes(command) && process.argv.length === 3) {
+    const result = command === 'start' ? await startRunner() : command === 'stop' ? await stopRunner() : runnerStatus();
+    console.log(JSON.stringify(result, null, 2));
+    process.exit(result.ok ? 0 : 1);
+  }
+  if (process.argv.length > 2) { console.error('usage: node orchestrate/runner.mjs [start|status|stop]'); process.exit(2); }
   const runner = new Runner();
   const release = acquireRunnerLock(runner.dir);
   if (!release) {

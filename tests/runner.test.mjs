@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { acquireRunnerLock, Runner, validateRequest } from '../orchestrate/runner.mjs';
+import { acquireRunnerLock, Runner, runnerStatus, startRunner, stopRunner, validateRequest } from '../orchestrate/runner.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT_PARENT = process.env.ORCH_TEST_ROOT ?? join(HERE, '..', 'runs');
@@ -17,6 +17,23 @@ let root;
 
 before(() => { mkdirSync(ROOT_PARENT, { recursive: true }); root = mkdtempSync(join(ROOT_PARENT, '.runner-test-')); });
 after(() => rmSync(root, { recursive: true, force: true }));
+
+test('background runner starts once, reports its actual process and stops without touching other processes', async (t) => {
+  const stateRoot = mkdtempSync(join(root, 'service-'));
+  const dir = join(stateRoot, 'requests');
+  const options = { dir, env: { ...process.env, ORCH_STATE_ROOT: stateRoot } };
+  t.after(async () => { if (runnerStatus(options).ok) await stopRunner(options); });
+  assert.equal(runnerStatus(options).ok, false);
+  const started = await startRunner(options);
+  assert.equal(started.ok, true, started.reason);
+  assert.equal((await startRunner(options)).pid, started.pid);
+  assert.equal(runnerStatus(options).pid, started.pid);
+  assert.equal((await stopRunner(options)).ok, true);
+  assert.equal(runnerStatus(options).ok, false);
+  writeFileSync(join(dir, '.runner.lock'), String(process.pid));
+  assert.equal(runnerStatus(options).conflict, true);
+  assert.equal((await stopRunner(options)).ok, false);
+});
 
 function workspace({ status = 'approved' } = {}) {
   const ws = mkdtempSync(join(root, 'ws-'));

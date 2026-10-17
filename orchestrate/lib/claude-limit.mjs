@@ -1,9 +1,9 @@
 // Claude out of tokens (subscription usage limit, rate limit, spend limit):
-// the FE implementer and the reviewer fall back to Codex
+// the coordinator, FE implementer and reviewer fall back to Codex
 // (docs/orchestration.md#claude-fallback-to-codex).
 import { spawnSync } from 'node:child_process';
 
-export const CLAUDE_LIMIT = /usage (credit )?limit|limit reached|hit your (usage )?limit|rate[_ ]limit|out of (extra )?usage|spend limit|credit balance too low/i;
+export const CLAUDE_LIMIT = /usage (credit )?limit|limit reached|hit your (?:(?:usage|weekly|daily|monthly|session|plan) )?limit|rate[_ ]limit|out of (extra )?usage|spend limit|credit balance too low/i;
 
 /**
  * Whether Claude answers a one-word prompt now. `limited` is true only when the

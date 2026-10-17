@@ -14,7 +14,7 @@ import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import {
-  buildFilesystemPolicy, deniedBy, gateFindings, globToRegExp, hiddenToolchain, matchesAny, profileArgs, reviewProvenance,
+  buildFilesystemPolicy, deniedBy, gateFindings, gitMetadataDigest, globToRegExp, hiddenToolchain, matchesAny, profileArgs, reviewProvenance,
   sanitizedEnv, scanSecrets,
 } from '../orchestrate/orchestrate.mjs';
 
@@ -93,6 +93,9 @@ if (plan.hook) {
   const hooks = path.resolve(cwd, common, 'hooks'); fs.mkdirSync(hooks, { recursive: true });
   fs.writeFileSync(path.join(hooks, 'pre-commit'), '#!/bin/sh\\ntouch "$HOME/hook-ran"\\n', { mode: 0o755 });
 }
+if (plan.untrackedCache) {
+  require('child_process').execFileSync('git', ['-C', cwd, 'config', 'core.untrackedCache', 'true']);
+}
 for (const [file, content] of Object.entries(plan.write ?? {})) {
   fs.mkdirSync(path.dirname(path.join(cwd, file)), { recursive: true });
   fs.writeFileSync(path.join(cwd, file), content);
@@ -118,11 +121,12 @@ process.stdin.on('end', async () => {
   for (const [name, body] of Object.entries({
     git: `#!/usr/bin/env bash\necho "$*" >> "${join(root, 'git-calls.log')}"\nexec "${REAL_GIT}" "$@"\n`,
     gh: `#!/usr/bin/env bash\necho "$*" >> "${join(root, 'gh-calls.log')}"\nexit 1\n`,
+    'agent-browser': '#!/bin/sh\nexit 0\n',
     // Stays alive as the parent (no exec), so `claude` really is in the ancestry
     // even when the suite runs outside a Claude Code session (CI, containers).
     claude: `#!/usr/bin/env bash\n"$@"\nexit $?\n`,
   })) writeFileSync(join(bin, name), body);
-  for (const name of ['codex', 'git', 'gh', 'claude']) chmodSync(join(bin, name), 0o755);
+  for (const name of ['codex', 'git', 'gh', 'claude', 'agent-browser']) chmodSync(join(bin, name), 0o755);
   // Stub gate runner: same interface as verify-container/run-gate.mjs, but runs the
   // fake repository's verify.sh directly (no Docker in unit tests). Logs its arguments.
   writeFileSync(join(root, 'gate-runner.mjs'), `import { appendFileSync, writeFileSync } from 'node:fs';
@@ -372,6 +376,9 @@ test('runner claude: at the usage limit the task falls back to its Codex model o
   ctx.task.sides.fe = { ...ctx.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5', fallback: { runner: 'codex-exec', model: 'test-model' } };
   writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
   assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+  const prior = state(ctx);
+  prior.sides.fe.status = 'blocked'; // A previous gate failure must not suppress a safe provider fallback.
+  writeFileSync(join(ctx.ws, 'state', `orch-${ctx.task.id}`, 'state.json'), JSON.stringify(prior));
   const stub = join(root, 'claude-limited.cjs');
   writeFileSync(stub, `#!/usr/bin/env node
 process.stdin.resume(); process.stdin.on('data', () => {}); process.stdin.on('end', () => {
@@ -388,6 +395,8 @@ process.stdin.resume(); process.stdin.on('data', () => {}); process.stdin.on('en
   assert.equal(call.args[call.args.indexOf('-m') + 1], 'test-model');
   const s = state(ctx);
   assert.equal(s.sides.fe.steps.implement.runner, 'codex-exec');
+  assert.equal(s.sides.fe.status, 'in_progress', 'a clean new implementation clears the old attempt status');
+  assert.equal(JSON.parse(orch(ctx, ['status', ctx.taskFile]).stdout).sides.fe.live.provider, 'codex');
   assert.deepEqual(s.log.filter((e) => e.side === 'fe' && e.step === 'implement').map((e) => e.exit), [1, 0], 'the Claude attempt, then Codex');
   // Without a fallback the run fails and says so.
   const bare = setup();
@@ -561,23 +570,50 @@ test('review needs Claude Code provenance and matching commits; blocking finding
   const s = state(ctx);
   const commits = { be: s.sides.be.steps.commit.commit, fe: s.sides.fe.steps.commit.commit };
   const reviewFile = join(ctx.ws, 'review.json');
+  // Model a reviewer started by an independent service, with its own process
+  // ancestry. Merely clearing CODEX_* leaves the suite's real Codex ancestor.
+  const reviewerService = join(ctx.ws, 'reviewer-service.mjs');
+  writeFileSync(reviewerService, `
+import { spawn, spawnSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+const [mode, resultFile, ...args] = process.argv.slice(2);
+if (mode === 'launch') {
+  const child = spawn(process.execPath, [process.argv[1], 'run', resultFile, String(process.pid), ...args], { detached: true, stdio: 'ignore' });
+  child.unref();
+} else {
+  const parent = Number(args.shift());
+  for (let i = 0; process.ppid === parent && i < 200; i++) await new Promise(r => setTimeout(r, 10));
+  const result = spawnSync(args[0], args.slice(1), { encoding: 'utf8' });
+  writeFileSync(resultFile, JSON.stringify({ status: result.status, stdout: result.stdout, stderr: result.stderr }));
+}
+`);
   writeFileSync(reviewFile, JSON.stringify({ commits, verdict: 'accept', findings: [] }));
   let r = orch(ctx, ['review-record', ctx.taskFile, reviewFile], { CLAUDECODE: '' });
   assert.equal(r.status, 2, 'outside Claude Code refused');
   // Run under a process named `claude` with the Claude Code marker.
-  const viaClaude = (env = {}) => spawnSync(join(root, 'bin', 'claude'), [process.execPath, CLI, 'review-record', ctx.taskFile, reviewFile], {
-    encoding: 'utf8',
-    env: { ...GIT_ENV, PATH: `${join(root, 'bin')}:${process.env.PATH}`, HOME: join(root, 'home'), CLAUDECODE: '1',
-      ORCH_BE_REPO: ctx.be, ORCH_FE_REPO: ctx.fe, ORCH_WORKTREE_ROOT: join(ctx.ws, 'worktrees'), ORCH_STATE_ROOT: join(ctx.ws, 'state'),
-      ORCH_MODEL_CATALOG: join(root, 'catalog.json'), ...env },
-  });
+  let reviewCall = 0;
+  const viaClaude = (env = {}) => {
+    const resultFile = join(ctx.ws, `review-result-${++reviewCall}.json`);
+    const launched = spawnSync(process.execPath, [reviewerService, 'launch', resultFile, join(root, 'bin', 'claude'), process.execPath, CLI, 'review-record', ctx.taskFile, reviewFile], {
+      encoding: 'utf8',
+      // Model the separate service environment; explicit adversarial markers stay.
+      env: { ...Object.fromEntries(Object.entries(GIT_ENV).filter(([key]) => !key.startsWith('CODEX_'))), PATH: `${join(root, 'bin')}:${process.env.PATH}`, HOME: join(root, 'home'), CLAUDECODE: '1',
+        ORCH_BE_REPO: ctx.be, ORCH_FE_REPO: ctx.fe, ORCH_WORKTREE_ROOT: join(ctx.ws, 'worktrees'), ORCH_STATE_ROOT: join(ctx.ws, 'state'),
+        ORCH_MODEL_CATALOG: join(root, 'catalog.json'), ...env },
+    });
+    assert.equal(launched.status, 0, launched.stderr);
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(resultFile) && Date.now() < deadline) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    assert.ok(existsSync(resultFile), 'independent reviewer returned a result');
+    return JSON.parse(readFileSync(resultFile, 'utf8'));
+  };
   r = viaClaude({ CODEX_SANDBOX: 'x' });
   assert.equal(r.status, 2, 'codex marker refused');
   writeFileSync(reviewFile, JSON.stringify({ commits: { ...commits, be: 'f'.repeat(40) }, verdict: 'accept', findings: [] }));
   assert.equal(viaClaude().status, 2, 'wrong commit refused');
   writeFileSync(reviewFile, JSON.stringify({ commits, verdict: 'accept', findings: [{ severity: 'blocking', side: 'be', summary: 'bug' }] }));
   r = viaClaude();
-  assert.equal(r.status, 1);
+  assert.equal(r.status, 1, r.stderr);
   assert.equal(state(ctx).review.status, 'rework_required');
   assert.equal(JSON.parse(orch(ctx, ['status', ctx.taskFile]).stdout).overall, 'rework_required');
   writeFileSync(reviewFile, JSON.stringify({ commits, verdict: 'accept', findings: [{ severity: 'minor', summary: 'nit' }] }));
@@ -599,6 +635,7 @@ test('review-codex: Codex reviews read-only when the risk is accepted, and this 
   assert.equal(r.status, 0, r.stderr);
   const call = JSON.parse(readFileSync(join(root, 'home', 'codex-calls.jsonl'), 'utf8').trim());
   assert.equal(call.args[call.args.indexOf('-s') + 1], 'read-only');
+  assert.equal(call.args[call.args.indexOf('-C') + 1], join(dirname(CLI), '..'), 'review starts in the ORCH-P Git repository');
   assert.ok(call.args.includes(join(dirname(CLI), 'review.schema.json')));
   assert.equal(state(ctx).review.status, 'ready_for_human_merge');
   const stored = JSON.parse(readFileSync(state(ctx).review.file, 'utf8'));
@@ -648,8 +685,31 @@ test('a Git hook planted by codex blocks the run and never executes', () => {
   // Even if someone carries on, orchestrator Git calls run with hooks disabled.
   orch(ctx, ['check', ctx.taskFile, 'be']);
   orch(ctx, ['verify', ctx.taskFile, 'be']);
-  orch(ctx, ['commit', ctx.taskFile, 'be']);
+  const blockedCommit = orch(ctx, ['commit', ctx.taskFile, 'be']);
+  assert.equal(blockedCommit.status, 2);
+  assert.match(blockedCommit.stderr, /blocked implementation/);
   assert.ok(!existsSync(join(root, 'home', 'hook-ran')), 'planted hook must not run');
+});
+
+test('Omnigent core.untrackedCache is ignored without a false Git metadata block', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ untrackedCache: true, write: { 'src/app.txt': 'v2\n' } }));
+  const r = orch(ctx, ['implement', ctx.taskFile, 'be']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(state(ctx).sides.be.steps.implement.git_metadata_changed, false);
+});
+
+test('empty worktree config created by Claude does not block, but nonempty config does', () => {
+  const ctx = setup();
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const wt = state(ctx).sides.be.worktree;
+  const gitDir = sh(wt, 'git rev-parse --absolute-git-dir');
+  const before = gitMetadataDigest(wt);
+  writeFileSync(join(gitDir, 'config.worktree'), '');
+  assert.equal(gitMetadataDigest(wt), before);
+  writeFileSync(join(gitDir, 'config.worktree'), '[core]\n hooksPath = /tmp/untrusted\n');
+  assert.notEqual(gitMetadataDigest(wt), before);
 });
 
 test('verify runs the containerized gate runner with the exact base or change', () => {
@@ -1137,6 +1197,141 @@ const omnigentEnvFor = (ctx, bundle, extra = {}) => ({
   ORCH_OMNIGENT_BUNDLE: bundle, ORCH_STEP0_OMNIGENT_REPORT: join(ctx.ws, 'step0-omnigent.json'), ORCH_OMNIGENT_POLL_MS: '10',
   ORCH_OMNIGENT_HOST_RECORD: join(ctx.ws, 'omnigent-host.json'), ...extra,
 });
+
+for (const scenario of ['passed', 'failed', 'blocked', 'changed-source', 'no-tool', 'no-screenshot', 'missing-criterion']) {
+  test(`browser verification Codex: ${scenario}`, async () => {
+    const { ctx, bundle } = omnigentSetup();
+    const criterion = 'browser: show a folder tree at 390px';
+    ctx.task.sides.fe.acceptance_criteria.push(criterion);
+    ctx.task.sides.fe.browser = { url: 'http://127.0.0.1:64991/test', start_command: ['pnpm', 'dev', '-p', '64991'], test_data_only: true };
+    writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+    assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+    for (const command of ['implement', 'check', 'verify']) assert.equal(orch(ctx, [command, ctx.taskFile, 'fe']).status, 0);
+    assert.equal(orch(ctx, ['commit', ctx.taskFile, 'fe']).status, 2, 'missing browser verification blocks commit');
+    const report = { status: ['failed', 'blocked'].includes(scenario) ? scenario : 'passed', summary: 'Browser result', checks: scenario === 'missing-criterion' ? [] : [{ criterion, status: ['failed', 'blocked'].includes(scenario) ? scenario : 'passed', observations: 'Selected a folder; viewport 390px; scrollWidth 390px; screenshot tree.png' }] };
+    const stub = await startOmnigentStub({
+      onMessage: ({ body }) => {
+        const prompt = body.data.content[0].text;
+        const artifactDir = /Save screenshots\/snapshots only in ([^;]+);/.exec(prompt)[1];
+        if (scenario !== 'no-screenshot') writeFileSync(join(artifactDir, 'tree.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+        if (scenario === 'changed-source') writeFileSync(join(state(ctx).sides.fe.worktree, 'src/app.txt'), 'unexpected edit\n');
+      },
+      afterMessage: ({ items }) => {
+        items.at(-1).content[0].text = JSON.stringify(report);
+        if (scenario !== 'no-tool') items.push({ type: 'function_call', name: 'shell', arguments: JSON.stringify({ command: 'agent-browser --session own snapshot -i' }) });
+      },
+    });
+    try {
+      const env = omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url, ORCH_DEFAULTS: '1' });
+      const result = await orchAsync(ctx, ['browser-verify', ctx.taskFile, 'fe'], env).done;
+      assert.equal(result.code, scenario === 'passed' ? 0 : 1, result.out);
+      const s = state(ctx).sides.fe;
+      assert.equal(s.steps.browser.provider, 'codex');
+      assert.equal(s.steps.browser.tree, s.steps.verify.tree);
+      if (scenario === 'passed') {
+        assert.equal(orch(ctx, ['commit', ctx.taskFile, 'fe']).status, 0);
+        writeFileSync(join(s.steps.browser.dir, 'report.json'), '{}');
+        const retry = await orchAsync(ctx, ['browser-verify', ctx.taskFile, 'fe'], env).done;
+        assert.equal(retry.code, 2, retry.out);
+        assert.equal(orch(ctx, ['commit', ctx.taskFile, 'fe']).status, 2);
+      } else if (scenario === 'changed-source') assert.equal(s.status, 'blocked');
+      else if (scenario === 'failed') assert.equal(s.rework.at(-1).source, 'browser');
+    } finally { await stub.close(); }
+  });
+}
+
+for (const scenario of ['chrome', 'quota-fallback', 'sandbox-disabled']) {
+  test(`browser verification Claude: ${scenario}`, async () => {
+    const { ctx, bundle } = omnigentSetup();
+    const criterion = 'browser: folder selection is highlighted';
+    ctx.task.sides.fe = { ...ctx.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5', fallback: { runner: 'omnigent', model: 'test-model' },
+      acceptance_criteria: [criterion], browser: { url: 'http://127.0.0.1:64992/test', start_command: ['pnpm', 'dev', '-p', '64992'], test_data_only: true } };
+    writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+    orch(ctx, ['prepare', ctx.taskFile]);
+    const report = { status: 'passed', summary: 'Highlighted', checks: [{ criterion, status: 'passed', observations: 'Clicked folder in Chrome and captured screenshot' }] };
+    const stubClaude = join(ctx.ws, 'claude-browser.cjs');
+    writeFileSync(stubClaude, `#!/usr/bin/env node
+const fs = require('node:fs'); let input = '';
+const out = (e) => process.stdout.write(JSON.stringify(e) + '\\n');
+process.stdin.on('data', (c) => input += c);
+process.stdin.on('end', () => {
+  if (!input.includes('browser verifier')) {
+    fs.writeFileSync('src/app.txt', 'v2\\n');
+    out({ type: 'result', structured_output: { status: 'implemented' } }); return;
+  }
+  if (${JSON.stringify(scenario)} === 'quota-fallback') {
+    out({ type: 'result', is_error: true, result: "You've hit your weekly limit" }); process.exitCode = 1; return;
+  }
+  if (${JSON.stringify(scenario)} === 'sandbox-disabled') process.stderr.write('Sandbox disabled');
+  out({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'chrome-call', name: 'mcp__claude-in-chrome__computer', input: { action: 'screenshot' } }] } });
+  out({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'chrome-call', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } }] }] } });
+  out({ type: 'result', structured_output: ${JSON.stringify(report)} });
+});
+`);
+    chmodSync(stubClaude, 0o755);
+    const stub = await startOmnigentStub({ onMessage: ({ body }) => {
+      const artifactDir = /Save screenshots\/snapshots only in ([^;]+);/.exec(body.data.content[0].text)[1];
+      writeFileSync(join(artifactDir, 'tree.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
+    }, afterMessage: ({ items }) => {
+      items.at(-1).content[0].text = JSON.stringify(report);
+      items.push({ type: 'function_call', name: 'shell', arguments: JSON.stringify({ command: 'agent-browser --session own screenshot tree.png' }) });
+    } });
+    try {
+      const env = omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url, ORCH_DEFAULTS: '1', ORCH_CLAUDE_BIN: stubClaude, ORCH_CLAUDE_SANDBOX_TOOLS: 'sh' });
+      for (const command of ['implement', 'check', 'verify']) assert.equal(orch(ctx, [command, ctx.taskFile, 'fe'], env).status, 0);
+      const result = await orchAsync(ctx, ['browser-verify', ctx.taskFile, 'fe'], env).done;
+      assert.equal(result.code, scenario === 'sandbox-disabled' ? 1 : 0, result.out);
+      const browser = state(ctx).sides.fe.steps.browser;
+      assert.equal(browser.provider, scenario === 'quota-fallback' ? 'codex' : 'claude');
+      const settings = JSON.parse(readFileSync(join(browser.dir, 'claude-settings.json'), 'utf8'));
+      assert.ok(settings.permissions.deny.includes('Edit') && settings.permissions.deny.includes('Write'));
+      if (scenario === 'chrome') assert.ok(existsSync(join(browser.dir, 'chrome-1.png')));
+      if (scenario === 'sandbox-disabled') assert.equal(stub.requests.length, 0, 'safety failure must not switch provider');
+    } finally { await stub.close(); }
+  });
+}
+
+for (const scenario of ['accept', 'blocking', 'wrong-commit', 'invalid-json', 'writable', 'hub-error', 'permission-change']) {
+  test(`Omnigent Codex review: ${scenario}`, async () => {
+    const { ctx, bundle } = omnigentSetup();
+    orch(ctx, ['prepare', ctx.taskFile]);
+    // Prepare verified commits with the stub hub; no real model calls.
+    const impl = await startOmnigentStub({ onMessage: ({ session }) => writeFileSync(join(session.workspace, 'src', 'app.txt'), 'v2\n') });
+    try {
+      const r = await orchAsync(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: impl.url })).done;
+      assert.equal(r.code, 0, r.out);
+    } finally { await impl.close(); }
+    for (const command of ['check', 'verify', 'commit']) assert.equal(orch(ctx, [command, ctx.taskFile, 'be']).status, 0);
+    runToCommit(ctx, 'fe');
+    const s = state(ctx);
+    const review = { commits: { be: s.sides.be.steps.commit.commit, fe: s.sides.fe.steps.commit.commit }, verdict: 'accept', acceptance: [], findings: [] };
+    if (scenario === 'wrong-commit') review.commits.be = 'f'.repeat(40);
+    if (scenario === 'blocking') review.findings.push({ side: 'be', severity: 'blocking', file: 'src/app.txt', summary: 'defect' });
+    codexSessionLog([`sandbox_policy=${scenario === 'writable' ? 'WorkspaceWrite' : 'ReadOnly'}`]);
+    if (scenario === 'hub-error') writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ output: review }));
+    const stub = await startOmnigentStub({ ...(scenario === 'hub-error' ? { agents: [] } : {}), afterMessage: ({ items }) => {
+      items.at(-1).content[0].text = scenario === 'invalid-json' ? '{}' : JSON.stringify(review);
+      if (scenario === 'permission-change') items.push({ type: 'external_codex_approval_mode_change' });
+    } });
+    try {
+      const result = await orchAsync(ctx, ['review-codex', ctx.taskFile], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url })).done;
+      assert.equal(result.code, ['accept', 'hub-error'].includes(scenario) ? 0 : scenario === 'blocking' ? 1 : 2, result.out);
+      if (scenario === 'hub-error') {
+        const stored = JSON.parse(readFileSync(state(ctx).review.file, 'utf8'));
+        assert.equal(stored.provenance.runner, 'codex-exec');
+        return;
+      }
+      const create = stub.requests.find((r) => r.path === '/v1/sessions' && r.method === 'POST');
+      assert.match(create.body.title, /review · Codex/);
+      assert.ok(create.body.terminal_launch_args.includes('read-only'));
+      if (scenario === 'accept') {
+        const stored = JSON.parse(readFileSync(state(ctx).review.file, 'utf8'));
+        assert.equal(stored.provenance.runner, 'omnigent');
+        assert.equal(stored.provenance.session_id, 'conv_1');
+      } else assert.notEqual(state(ctx).review?.status, 'ready_for_human_merge');
+    } finally { await stub.close(); }
+  });
+}
 
 test('omnigent runner: refused until the Omnigent pin is approved', () => {
   const { ctx, bundle } = omnigentSetup();

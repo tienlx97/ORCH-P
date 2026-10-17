@@ -17,7 +17,8 @@ Its rules govern how you implement, test and document the change.
 {{CONTEXT}}
 
 ## Findings to address (rework)
-Findings from the repository gate or a review of your previous attempt in this same worktree.
+Findings from the repository gate, browser verification, review, or an explicitly recorded
+operator diagnosis of your previous attempt in this same worktree.
 Fix every one of them; keep the rest of the existing work.
 {{REWORK}}
 
@@ -34,6 +35,9 @@ Fix every one of them; keep the rest of the existing work.
   Run only focused checks (single test projects, single test files, lint of touched files).
 - Do not read, print, copy or create credential files, `.env*` files, tokens or keys, and never
   put secret values in code, tests, documentation, logs or your report.
+- Read tool documentation selectively. Avoid dumping full CLI skill bundles with credential
+  examples into the transcript; print only the relevant noncredential sections. Secret-like
+  examples can still block evidence scanning. Never disable or alter that scanner.
 - Do not access dev, LAN or production databases or services. Use the repository's test
   fixtures only.
 - Do not modify harness, CI, lockfile or agent-configuration files unless they are listed in

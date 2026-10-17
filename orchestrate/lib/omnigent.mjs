@@ -3,8 +3,8 @@
 // Omnigent is a third-party agent platform evaluated statically under
 // AGENTS.md rule 7. ORCH-P uses it only as a cockpit: a loopback web UI where
 // one Claude coordinator talks to the user, reads status and writes task
-// proposals. Codex implementers stay in orchestrate.mjs with the Step 0
-// sandbox profile; nothing here starts, approves or commits work.
+// proposals. Codex implementers stay in orchestrate.mjs with the accepted
+// defaults or Step 0 profile; nothing here approves or commits work.
 //
 // This module holds the parts ORCH-P can check without installing Omnigent:
 // the pin record, the launch environment (an allowlist with every opt-out set)
@@ -13,6 +13,7 @@
 // posture and requires the guardrails the coordinator depends on.
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { readAgentConfig } from './agent-config.mjs';
 
 const PASS_ENV = ['HOME', 'PATH', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'COLORTERM', 'NO_COLOR', 'LANG', 'LC_ALL', 'TMPDIR', 'TZ'];
 
@@ -77,9 +78,10 @@ export function readPin(bundleDir) {
 }
 
 // Gaps the user may accept, by name, with the Step 0 checks each one covers.
-// Nothing else can be accepted: write isolation, network, loopback, credential
-// variables, the private TMPDIR and the secret scan always have to hold for
-// Codex implementers. `debby-unsandboxed` covers no Step 0 check: it concerns
+// Only the listed risks may waive their named checks. Write isolation,
+// credential variables, private TMPDIR and secret scanning remain required;
+// orch-defaults explicitly permits implementer network and loopback access.
+// `debby-unsandboxed` covers no Step 0 check: it concerns
 // Omnigent's built-in debby, which never runs a pipeline step. Neither does
 // `agent-prompt-preapproval`: it concerns Claude's own permission prompt in
 // the bundle agents (claudeSettings below), not the Codex sandbox.
@@ -248,6 +250,7 @@ function agentDirs(bundleDir) {
 export function lintBundle(bundleDir) {
   const { pin, problems: pinProblems } = readPin(bundleDir);
   const problems = [...pinProblems];
+  try { readAgentConfig(join(bundleDir, 'agents.json')); } catch (error) { problems.push(`agents.json: ${error.message}`); }
   const cel = !accepts(pin, 'agent-no-cel');
   const server = join(bundleDir, 'config.yaml');
   if (!existsSync(server)) problems.push('omnigent/config.yaml (server config) is missing');

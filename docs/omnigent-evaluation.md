@@ -1,10 +1,42 @@
 # Omnigent evaluation — the agent hub (installed; Codex sessions under accepted risk)
 
-**Status (2026-10-14):** static evaluation done under [AGENTS.md](../AGENTS.md) rule 7. The user
-chose Omnigent as the hub that runs, coordinates and keeps the shared history of every agent.
-Read statically, it can be that hub **if ORCH-P creates the Codex sessions itself** with the
-Step 0 profile (its own Codex dispatch disables Codex's sandbox). Not installed, not run.
-Adoption needs the O1 probe below and the user's written approval in `omnigent/pin.json`.
+**Current status (2026-10-17):** Omnigent 0.18.0 is installed and approved in
+`omnigent/pin.json`. ORCH-P creates top-level Codex sessions, binds approval, runs the
+repository gates and records review provenance. The active `orch-defaults` decision permits
+implementer network/loopback access and removes their Step 0 prerequisite; other named risks
+remain recorded in the pin. The findings and O1 results below describe the original evaluation
+and are historical where later accepted decisions supersede them.
+
+`cockpit.mjs check-config` validates configuration offline; `cockpit.mjs check` additionally
+requires the recorded daemon, reachable loopback API, Codex agent and online host. Neither
+makes model calls. Codex coordinator fallback now opens a persistent top-level Omnigent chat
+with writes limited to `runs/proposals`, network disabled and the existing session policies.
+The user approves plans by typing `autopilot.mjs run`; the coordinator cannot write requests.
+If the hub is unavailable before initialization, the existing CLI remains the fallback. A
+failed hub initialization or unverifiable sandbox stops rather than switching transports.
+
+## Live pilot (2026-10-17)
+
+The user approved configuration fixes and real integration checks on 2026-10-17. The pinned
+host was restarted through `cockpit.mjs host`; `check` and `probe-api` confirmed 16 agents and
+one online host. The new Codex coordinator initialized in the Web UI as
+`ORCH-P · coordinator · Codex` (session `87691633214d4812922998a6f3fbbc58`), read its instructions
+and waited for a spec. Its Codex log contained only ReadOnly/WorkspaceWrite policies.
+
+A separate real Codex session (`a3496c01f53e49efbb9cac97d5c7ae5b`) used agent-browser 0.34.0
+against a synthetic localhost fixture: expand Documents, select Invoice, inspect the selected
+label, then repeat at 390px width. Desktop/mobile screenshots and snapshots were preserved;
+measured viewport and scroll widths were all 390px. An independent Codex session
+(`dfcd5db2434c454a85e366dd1888052e`) inspected source and evidence with only ReadOnly logged,
+returning accept with no findings. Both used the hub-configured model `gpt-5.6-sol`.
+
+Evidence is retained locally in `runs/omnigent-pilot-20261017/summary.json`, browser/review
+reports, transcripts, sandbox reports, snapshots and screenshots. The fixture source SHA-256
+was unchanged and its server port was closed after verification. This proves real hub,
+Codex, agent-browser and read-only review interoperability on test data. It does not attest
+an actual FE-P task's gate/tree/commit binding, exercise Claude-in-Chrome, or replace missing
+browser evidence for old approved tasks. Gate tests cover those state and binding rules.
+No production task/plan was approved or executed by this smoke test.
 
 ## What was evaluated
 
@@ -130,7 +162,7 @@ omnigent wheel sha256 = pin). Server and daemon started by `cockpit.mjs host`.
 | # | Result |
 |---|---|
 | 1 | **NOT READY.** In a `codex-native-ui` session the check script read the canary, an SSH key, `~/.codex/auth.json`, `~/.omnigent` and BE `.env`; writes outside the worktree, network and loopback to Omnigent were denied. The session's private `config.toml` held the ORCH-P profile (`default_permissions = "orch"` and the full table), also passed as `-c default_permissions="orch"`, yet Codex logged `sandbox_policy=WorkspaceWrite … permission_profile: None` for the thread: the app-server / `--remote` TUI path ran the legacy workspace-write sandbox without the read denials. Option 3 (below) accepts exactly these read checks; everything else held. The approval-mode label is not a signal (Omnigent shows `full-access` for this stance while Codex runs WorkspaceWrite): ORCH-P reads the sandbox policies from the session's own Codex log (`~/.omnigent/codex-native/<id>/codex-home/logs_2.sqlite`, flushed seconds after idle) and blocks anything but `WorkspaceWrite`/`ReadOnly`. Retest after every Codex or Omnigent upgrade. |
-| 2 | The personal `~/.codex/config.toml` has two MCP servers and hooks. Omnigent's `HARNESS_CODEX_MINIMAL_CONFIG` does not reach runners (the daemon strips it), so the hub uses its own `CODEX_HOME` (`~/.codex-orch`: `model` plus `[features] code_mode_host = false`, `auth.json` linked; with code-mode-host on, its helper runs in its own process group and holds the app-server's stdio open, so Omnigent's session cleanup times out and the turn fails with "previous Codex session cleanup is incomplete", observed 2026-10-15 on Codex 0.162.1), set by `cockpit.mjs host`; `implement` checks that home. |
+| 2 | The personal `~/.codex/config.toml` has two MCP servers and hooks. Omnigent's `HARNESS_CODEX_MINIMAL_CONFIG` does not reach runners (the daemon strips it), so the hub uses its own `CODEX_HOME` (`~/.codex-orch`: a model, `auth.json` linked, and code-mode-host enabled), set by `cockpit.mjs host`; `implement` checks that home. Disabling code-mode-host made current code-mode models stop before any repository command; enabling it only in terminal launch arguments was too late because the app-server had already read the hub config. An older cleanup issue with the helper was observed 2026-10-15 on Codex 0.162.1; retain the setting and retest cleanup after upgrades. |
 | 3 | Omnigent's runner environment is already an allowlist (`host/connect.py` `_RUNNER_ENV_ALLOWLIST`); with `shell_environment_policy` the check script saw no credential variables and the private `TMPDIR`. |
 | 4 | `/v1/agents` → `{object, data[], first_id, last_id, has_more}`; `/v1/hosts` → `{hosts[]}` with `host_id`, `status: "online"`, `configured_harnesses` (`codex-native`, `claude-native` true), `gateway_inference` all false. Launch args are capped at 256 entries × 4096 characters, so the profile travels as a Codex file profile. stdin must be closed for `omnigent host --background`. |
 | 9 | Codex sessions: loopback denied. Claude agents: `egress_rules` would limit them to Anthropic hosts but break REST-created sessions, so they are off (question 5); loopback is reachable for them, behind the CEL allowlist and per-command approval. |
@@ -277,6 +309,26 @@ there. ORCH-P's Git metadata check blocked SHIPDOC-04A on it; `gitMetadataDigest
 
 ## Codex as a child session
 
+Browser verification added 2026-10-17: agent-browser CLI 0.34.0 (existing local install),
+used by a separate Codex Omnigent session after the FE gate. The CLI launches its own named
+Chromium session, stores browser runtime state separately and writes screenshots only to the
+run's private temp artifact directory (copied to ORCH-P evidence). It can read rendered test
+pages and execute browser interactions; browser traffic targets the approved loopback test
+origin/backend. Codex retains the accepted orch-defaults sandbox/network posture; prompts and
+task URL validation are policy constraints, not a network firewall. No third-party browser
+service or production login is configured. Claude verification uses the already accepted
+claude-in-chrome real-browser integration in a new tab. Both preserve browser evidence and
+check source/Git metadata invariance; missing/failed evidence prevents commit/review acceptance.
+The unit tests use stub agents and synthetic screenshots, with no model or real browser calls.
+
+Codex reviewer transport (Omnigent 0.18.0): ORCH-P creates an independent top-level
+`<task id> · review · Codex` session with a read-only Codex sandbox and the existing session
+policies. It can read repositories to inspect verified commits; repository writes are denied.
+No additional network permission is granted. Session history is retained in the hub and exported
+to ORCH-P evidence. ORCH-P verifies Codex logged only ReadOnly, validates the final JSON and
+commit binding, then records the review itself. Hub infrastructure failures fall back to the
+existing read-only CLI transport; safety or invalid-review failures do not.
+
 Tried 2026-10-16 (`ORCH_PROBE_PARENT_SESSION` in `step0-omnigent.mjs`, report in
 `runs/orch-step0-child/`): a Codex session created with `parent_session_id` = the coordinator's
 session runs on the coordinator's runner, and its sandbox checks match a top-level session (only
@@ -308,3 +360,33 @@ Each question has a design answer in place (2026-10-14); O1 confirms it with evi
 
 A new pinned version, a change to an agent config or to `lib/omnigent-runner.mjs`, dispatching
 implementers as Omnigent sub-agents, or a non-loopback server.
+
+## Claude FE sessions and central defaults (2026-10-17)
+
+The user approved this integration and chose a real FE pilot in Logistics → Hợp đồng →
+create/edit drawer → payment terms, removing nested occurrences from the editor. No backend
+contract or production data change is authorized by that pilot.
+
+New proposals use `omnigent/agents.json` through `orchestrate/agents.mjs resolve`; model,
+effort, timeout, fallback, Claude transport and reviewer settings are written into the proposal
+before its approval digest is computed. Approved task execution does not resolve mutable
+defaults again. Legacy Claude tasks keep their CLI transport unless their approved spec
+explicitly names `claude_transport: omnigent`.
+
+Omnigent 0.18.0 appends its own `--settings` sidecar to native Claude arguments. Passing the
+old secure settings as another flag alone cannot prove that those restrictions survive.
+The first-party `orchestrate/bin/claude` wrapper is therefore added only to the host's PATH:
+it handles an explicit ORCH launch marker, merges the generated bridge hooks with the same
+strict Claude sandbox/permission settings, limits per-run environment fields, disables the native bridge's blanket auto-approval of project MCP servers, and writes an
+execution-settings attestation before invoking the real Claude executable. Unmarked launches
+pass through. If the wrapper is absent, Claude rejects the unknown marker before receiving a
+task prompt. No Omnigent package is patched and no provider/billing configuration is changed.
+
+Native FE shell networking stays limited to localhost, shell writes to its worktree/temp,
+and credential/state reads remain denied. Extra Omnigent MCP tools are denied for these FE
+sessions; the native hooks retain their own bridge. Chrome remains the already accepted real
+user browser (`fe-claude-chrome`). Native transcripts preserve Chrome screenshot results.
+Missing/changed execution settings, permission changes, sandbox-disabled warnings, source or
+Git metadata changes, malformed report JSON and secret hits stop the run. Only a positively
+identified Claude quota failure may use the approved Codex fallback. Live Claude tool proof
+is pending while the subscription reports its weekly limit (reset Oct 20, 06:00 Bangkok).

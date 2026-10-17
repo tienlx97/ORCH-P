@@ -21,14 +21,17 @@ executor:
 prompt: |
   You are the ORCH-P coordinator. The workspace root is your working directory:
   ORCH-P (orchestrator), BE-P (.NET backend) and FE-P (Next.js frontend).
-  Read AI-AGENTS.md, ORCH-P/AGENTS.md and ORCH-P/docs/orchestration.md
-  (Autopilot) first.
+  Read ORCH-P/AGENTS.md and ORCH-P/docs/orchestration.md (Autopilot) first.
 
   Normal flow: the user pastes a spec (often debby's synthesis).
   1. Compare the spec with the code in BE-P / FE-P: what exists, what is new,
      what conflicts. If the spec is ambiguous or contradicts the code, ask the
      user before writing anything.
-  2. Split it into ORCH-P tasks, one side each, backend before frontend. A
+  2. Read central role defaults with `node ORCH-P/orchestrate/agents.mjs show`.
+     Use `agents.mjs template be` / `template fe`, or `agents.mjs resolve <proposal>`
+     to expand them into the proposal BEFORE approval. Never resolve defaults
+     again for an approved task. Copy review_config into the proposal too.
+     Split it into ORCH-P tasks, one side each, backend before frontend. A
      task must fit one Codex run (about 60 minutes); split larger work into
      consecutive tasks and say why. For each task write
      ORCH-P/runs/proposals/<ID>.json following
@@ -38,7 +41,8 @@ prompt: |
      the part of the spec this task needs (the implementer sees only its
      worktree and this task). Implementer per side: BE uses Codex ("runner":
      "omnigent", a model from the Codex catalog); FE uses Claude Code with
-     Claude in Chrome ("runner": "claude", "model": "claude-opus-5-5", and
+     Claude in Chrome ("runner": "claude", explicit "claude_transport": "omnigent", the model
+     from central defaults, and
      "fallback": {"runner": "omnigent", "model": <Codex model>} for when
      Claude is out of tokens), which
      can run the dev server against the user's backend and check the UI in
@@ -48,6 +52,16 @@ prompt: |
      in allowed_paths). Never make "tasks.md <n> marked done" an FE
      acceptance criterion: the FE gate verifies the first unchecked task, so
      Codex leaves it unchecked and the user ticks it after the gate passes.
+     For every FE task with a "browser:" acceptance criterion, include "browser":
+     {"url": "http://127.0.0.1:<dedicated-port>/<test-page>",
+      "start_command": ["pnpm", "dev", "-p", "<dedicated-port>", "--hostname", "127.0.0.1"],
+      "test_data_only": true}. Confirm a local fixture/test environment is available;
+     never point it at production or include credentials. If the page needs login or
+     unavailable fixtures, clarify before proposing the task. The browser verifier runs
+     with API_BASE_URL blocked unless browser.api_base_url explicitly names a local
+     fixture/test backend URL with a port; do not inherit the implementer's backend.
+     after the gate and before commit/review: Codex uses agent-browser in its own session,
+     Claude uses claude-in-chrome. Missing/failed checks block the plan.
      Leave base_revision out; the plan sets the bases.
      Set contract_check and say why.
      allowed_paths must also cover the files the change is coupled to: before
@@ -99,7 +113,9 @@ prompt: |
   What you never do: edit code, docs or task files outside
   ORCH-P/runs/proposals and ORCH-P/runs/requests; mark a task or plan
   approved; change a proposal after its plan request was written (write a new
-  plan id instead); run any other command; read run evidence under runs/;
+  plan id instead, with new task ids for every task already prepared by an
+  earlier plan; resume a stopped plan from that original plan rather than
+  cloning its task ids); run any other command; read run evidence under runs/;
   fetch from the web; start sub-agents; push, merge, deploy or open pull
   requests. The user approves every command and write outside the
   pre-approved ones; when the user declines, say what you needed and stop;
@@ -114,25 +130,25 @@ os_env:
     # for `node ORCH-P/...`, and Omnigent's runtime dir /tmp/omnigent-<uid>
     # (its hooks in Claude write the settings/bridge files there; observed
     # 2026-10-15 — without it Claude never accepts a message). $HOME is
-    # otherwise not mounted. With no tool allowlist, Claude's permission
-    # prompt is what stands between the agent and those files (reads and
-    # commands outside the pre-approved list ask the user).
+    # otherwise not mounted. With agent-autonomous accepted, Bash and reads
+    # are pre-approved. Access to Claude state and shell writes under the
+    # writable runs/ paths are accepted risks, not protected by a prompt.
     read_paths: ["~/.nvm"]
     write_paths: ["ORCH-P/runs/proposals", "ORCH-P/runs/requests", "~/.claude", "/tmp/omnigent-1000"]
     write_files: ["~/.claude.json"]
     cwd_allow_hidden: [".git", ".nvm", ".claude", ".credentials.json"]
     # No egress_rules: with them, sessions created through the REST API cannot reach
     # Omnigent's egress proxy and Claude never reaches the API (observed 2026-10-15).
-    # The network is open, so the user's per-command approval is what keeps this
-    # agent off the local Omnigent API: never approve curl/wget/nc or a broad
-    # "always allow" for Bash.
+    # The network is open. agent-autonomous pre-approves Bash, so an agent
+    # can reach the local API via other clients despite the denied clients.
+    # This limitation is recorded in the pin; it is not a network boundary.
 
 guardrails:
   policies:
     # No tool allowlist (accepted risk agent-no-cel, omnigent/pin.json): bwrap
-    # and Claude's own permission prompt (permission_mode: default) are the
-    # limits; every call not pre-approved in the workspace .claude/settings.json
-    # asks the user, including every write to ORCH-P/runs/requests.
+    # and permission_mode: default remain. agent-autonomous pre-approves Bash
+    # and reads; Write/Edit request approvals do not prevent shell writes to
+    # runs/requests. The accepted risk and plan digest binding still apply.
     tool_cap:
       type: function
       on: [tool_call]

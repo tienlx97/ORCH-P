@@ -13,6 +13,8 @@
 // list responses are read defensively because their envelopes are not in the
 // published schema. Everything here is checked again by the O1 probe.
 
+import { scanSecrets } from './secrets.mjs';
+
 export const CODEX_APPROVAL_LABEL = 'omnigent.codex_native.approval_mode';
 const BUSY = new Set(['launching', 'running', 'waiting']);
 
@@ -32,13 +34,14 @@ const listOf = (body, ...keys) => {
   return [];
 };
 
-export function omnigentClient(base, { fetchImpl = fetch } = {}) {
+export function omnigentClient(base, { fetchImpl = fetch, timeoutMs = 30_000 } = {}) {
   async function call(method, path, body) {
     const response = await fetchImpl(`${base}${path}`, {
       method,
       headers: body === undefined ? {} : { 'content-type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
       redirect: 'error',
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await response.text();
     if (!response.ok) {
@@ -136,6 +139,11 @@ export function codexUserConfigProblems(text) {
   return problems;
 }
 
+/** An explicit hub-wide disable leaves current code-mode models without an execution tool. */
+export function codexCodeModeHostDisabled(text) {
+  return /^\s*code_mode_host\s*=\s*false\s*(?:#.*)?$/m.test(text);
+}
+
 /** Session policies on top of the sandbox: no writes outside the worktree, no push or destructive command. */
 export function sessionPolicies(worktree) {
   return [
@@ -170,7 +178,7 @@ export function lastAssistantText(items) {
  * 2026-10-14), so a real switch to Full Access would not change it.
  */
 export function permissionChanged(items) {
-  return items.some((item) => /approval_mode_change/.test(`${item?.type ?? ''} ${item?.data?.type ?? ''}`));
+  return items.some((item) => /approval_mode_change|permission_mode_change/.test(`${item?.type ?? ''} ${item?.data?.type ?? ''}`));
 }
 
 // Sandbox policies Codex may log for an ORCH-P session (ReadOnly: Omnigent's
@@ -184,13 +192,13 @@ export const ALLOWED_SANDBOX_POLICIES = Object.freeze(['WorkspaceWrite', 'ReadOn
  * ~/.omnigent/codex-native/<id>/state.json and its logs_2.sqlite is read
  * read-only. Ground truth for "did the sandbox stay as launched".
  */
-export async function codexSandboxPolicies({ sessionId, omnigentHome, settleMs = 30_000, pollMs = 1000 }) {
+export async function codexSandboxPolicies({ sessionId, omnigentHome, settleMs = 30_000, pollMs = 1000, readOnly = false }) {
   // Codex flushes its log after the session reports idle (observed: empty right
   // after the turn, complete seconds later): wait for the turn's own policy.
   const deadline = Date.now() + settleMs;
   for (;;) {
     const result = await readCodexSandboxPolicies({ sessionId, omnigentHome });
-    const turnLogged = result.policies?.some((p) => p !== 'ReadOnly');
+    const turnLogged = result.policies?.some((p) => readOnly || p !== 'ReadOnly');
     if (turnLogged || Date.now() >= deadline) return result;
     await sleep(pollMs);
   }
@@ -234,6 +242,13 @@ export function sandboxPolicyProblems(result) {
 
 const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
+export function sessionFailureNote(session) {
+  const message = session?.last_task_error?.message ?? session?.labels?.['omnigent.last_task_error_message'];
+  if (typeof message !== 'string' || !message.trim()) return 'session failed';
+  if (scanSecrets(message, 'session error').length) return 'session failed (error detail withheld: secret-like text)';
+  return `session failed: ${message.replace(/[\x00-\x1f\x7f-\x9f]/g, ' ').slice(0, 500)}`;
+}
+
 /**
  * Runs one Codex implementer session to completion.
  * Returns { status, timedOut, interrupted, sessionId, session, items, permissionChanged, note }:
@@ -243,6 +258,7 @@ const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 export async function runCodexSession({
   client, agentName, hostId, worktree, title, launchArgs, policies, prompt,
   timeoutMs, pollMs = 2000, startGraceMs = 120_000, labelGraceMs = 20_000, signal, onHeartbeat = () => {}, onStatus = () => {}, onSession = () => {}, parentSessionId = null,
+  approvalLabel = CODEX_APPROVAL_LABEL, onItems = null,
 }) {
   const agents = await client.agents();
   const agent = agents.find((a) => nameOf(a) === agentName);
@@ -287,12 +303,12 @@ export async function runCodexSession({
   // "never" while Codex ran WorkspaceWrite). The value before the prompt is
   // the baseline; a change after it is a change made during the run.
   const labelWait = Date.now();
-  while (!session.labels?.[CODEX_APPROVAL_LABEL] && Date.now() - labelWait < labelGraceMs && !signal?.aborted) {
+  while (approvalLabel && !session.labels?.[approvalLabel] && Date.now() - labelWait < labelGraceMs && !signal?.aborted) {
     await sleep(pollMs);
     session = await client.session(sessionId);
     onHeartbeat();
   }
-  const initialLabel = session.labels?.[CODEX_APPROVAL_LABEL] ?? null;
+  const initialLabel = approvalLabel ? session.labels?.[approvalLabel] ?? null : null;
   await client.postMessage(sessionId, prompt);
 
   let sawBusy = false;
@@ -303,17 +319,26 @@ export async function runCodexSession({
     session = await client.session(sessionId);
     onHeartbeat();
     onStatus(session.status);
+    if (onItems) await onItems(await client.items(sessionId));
     if (BUSY.has(session.status)) sawBusy = true;
     if (signal?.aborted) outcome = { status: 128, interrupted: signal.reason ?? 'signal' };
     else if (Date.now() - posted > timeoutMs) outcome = { status: 127, timedOut: true };
-    else if (session.status === 'failed') outcome = { status: 1, note: 'session failed' };
+    else if (session.status === 'failed') outcome = { status: 1, note: sessionFailureNote(session) };
     else if (session.status === 'idle' && sawBusy) outcome = { status: 0 };
     else if (session.status === 'idle' && Date.now() - posted > startGraceMs) outcome = { status: 1, note: 'session never started working' };
   }
   if (outcome.status === 127 || outcome.status === 128) await client.interrupt(sessionId).catch(() => {});
   const items = await client.items(sessionId);
+  // Idle means the turn ended, not that the implementer completed its task.
+  // Preserve a blocked report as failure instead of wasting gate/rework rounds.
+  if (outcome.status === 0) {
+    try {
+      const report = JSON.parse(lastAssistantText(items));
+      if (report?.status === 'blocked') outcome = { status: 1, note: `implementer blocked: ${String(report.summary ?? 'see final report').slice(0, 500)}` };
+    } catch { /* Non-JSON replies are used by the Step 0 probe. */ }
+  }
   const finalSession = await client.session(sessionId).catch(() => session);
-  const finalLabel = finalSession.labels?.[CODEX_APPROVAL_LABEL] ?? null;
+  const finalLabel = approvalLabel ? finalSession.labels?.[approvalLabel] ?? null : null;
   return {
     timedOut: false, interrupted: null, note: null, ...outcome, sessionId, session: finalSession, items,
     approvalLabel: { before: initialLabel, after: finalLabel },

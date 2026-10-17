@@ -10,6 +10,7 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
 | How it works, commands, security controls, residual risk | [docs/orchestration.md](docs/orchestration.md) |
 | Why there is no Ruflo | [docs/ruflo-evaluation.md](docs/ruflo-evaluation.md) |
 | Omnigent hub: evaluation, decision, open questions | [docs/omnigent-evaluation.md](docs/omnigent-evaluation.md) |
+| Agent models, fallbacks, effort and timeout defaults | [omnigent/agents.json](omnigent/agents.json), [configuration workflow](docs/orchestration.md#agent-configuration) |
 | Coordination policy (roles, approvals, handoff, contract changes) | `../BE-P/docs/coordination/README.md` |
 | Workspace phase gates | `../AI-AGENTS.md` (if present) |
 | BE / FE implementation rules and gates | Each repository's AGENTS.md and `harness/verify.sh` |
@@ -22,7 +23,8 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
   `omnigent-runner.mjs` (Codex implementer sessions in Omnigent); `cockpit.mjs` (starts Omnigent
   agents) and `runner.mjs` (runs step requests approved in Omnigent).
 - `omnigent/` — Omnigent hub bundle: `pin.json` (pinned release, approval), `config.yaml`
-  (required `~/.omnigent` settings), `orch-coordinator/` and `orch-reviewer/` (agents and their
+  (required `~/.omnigent` settings), `agents.json` (defaults copied into new proposals),
+  `orch-coordinator/` and `orch-reviewer/` (agents and their
   guardrails); `node orchestrate/cockpit.mjs lint` checks it.
 - `verify-container/` — verification image and `run-gate.mjs` (containerized BE/FE gates).
 - `tests/` — stub-based tests (no model calls, no Docker); `harness/` — this repo's gate.
@@ -57,9 +59,11 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
    Never add or widen an accepted risk without that decision.
 3. Changes that alter what ORCH-P expects from BE-P or FE-P (`INTERFACES` in
    `orchestrate/orchestrate.mjs`) need the matching change in that repository first.
-4. Real Codex runs need a READY Step 0 (`node orchestrate/step0-probe.mjs`) and explicit user
-   approval; Codex sessions in Omnigent also need a READY `node orchestrate/step0-omnigent.mjs`.
-   Rerun both after Codex or Omnigent upgrades. Approving a plan (one ASK for its `autopilot`
+4. Real implementation runs need explicit user approval. Unless the accepted risk
+   `orch-defaults` is active, Codex also needs a READY Step 0
+   (`node orchestrate/step0-probe.mjs`); Codex sessions in Omnigent additionally need
+   `node orchestrate/step0-omnigent.mjs` accepted under the pin's named risks.
+   Rerun the applicable probes after Codex or Omnigent upgrades. Approving a plan (one ASK for its `autopilot`
    request, or `autopilot.mjs run` typed by the user) is that approval for every task in it
    (docs/orchestration.md#autopilot); nothing else may approve a task or a plan.
 5. GitHub CI stays manual-only; run the gate locally before any push.
