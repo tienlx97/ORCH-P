@@ -34,6 +34,8 @@ import { referenceInputProblems, materializeReferenceInputs } from './lib/refere
 import { skillContractProblems, skillPrompt, materializeSkillBundle, validateSkillsRead, withSkillReportSchema } from './lib/skills.mjs';
 import { applicationBrowser, agentBrowserTransport, fixtureUiRouteFile, implementationApplicationCheck, browserConfigProblems, browserCriteria, browserPrompt, browserSchema, chromeScreenshots, validateBrowserReport } from './lib/browser-verification.mjs';
 import { applicationLoginCommand } from './lib/browser-session.mjs';
+import { httpReachable, startHostDevServer } from './lib/dev-server.mjs';
+import { ensureQaBackend, qaBackendSource } from './lib/qa-backend.mjs';
 import { claudeArgs, claudeImplementerSettings, claudeProgress, SANDBOX_DISABLED, SANDBOX_TOOLS } from './lib/claude-runner.mjs';
 import { codexProjector, lineSplitter } from './lib/event-stream.mjs';
 import { orchHostStatus, readPin, step0Acceptance } from './lib/omnigent.mjs';
@@ -1448,6 +1450,20 @@ async function cmdBrowserVerify(taskPath, side) {
   mkdirSync(socketDir, { mode: 0o700 });
   const artifacts = join(socketDir, 'artifacts');
   mkdirSync(dir, { recursive: true, mode: 0o700 }); mkdirSync(artifacts, { recursive: true, mode: 0o700 });
+  // FE application QA runs against the plan's reviewed BE code, rebuilt before every run.
+  let backend = null;
+  if (side === 'fe' && applicationBrowser(spec.browser)) {
+    try {
+      backend = await ensureQaBackend({ apiBaseUrl: spec.browser.api_base_url, source: qaBackendSource(process.env.ORCH_QA_BACKEND), beRepo: BE_REPO, logFile: join(dir, 'backend.log'), env: sanitizedEnv() });
+      console.log(`browser-verify: dev backend ${backend.source}${backend.commit ? ` ${backend.commit.slice(0, 12)}` : ''} at ${spec.browser.api_base_url}`);
+    } catch (error) {
+      recordStep(state, side, 'browser', { exit: 1, tree, verify_at: verified.at, dir, report_status: 'blocked', error: error.message, attempts: [], screenshots: [], evidence: [] });
+      saveState(task, state, { sides: [side] });
+      rmSync(socketDir, { recursive: true, force: true });
+      console.log(`browser-verify ${side}: blocked/failed; evidence ${dir} — ${error.message}`);
+      return 1;
+    }
+  }
   const metadata = gitMetadataDigest(s.worktree);
   const obs = observe(task, state, side, 'browser');
   obs.start('verifying');
@@ -1471,6 +1487,9 @@ async function cmdBrowserVerify(taskPath, side) {
     AGENT_BROWSER_CONFIG: browserConfigFile, AGENT_BROWSER_SCREENSHOT_DIR: artifacts,
     AGENT_BROWSER_ALLOWED_DOMAINS: '127.0.0.1,localhost,[::1]',
   };
+  // Accepted risk claude-chrome-login: Claude types the local dev account into Chrome's login form.
+  const chromeLoginFile = applicationBrowser(spec.browser) && (readPin(OMNIGENT_BUNDLE).pin?.accepted_risks ?? []).some((r) => r?.id === 'claude-chrome-login')
+    ? join(FE_REPO, '.ai-login.local.md') : null;
   const loginCommand = applicationBrowser(spec.browser) ? applicationLoginCommand({ config: spec.browser, session, socketDir, browserConfigFile, directory: artifacts, feRepository: FE_REPO }) : null;
   const switchProvider = async () => {
     if (gitMetadataDigest(s.worktree) !== metadata || worktreeTree(s.worktree) !== tree) throw new Error('browser verifier changed source or Git metadata');
@@ -1490,7 +1509,7 @@ async function cmdBrowserVerify(taskPath, side) {
   try {
     for (;;) {
       attempts.push({ provider, model: browserSpec.model, session_id: null });
-      const prompt = browserPrompt({ taskId: task.id, worktree: s.worktree, tree, config: spec.browser, criteria, provider, artifactDir: artifacts, session, skills, reportSchema, loginCommand, runtimeNotes: s.browser_notes });
+      const prompt = browserPrompt({ taskId: task.id, worktree: s.worktree, tree, config: spec.browser, criteria, provider, artifactDir: artifacts, session, skills, reportSchema, loginCommand, runtimeNotes: s.browser_notes, hostServer: provider === 'claude', chromeLoginFile: provider === 'claude' ? chromeLoginFile : null });
       if (scanSecrets(prompt, 'browser prompt').length) throw new Error('secret-like text in browser configuration or criteria');
       writeFileSync(join(dir, `${provider}-prompt.md`), prompt, { mode: 0o600 });
       if (provider === 'claude') {
@@ -1501,6 +1520,8 @@ async function cmdBrowserVerify(taskPath, side) {
         const settingsFile = join(dir, 'claude-settings.json');
         const settings = claudeImplementerSettings({ chrome, worktree: s.worktree, tmpDir: sideTmpDir(task, side), home: homedir(), denied: [STATE_ROOT, join(BE_REPO, '.env'), join(FE_REPO, '.env')] });
         settings.permissions.deny.push('Edit', 'Write');
+        // TMPDIR and the agent-browser socket live in this run's private temp root.
+        settings.sandbox.filesystem.allowWrite.push(socketDir);
         writeFileSync(settingsFile, JSON.stringify(settings), { mode: 0o600 });
         const progress = claudeProgress();
         const splitter = lineSplitter({ onLine: (line) => { try {
@@ -1508,33 +1529,43 @@ async function cmdBrowserVerify(taskPath, side) {
           obs.agentActive();
           writeJsonAtomic(join(stateDir(task), 'live', 'agents', `${side}.claude.json`), { ...progress.seen, report: undefined, result: undefined, at: now() });
         } catch { /* invalid events cannot prove browser use */ } }, onOversized: () => {} });
+        // Claude's sandbox network namespace hides its own servers from Chrome; the host runs it.
+        if (spec.browser.api_base_url && !(await httpReachable(spec.browser.api_base_url))) throw new Error(`dev backend ${spec.browser.api_base_url} is not running; start it before browser QA`);
+        const devServer = await startHostDevServer({ argv: spec.browser.start_command, cwd: s.worktree, url: spec.browser.url, logFile: join(artifacts, 'dev-server.log'),
+          env: { ...sanitizedEnv(), TMPDIR: socketDir, NEXT_TELEMETRY_DISABLED: '1', API_BASE_URL: spec.browser.api_base_url ?? 'http://127.0.0.1:1' } });
         let result, raw;
-        if (browserSpec.claude_transport === 'omnigent') {
-          const host = orchHostStatus({ home: homedir(), record: OMNIGENT_HOST_RECORD, requireClaudeLauncher: true });
-          if (!host.ok || !host.record?.claude_launcher) throw new Error('Claude browser requires cockpit host with the ORCH launcher');
-          result = await runClaudeHub({ worktree: s.worktree, dir, tmpDir: sideTmpDir(task, side), settings, chrome,
-            env: { ...(applicationBrowser(spec.browser) ? browserEnv : {}), TMPDIR: socketDir, ORCH_IMPLEMENTER: '1', NEXT_TELEMETRY_DISABLED: '1', API_BASE_URL: spec.browser.api_base_url ?? 'http://127.0.0.1:1' },
-            model: browserSpec.model, effort: browserSpec.effort, prompt, schema: reportSchema, skillBundle,
-            title: `${task.id} · browser verification · Claude`, timeoutMs: (browserSpec.browser_timeout_minutes ?? spec.browser_timeout_minutes ?? 30) * 60_000,
-            pollMs: Number(process.env.ORCH_OMNIGENT_POLL_MS ?? 2000), signal: controller.signal,
-            onHeartbeat: () => obs.heartbeat(), onSession: (id) => {
-              sessionId = id; attempts.at(-1).session_id = id;
-              console.log(`browser-verify: Claude Omnigent session ${id}`);
-              writeJsonAtomic(join(stateDir(task), 'live', 'agents', `${side}.session.json`), { session_id: id, provider: 'claude', title: `${task.id} · browser verification · Claude`, started_at: now() });
-            },
-          });
-          raw = result.native;
-          progress.seen.report = result.report;
-          progress.seen.result = result.text;
-          writeFileSync(join(dir, 'claude-events.jsonl'), raw, { mode: 0o600 });
-          writeFileSync(join(dir, 'claude-stderr.log'), '', { mode: 0o600 });
-        } else {
-          result = await runStreaming(CLAUDE, claudeArgs({ model: browserSpec.model, effort: browserSpec.effort, settingsFile, schema: JSON.stringify(reportSchema), skillBundle, chrome }), {
-            input: prompt, cwd: s.worktree, env: { ...sanitizedEnv(), ...(applicationBrowser(spec.browser) ? browserEnv : {}), TMPDIR: socketDir, ORCH_IMPLEMENTER: '1', API_BASE_URL: spec.browser.api_base_url ?? 'http://127.0.0.1:1' },
-            timeout: (browserSpec.browser_timeout_minutes ?? spec.browser_timeout_minutes ?? 30) * 60_000, killSignal: 'SIGTERM', stdoutFile: join(dir, 'claude-events.jsonl'), stderrFile: join(dir, 'claude-stderr.log'), onStdout: (chunk) => splitter.push(chunk), onHeartbeat: () => obs.heartbeat(),
-          });
-          splitter.end();
-          raw = readFileSync(join(dir, 'claude-events.jsonl'), 'utf8');
+        try {
+          if (browserSpec.claude_transport === 'omnigent') {
+            const host = orchHostStatus({ home: homedir(), record: OMNIGENT_HOST_RECORD, requireClaudeLauncher: true });
+            if (!host.ok || !host.record?.claude_launcher) throw new Error('Claude browser requires cockpit host with the ORCH launcher');
+            result = await runClaudeHub({ worktree: s.worktree, dir, tmpDir: sideTmpDir(task, side), settings, chrome,
+              env: { ...(applicationBrowser(spec.browser) ? browserEnv : {}), TMPDIR: socketDir, ORCH_IMPLEMENTER: '1', NEXT_TELEMETRY_DISABLED: '1', API_BASE_URL: spec.browser.api_base_url ?? 'http://127.0.0.1:1' },
+              model: browserSpec.model, effort: browserSpec.effort, prompt, schema: reportSchema, skillBundle,
+              title: `${task.id} · browser verification · Claude`, timeoutMs: (browserSpec.browser_timeout_minutes ?? spec.browser_timeout_minutes ?? 30) * 60_000,
+              pollMs: Number(process.env.ORCH_OMNIGENT_POLL_MS ?? 2000), signal: controller.signal,
+              onHeartbeat: () => obs.heartbeat(), onSession: (id) => {
+                sessionId = id; attempts.at(-1).session_id = id;
+                console.log(`browser-verify: Claude Omnigent session ${id}`);
+                writeJsonAtomic(join(stateDir(task), 'live', 'agents', `${side}.session.json`), { session_id: id, provider: 'claude', title: `${task.id} · browser verification · Claude`, started_at: now() });
+              },
+            });
+            raw = result.native;
+            progress.seen.report = result.report;
+            progress.seen.result = result.text;
+            writeFileSync(join(dir, 'claude-events.jsonl'), raw, { mode: 0o600 });
+            writeFileSync(join(dir, 'claude-stderr.log'), '', { mode: 0o600 });
+          } else {
+            result = await runStreaming(CLAUDE, claudeArgs({ model: browserSpec.model, effort: browserSpec.effort, settingsFile, schema: JSON.stringify(reportSchema), skillBundle, chrome }), {
+              input: prompt, cwd: s.worktree, env: { ...sanitizedEnv(), ...(applicationBrowser(spec.browser) ? browserEnv : {}), TMPDIR: socketDir, ORCH_IMPLEMENTER: '1', API_BASE_URL: spec.browser.api_base_url ?? 'http://127.0.0.1:1' },
+              timeout: (browserSpec.browser_timeout_minutes ?? spec.browser_timeout_minutes ?? 30) * 60_000, killSignal: 'SIGTERM', stdoutFile: join(dir, 'claude-events.jsonl'), stderrFile: join(dir, 'claude-stderr.log'), onStdout: (chunk) => splitter.push(chunk), onHeartbeat: () => obs.heartbeat(),
+            });
+            splitter.end();
+            raw = readFileSync(join(dir, 'claude-events.jsonl'), 'utf8');
+          }
+        } finally {
+          await devServer.stop();
+          // Claude reads the log in its artifact dir; evidence keeps a copy.
+          if (existsSync(join(artifacts, 'dev-server.log'))) cpSync(join(artifacts, 'dev-server.log'), join(dir, 'dev-server.log'));
         }
         const events = raw.split('\n').flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
         attempts.at(-1).exit = result.status;
@@ -1625,7 +1656,7 @@ async function cmdBrowserVerify(taskPath, side) {
   const reportDigest = existsSync(reportFile) ? sha256(readFileSync(reportFile)) : null;
   s.rework = (s.rework ?? []).filter((f) => f.source !== 'browser');
   if (!failure && report?.status === 'failed') s.rework.push(...report.checks.filter((c) => c.status === 'failed').map((c) => ({ source: 'browser', side, severity: 'blocking', summary: `${c.criterion}: ${c.observations}` })));
-  recordStep(state, side, 'browser', { exit, tree, verify_at: verified.at, provider, model: browserSpec.model, attempts, session_id: sessionId, dir, report_status: report?.status ?? 'blocked', report_sha256: reportDigest, error: failure, screenshots: copied, evidence });
+  recordStep(state, side, 'browser', { exit, tree, verify_at: verified.at, provider, model: browserSpec.model, attempts, session_id: sessionId, dir, report_status: report?.status ?? 'blocked', report_sha256: reportDigest, error: failure, screenshots: copied, evidence, backend });
   saveState(task, state, { sides: [side] });
   if (removeBrowserTemp && !stillListening) rmSync(socketDir, { recursive: true, force: true });
   obs.finish(exit === 0 ? 'idle' : 'blocked', failure ?? report?.summary ?? 'browser verification blocked', { exit, next: exit === 0 ? 'commit' : null });

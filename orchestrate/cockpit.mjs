@@ -23,6 +23,7 @@ import { fileURLToPath } from 'node:url';
 import { claudeHostLauncherProblems, lintBundle, omnigentEnv, orchHostStatus, parseVersion, readPin, syncClaudeSettings } from './lib/omnigent.mjs';
 import { codexCodeModeHostDisabled, codexSandboxPolicies, codexUserConfigProblems, loopbackUrl, omnigentClient, runCodexSession, sandboxPolicyProblems, sessionPolicies } from './lib/omnigent-runner.mjs';
 import { claudeAvailable as claudeCheck } from './lib/claude-limit.mjs';
+import { stageClaudeRuntime } from './lib/claude-hub.mjs';
 import { scanSecrets } from './lib/secrets.mjs';
 import { readAgentConfig } from './lib/agent-config.mjs';
 import { techLeadSkillPrompt, materializeSkillBundle, materializeRoleAgent, pinSkill } from './lib/skills.mjs';
@@ -97,6 +98,10 @@ export async function healthProblems({ home = process.env.HOME, record = HOST_RE
  */
 export function reviewerCommand(prompt, { bin = BIN, env = omnigentEnv(), role = readAgentConfig().roles.reviewer, skillBindings = [] } = {}) {
   const problems = [...startProblems({ bin, env }), ...agentSettingsProblems()];
+  if (!problems.length) {
+    try { stageClaudeRuntime({ path: env.PATH, home: env.HOME }); }
+    catch (error) { problems.push(`Claude reviewer runtime unavailable: ${error.message}`); }
+  }
   for (const dir of RUN_DIRS) mkdirSync(join(ORCH_REPO, 'runs', dir), { recursive: true, mode: 0o700 });
   const agent = problems.length ? AGENTS.reviewer : materializeRoleAgent(join(BUNDLE, 'orch-reviewer'), skillBindings, tmpdir());
   return { command: bin, args: ['run', agent, '--model', role.model, '-p', prompt], env, cwd: WORKSPACE, problems };

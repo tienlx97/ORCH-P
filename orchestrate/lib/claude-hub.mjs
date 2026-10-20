@@ -2,7 +2,7 @@
 // The host PATH wrapper merges the ORCH settings AFTER Omnigent adds its hook sidecar.
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -46,12 +46,30 @@ export function validateClaudeReport(value, rule, path = 'report') {
   return value;
 }
 
-export function realClaude(path = process.env.PATH ?? '') {
-  for (const directory of path.split(delimiter)) {
-    const candidate = join(directory, 'claude');
+export function realClaude(path = process.env.PATH ?? '', home = homedir()) {
+  const candidates = [...path.split(delimiter).map(directory => join(directory, 'claude')),
+    join(home, '.nvm', 'orch-claude-runtime', 'claude')];
+  for (const candidate of candidates) {
     try { if (statSync(candidate).isFile() && realpathSync(candidate) !== realpathSync(WRAPPER)) return candidate; } catch { /* next entry */ }
   }
   throw new Error('no Claude executable after the ORCH wrapper in PATH');
+}
+
+// The bundle already mounts ~/.nvm read-only. Native Claude installs under
+// ~/.local are outside that mount; stage only the executable, not user state.
+export function stageClaudeRuntime({ path = process.env.PATH ?? '', home = homedir() } = {}) {
+  const source = realClaude(path, home);
+  const directory = join(home, '.nvm', 'orch-claude-runtime');
+  const target = join(directory, 'claude');
+  if (resolve(source) === target) return target;
+  const bytes = readFileSync(source);
+  if (existsSync(target) && digest(readFileSync(target)) === digest(bytes)) return target;
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const temporary = join(directory, `claude-${randomUUID()}`);
+  copyFileSync(source, temporary);
+  chmodSync(temporary, 0o700);
+  renameSync(temporary, target);
+  return target;
 }
 
 export function mergeClaudeSettings(args, strict) {

@@ -5,11 +5,29 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { claudeImplementerSettings } from '../orchestrate/lib/claude-runner.mjs';
-import { mergeClaudeSettings, nativeQuotaLimited, runClaudeHub, validateClaudeReport } from '../orchestrate/lib/claude-hub.mjs';
+import { mergeClaudeSettings, nativeQuotaLimited, realClaude, runClaudeHub, stageClaudeRuntime, validateClaudeReport } from '../orchestrate/lib/claude-hub.mjs';
 import { omnigentClient } from '../orchestrate/lib/omnigent-runner.mjs';
 import { startOmnigentStub } from './omnigent-stub.mjs';
 
 const wrapper = resolve('orchestrate/bin/claude');
+test('native Claude remains executable inside the existing nvm-only runtime mount', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'orch-native-claude-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const bin = join(root, '.local', 'bin');
+  mkdirSync(bin, { recursive: true });
+  const source = join(bin, 'claude');
+  writeFileSync(source, '#!/bin/sh\necho native-v1\n', { mode: 0o700 });
+  const staged = stageClaudeRuntime({ path: bin, home: root });
+  assert.equal(staged, join(root, '.nvm', 'orch-claude-runtime', 'claude'),
+    'nested dot-directories are masked by the bundle sandbox');
+  assert.equal(readFileSync(staged, 'utf8'), readFileSync(source, 'utf8'));
+  // The sandbox cannot see ~/.local; only the wrapper and nvm cache remain.
+  assert.equal(realClaude(dirname(wrapper), root), staged);
+  assert.equal(spawnSync(staged, [], { encoding: 'utf8' }).stdout.trim(), 'native-v1');
+  writeFileSync(source, '#!/bin/sh\necho native-v2\n');
+  assert.equal(stageClaudeRuntime({ path: bin, home: root }), staged);
+  assert.equal(spawnSync(staged, [], { encoding: 'utf8' }).stdout.trim(), 'native-v2');
+});
 test('native quota rejection is recognized even before bridge items arrive, never from quoted tool output', () => {
   const entry = { type: 'assistant', isApiErrorMessage: true, apiError: 'usage_limit_reached',
     message: { content: [{ type: 'text', text: "You've hit your weekly limit" }] } };

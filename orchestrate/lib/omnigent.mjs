@@ -92,6 +92,7 @@ export function readPin(bundleDir) {
 export const KNOWN_RISKS = Object.freeze({
   'codex-read-isolation': Object.freeze(['CANARY_READ', 'SSH_KEY_READ', 'CODEX_AUTH_READ', 'OMNIGENT_STATE_READ', 'BE_ENV_READ']),
   'debby-unsandboxed': Object.freeze([]),
+  'claude-chrome-login': Object.freeze([]),
   'agent-prompt-preapproval': Object.freeze([]),
   'agent-no-cel': Object.freeze([]),
   'agent-autonomous': Object.freeze([]),

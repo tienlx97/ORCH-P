@@ -6,6 +6,8 @@ import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { createServer } from 'node:http';
+import { connect } from 'node:net';
 import {
   appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
@@ -1617,14 +1619,20 @@ for (const scenario of ['passed', 'failed', 'blocked', 'changed-source', 'no-too
   });
 }
 
-for (const scenario of ['chrome', 'quota-fallback', 'codex-quota-fallback', 'sandbox-disabled', 'application']) {
-  test(`browser verification Claude: ${scenario}`, async () => {
+// The host, not Claude's sandbox, runs the FE dev server for Claude QA.
+const hostDevServer = ['node', '-e', "require('node:http').createServer((q, r) => r.end('ok')).listen(64992, '127.0.0.1')"];
+for (const scenario of ['chrome', 'quota-fallback', 'codex-quota-fallback', 'sandbox-disabled', 'application', 'backend-down']) {
+  test(`browser verification Claude: ${scenario}`, async (t) => {
     const { ctx, bundle } = omnigentSetup();
+    const backend = createServer((q, r) => r.end()).listen(0, '127.0.0.1');
+    await once(backend, 'listening');
+    t.after(() => backend.close());
+    const apiBase = scenario === 'backend-down' ? 'http://127.0.0.1:1' : `http://127.0.0.1:${backend.address().port}`;
     const criterion = 'browser: folder selection is highlighted';
     ctx.task.sides.fe = { ...ctx.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5', fallback: { runner: 'omnigent', model: 'test-model' },
-      acceptance_criteria: [criterion], browser: { url: 'http://127.0.0.1:64992/test', start_command: ['pnpm', 'dev', '-p', '64992'], test_data_only: true } };
-    if (scenario === 'application') {
-      ctx.task.sides.fe.browser = { ...ctx.task.sides.fe.browser, workflow: 'application', url: 'http://127.0.0.1:64992/logistics/contract/demo', api_base_url: 'http://localhost:8081',
+      acceptance_criteria: [criterion], browser: { url: 'http://127.0.0.1:64992/test', start_command: hostDevServer, test_data_only: true } };
+    if (scenario === 'application' || scenario === 'backend-down') {
+      ctx.task.sides.fe.browser = { ...ctx.task.sides.fe.browser, workflow: 'application', url: 'http://127.0.0.1:64992/logistics/contract/demo', api_base_url: apiBase,
         application: { path: '/logistics/contract/demo', authentication: 'fe-local', navigation: ['Login', 'Logistics', 'Documents'], mutations: [] } };
     }
     if (scenario === 'codex-quota-fallback') ctx.task.qa_config = { runner: 'omnigent', model: 'test-model', effort: 'medium', browser_timeout_minutes: 30, fallback: { runner: 'claude', model: 'claude-opus-5-5', effort: 'high', claude_transport: 'cli' } };
@@ -1639,6 +1647,9 @@ const fs = require('node:fs'); let input = '';
 const out = (e) => process.stdout.write(JSON.stringify(e) + '\\n');
 process.stdin.on('data', (c) => input += c);
 process.stdin.on('end', () => {
+  if (input.includes('browser verifier') && !input.includes('The host already started')) {
+    process.stderr.write('Claude QA must not start its own sandboxed dev server'); process.exitCode = 1; return;
+  }
   if (input.includes('browser verifier') && (!process.env.TMPDIR?.startsWith('/tmp/ab-') || process.env.TMPDIR.length >= 48)) {
     process.stderr.write('Browser TMPDIR is too long for Chrome SingletonSocket'); process.exitCode = 1; return;
   }
@@ -1649,7 +1660,7 @@ process.stdin.on('end', () => {
   if (${JSON.stringify(scenario)} === 'application') {
     const artifactDir = /Save screenshots\\/snapshots only in ([^;]+);/.exec(input)[1];
     fs.writeFileSync(artifactDir + '/app.png', Buffer.from('89504e470d0a1a0a', 'hex'));
-    out({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'browser-call', name: 'Bash', input: { command: 'agent-browser --session own snapshot -i' } }] } });
+    out({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'browser-call', name: 'mcp__claude-in-chrome__navigate', input: { url: 'http://127.0.0.1:64992/logistics/contract/demo' } }] } });
     out({ type: 'result', structured_output: ${JSON.stringify(report)} }); return;
   }
   if (${JSON.stringify(scenario)} === 'quota-fallback') {
@@ -1674,18 +1685,23 @@ process.stdin.on('end', () => {
       const env = omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url, ORCH_DEFAULTS: '1', ORCH_CLAUDE_BIN: stubClaude, ORCH_CLAUDE_SANDBOX_TOOLS: 'sh' });
       for (const command of ['implement', 'check', 'verify']) assert.equal(orch(ctx, [command, ctx.taskFile, 'fe'], env).status, 0);
       const result = await orchAsync(ctx, ['browser-verify', ctx.taskFile, 'fe'], env).done;
-      assert.equal(result.code, scenario === 'sandbox-disabled' ? 1 : 0, result.out);
+      assert.equal(result.code, ['sandbox-disabled', 'backend-down'].includes(scenario) ? 1 : 0, result.out);
       const browser = state(ctx).sides.fe.steps.browser;
+      assert.equal(await new Promise(done => connect(64992, '127.0.0.1').once('connect', () => done(true)).once('error', () => done(false))), false, 'host dev server must be stopped');
+      if (scenario === 'backend-down') { assert.match(browser.error, /no docker-compose.dev.yml/); assert.equal(stub.requests.length, 0); return; }
+      if (!['quota-fallback'].includes(scenario)) assert.ok(existsSync(join(browser.dir, 'dev-server.log')));
       assert.equal(browser.provider, scenario === 'quota-fallback' ? 'codex' : 'claude');
       const settings = JSON.parse(readFileSync(join(browser.dir, 'claude-settings.json'), 'utf8'));
       assert.ok(settings.permissions.deny.includes('Edit') && settings.permissions.deny.includes('Write'));
+      if (scenario !== 'quota-fallback') assert.ok(settings.sandbox.filesystem.allowWrite.some(p => /^\/tmp\/ab-[0-9a-f]{8}$/.test(p)),
+        'agent-browser must be able to create its socket under the private TMPDIR');
       if (scenario === 'codex-quota-fallback') {
         assert.deepEqual(browser.attempts.map(a => a.provider), ['codex', 'claude']);
         assert.equal(browser.attempts[0].reason, 'provider_usage_limit');
         assert.ok(browser.evidence.includes('session-items.jsonl'));
         assert.ok(existsSync(join(browser.dir, 'chrome-1.png')));
       }
-      if (scenario === 'application') { assert.ok(settings.permissions.deny.includes('mcp__claude-in-chrome')); assert.ok(existsSync(join(browser.dir, 'app.png'))); }
+      if (scenario === 'application') { assert.ok(settings.permissions.allow.includes('mcp__claude-in-chrome')); assert.ok(existsSync(join(browser.dir, 'app.png'))); }
       if (scenario === 'chrome') assert.ok(existsSync(join(browser.dir, 'chrome-1.png')));
       if (scenario === 'sandbox-disabled') assert.equal(stub.requests.length, 0, 'safety failure must not switch provider');
     } finally { await stub.close(); }

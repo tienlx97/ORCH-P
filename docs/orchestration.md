@@ -399,6 +399,12 @@ reviewer defaults and transport. `ORCH_REVIEW_CODEX_MODEL` remains an explicit o
 
 ### Claude FE/browser transport
 
+Before launching the bundle reviewer, cockpit synchronizes the installed Claude
+executable into `~/.nvm/orch-claude-runtime/claude`. The existing read-only nvm
+mount exposes this executable when a native `~/.local` install is invisible inside
+bwrap. Only executable bytes are copied; account state and sandbox mounts stay
+unchanged. The launcher uses this cache only when PATH has no visible Claude.
+
 New specialist templates set `claude_transport: omnigent` on their Claude fallback;
 legacy Claude tasks without this field keep `cli`. Backend Claude runs omit Chrome. Both transports use the same Claude settings and `fe-claude-chrome` accepted risk.
 The native path creates separately titled implementer/browser sessions visible on the Web UI.
@@ -455,10 +461,32 @@ in the original FE checkout's ignored `.ai-login.local.md`; never paste its valu
 or `.env` contents into tasks/prompts. ORCH-P supplies a trusted login helper command
 that reads the file privately and submits the real login form via isolated
 agent-browser batch stdin. It suppresses child output, including failures, and
-never persists account values. Both QA providers use agent-browser for application
-workflows; the Claude shell sandbox remains enabled and its Chrome tools are denied
-for that workflow. No user profile/session is imported. Agents must never read
-credentials, cookies or auth tokens or capture the filled login screen.
+never persists account values. Codex QA uses agent-browser and this helper. Claude QA
+uses Claude in Chrome (accepted risk `fe-claude-chrome`; user decision 2026-10-20):
+its shell sandbox blocks `AF_UNIX` sockets and Chrome's nested sandbox, so the
+agent-browser daemon cannot start there, and the sandbox is not widened for it.
+In Chrome the FE session cookie is host-scoped, so an existing login on the same
+host carries over. With the accepted risk `claude-chrome-login` (user decision
+2026-10-20) a `/login` redirect is handled by Claude reading FE-P/.ai-login.local.md and
+typing the local dev account into the real form; the value then appears in the Claude
+transcript and `runs/` evidence, but never in the prompt, report or messages, and
+`/login` is never captured. Without that risk Claude may use only Chrome's
+saved-password autofill, and QA reports `login: sign in once ...` as blocked. The sandbox also has its own network
+namespace, so for Claude QA the host starts `start_command` in the gated worktree
+outside the sandbox, waits for `url`, and stops the server after the attempt; Claude
+must not start servers itself.
+
+Before every FE application QA run (`browser-verify`), the host also prepares the dev
+backend. Autopilot passes the reviewed BE commit of the same task or of the plan's
+latest finished BE task (`ORCH_QA_BACKEND`); the BE worktree must be a clean BE-P
+worktree at exactly that commit. The host then runs BE-P's own command from that
+worktree, `docker compose -f docker-compose.dev.yml --project-directory <worktree>
+--env-file BE-P/.env up -d --build api` (same `companymanagement-dev` project, dev DB
+volume and `API_PORT`, default 8081), and waits until `api_base_url` answers. The
+rebuilt API keeps running after QA. Without a BE task, a running backend is reused
+and a stopped one starts from the BE-P checkout. Build output is in
+`fe-browser-*/backend.log`; a failed build or check blocks QA. Agents must never read credentials,
+cookies or auth tokens or capture the filled login screen.
 
 `application.path` must match the browser URL and cannot be a `/dev`, test or fixture
 route. `navigation` describes the actual menu → parent/detail → tab steps, not merely

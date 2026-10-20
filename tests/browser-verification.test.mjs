@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fixtureUiRouteFile, implementationApplicationCheck, browserConfigProblems, browserCriteria, browserPrompt, chromeScreenshots, validateBrowserReport } from '../orchestrate/lib/browser-verification.mjs';
+import { agentBrowserTransport, fixtureUiRouteFile, implementationApplicationCheck, browserConfigProblems, browserCriteria, browserPrompt, chromeScreenshots, validateBrowserReport } from '../orchestrate/lib/browser-verification.mjs';
 
 const config = { url: 'http://127.0.0.1:3101/test-page', start_command: ['pnpm', 'dev', '-p', '3101'], test_data_only: true };
 const criteria = ['browser: selects a folder', 'browser: no horizontal scroll at 390px'];
@@ -96,13 +96,30 @@ test('a fixture report cannot pass application QA, and every real navigation ste
   }
 });
 
-test('both application QA providers use isolated login helper and forbid fixture substitution', () => {
+test('application QA: Codex uses the isolated login helper, Claude uses Chrome without account values; both forbid fixtures', () => {
   for (const provider of ['codex', 'claude']) {
     const prompt = browserPrompt({ taskId: 'APP', worktree: '/wt', tree: 'abc', config: application(), criteria, artifactDir: '/tmp/run', session: 'orch-app-123', provider,
       loginCommand: ['node', '/orch/browser-login.mjs', '/tmp/run/local-login.json'] });
-    assert.match(prompt, /browser-login.mjs/); assert.match(prompt, /Use agent-browser CLI/);
+    if (provider === 'codex') {
+      assert.match(prompt, /browser-login.mjs/); assert.match(prompt, /Use agent-browser CLI/);
+      assert.doesNotMatch(prompt, /Use only mcp__claude-in-chrome/);
+    } else {
+      // Claude's shell sandbox cannot start agent-browser (no AF_UNIX, no nested Chrome sandbox).
+      assert.equal(agentBrowserTransport(application(), provider), false);
+      assert.doesNotMatch(prompt, /browser-login.mjs|Use agent-browser CLI/);
+      assert.match(prompt, /Use only mcp__claude-in-chrome/);
+      assert.match(prompt, /saved-password autofill/); assert.match(prompt, /Never read the account file, type or form_input account values/);
+      // Accepted risk claude-chrome-login: Claude reads the file at runtime; values never enter the prompt.
+      const typed = browserPrompt({ taskId: 'APP', worktree: '/wt', tree: 'abc', config: application(), criteria, artifactDir: '/tmp/run', session: 'orch-app-123', provider,
+        chromeLoginFile: '/fe/.ai-login.local.md' });
+      assert.match(typed, /read the local dev account from \/fe\/\.ai-login\.local\.md \(accepted risk claude-chrome-login\)/);
+      assert.match(typed, /never take screenshots, read_page or get_page_text while on \/login/);
+      assert.doesNotMatch(typed, /saved-password autofill/);
+      assert.match(prompt, /Never trigger permission prompts or native dialogs \(navigator\.clipboard/);
+      const hosted = browserPrompt({ taskId: 'APP', worktree: '/wt', tree: 'abc', config: application(), criteria, artifactDir: '/tmp/run', session: 'orch-app-123', provider, hostServer: true });
+      assert.match(hosted, /Its request log .* is \/tmp\/run\/dev-server\.log/);
+    }
     assert.match(prompt, /Do not mock\/intercept API/); assert.match(prompt, /Contract detail/);
-    assert.doesNotMatch(prompt, /Use only mcp__claude-in-chrome/);
     assert.match(prompt, /Apart from the approved login form/);
     assert.match(prompt, /Do not create, extend, navigate to or test standalone/);
     assert.doesNotMatch(prompt, /fixtures? (?:are|is) supplementary/);

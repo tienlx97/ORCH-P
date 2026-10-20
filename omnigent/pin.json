@@ -119,6 +119,15 @@
       "scope": "Generic secret matches become advisory throughout the pipeline; approved local dev actions need no additional data attestation; browser acceptance runs after the gate; explicit resume retries ordinary implementation/environment blocks.",
       "reason": "Reduce false positives, duplicate browser work and permanent environment blocks. Unknown credentials may evade recognizable-format blocking; broad output redaction remains. Real browser failures, source scope, Git integrity, gates, approval binding, review provenance and no push/merge remain enforced.",
       "until": "the user withdraws it; remove this risk to restore strict defaults"
+    },
+    {
+      "id": "claude-chrome-login",
+      "checks": [],
+      "approved_by": "user",
+      "date": "2026-10-20",
+      "source": "Claude Code conversation 2026-10-20: asked how Claude QA in Chrome should log in, the user chose 'Cho Claude đọc file và gõ' (let Claude read FE-P/.ai-login.local.md and type it).",
+      "scope": "Claude browser QA (browser-verify, Claude in Chrome transport) only. When the FE redirects to /login, Claude may read FE-P/.ai-login.local.md and type the local dev account into the actual login form. Codex QA keeps the trusted agent-browser login helper.",
+      "reason": "Claude's shell sandbox cannot run agent-browser, so the trusted login helper cannot fill the Chrome form. The local dev account value therefore appears in the Claude/Omnigent transcript and browser evidence under runs/. The prompt still forbids repeating it in messages, the report or file names, and forbids screenshots or page reads on /login. Prompt/task files, .env values and the secret scan are unchanged."
     }
   ]
 }

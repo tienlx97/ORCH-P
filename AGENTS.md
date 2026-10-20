@@ -67,6 +67,9 @@ rounds. Preserve existing data, actual acceptance evidence and the repository ga
    docs/orchestration.md#omnigent-defaults).
    Active since 2026-10-19: `http-file-secret-hits` (user-approved exemption for `.http`
    files from source secret scanning; scope/protected paths and prompt/output scans remain).
+   Active since 2026-10-20: `claude-chrome-login` (Claude browser QA in Chrome may read
+   FE-P/.ai-login.local.md and type the local dev account into the login form; see
+   docs/orchestration.md#browser-verification).
    Also active: `solo-dev` (generic secret matches advisory, no extra dev-data attestations,
    browser acceptance after the gate, retry ordinary implementation blocks; see the policy above).
    Never add or widen an accepted risk without that decision.

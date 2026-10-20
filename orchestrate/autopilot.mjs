@@ -195,9 +195,9 @@ export function acquireLock(dir) {
 
 // ── steps ────────────────────────────────────────────────────────────────
 /** Runs one orchestrate.mjs command (or another ORCH-P script); output goes to the plan log. Returns { exit, output }. */
-function runCli(ctx, args, script = ctx.cli) {
+function runCli(ctx, args, script = ctx.cli, env = ctx.env) {
   return new Promise((done) => {
-    const child = spawn(process.execPath, [script, ...args], { cwd: ORCH_REPO, env: ctx.env, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [script, ...args], { cwd: ORCH_REPO, env, stdio: ['ignore', 'pipe', 'pipe'] });
     ctx.child = child;
     let output = '';
     const keep = (d) => { output = (output + d).slice(-100_000); };
@@ -210,6 +210,19 @@ function runCli(ctx, args, script = ctx.cli) {
       done({ exit, output });
     });
   });
+}
+
+/** FE browser QA runs against the reviewed BE commit of this task or of the plan's latest BE task. */
+function qaBackendEnv(ctx, item) {
+  const own = taskState(ctx, item.id)?.sides?.be;
+  let source = own?.steps?.commit?.commit ? { task: item.id, worktree: own.worktree, commit: own.steps.commit.commit } : null;
+  if (!source) {
+    const [id, done] = Object.entries(ctx.state.tasks).filter(([id, t]) => id !== item.id
+      && ['ready_for_human_merge', 'needs_contract_pilot'].includes(t.status) && t.commits?.be).at(-1) ?? [];
+    const worktree = id && taskState(ctx, id)?.sides?.be?.worktree;
+    if (worktree) source = { task: id, worktree, commit: done.commits.be };
+  }
+  return source ? { ...ctx.env, ORCH_QA_BACKEND: JSON.stringify(source) } : ctx.env;
 }
 
 function taskState(ctx, id) {
@@ -272,7 +285,7 @@ async function sideToCommit(ctx, item, side, { from = 'implement' } = {}) {
     } else if (step === 'commit') {
       if (browserCriteria(item.task.sides[side]).length) {
         ctx.progress(item, `${side}: browser verification`);
-        const browser = await runCli(ctx, ['browser-verify', t, side]);
+        const browser = await runCli(ctx, ['browser-verify', t, side], ctx.cli, side === 'fe' ? qaBackendEnv(ctx, item) : ctx.env);
         if (browser.exit !== 0) {
           const s = taskState(ctx, item.id)?.sides?.[side];
           if (!s?.steps?.browser?.error && s?.steps?.browser?.report_status === 'failed' && gateRounds < item.maxRework) {
@@ -434,7 +447,7 @@ async function runTask(ctx, item) {
       if (state?.steps?.browser?.exit === 0 && state.steps.browser.tree === state.steps.commit?.tree
           && state.steps.browser.verify_at === state.steps.verify?.at) continue;
       ctx.progress(item, `${side}: browser verification`);
-      const browser = await runCli(ctx, ['browser-verify', item.runFile, side]);
+      const browser = await runCli(ctx, ['browser-verify', item.runFile, side], ctx.cli, side === 'fe' ? qaBackendEnv(ctx, item) : ctx.env);
       if (browser.exit !== 0) throw new Stop(`${item.id} ${side}: browser verification failed or blocked${tailLine(browser.output)}`);
     }
     const verdict = await review(ctx, item);
