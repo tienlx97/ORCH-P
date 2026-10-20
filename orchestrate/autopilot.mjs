@@ -41,7 +41,11 @@ import { lastAssistantText, loopbackUrl, omnigentClient } from './lib/omnigent-r
 import { claudeAvailable as claudeCheck } from './lib/claude-limit.mjs';
 import { scanSecrets } from './lib/secrets.mjs';
 import { browserCriteria } from './lib/browser-verification.mjs';
-import { validateTask } from './orchestrate.mjs';
+import { canRecheckSourceBlock, canRetryImplementationBlock, validateTask } from './orchestrate.mjs';
+import { skillPrompt, requiredSkills } from './lib/skills.mjs';
+import { readAgentConfig } from './lib/agent-config.mjs';
+import { checkoutReviewedProject } from './lib/project-checkout.mjs';
+import { resolveReferenceInputs } from './lib/reference-inputs.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ORCH_REPO = resolve(HERE, '..');
@@ -129,10 +133,16 @@ export function checkPlan(planPath, { workspace = WORKSPACE, stateRoot = STATE_R
       } else if (!SHA.test(value) && !REF.test(value)) problems.push(`${where}.base.${side}: ${value} is not a SHA or a branch name`);
       base[side] = value;
     }
+    for (const spec of Object.values(task.sides ?? {})) for (const input of Array.isArray(spec.reference_inputs) ? spec.reference_inputs : []) {
+      if (typeof input?.revision === 'string' && input.revision.startsWith('after:')) {
+        const earlier = seen.get(input.revision.slice(6));
+        if (!earlier?.sides.includes(input.repository)) problems.push(`${where}.reference_inputs: ${input.revision} must name an earlier task with a ${input.repository} side`);
+      }
+    }
     if (!preApproved && sides.length) {
       // Everything prepare will check except the bases, which exist only once the plan runs.
       const candidate = { ...structuredClone(task), status: 'approved', approval: { source: 'plan', approved_by: 'user' }, base_revision: Object.fromEntries(sides.map((s) => [s, '0'.repeat(40)])) };
-      try { validateTask(candidate, { resolveCommit: false }); } catch (error) { problems.push(`${where}: ${task.id} ${error.message.replace(/\n\s*/g, ' ')}`); }
+      try { validateTask(candidate, { resolveCommit: false, allowDeferredReferences: true }); } catch (error) { problems.push(`${where}: ${task.id} ${error.message.replace(/\n\s*/g, ' ')}`); }
     }
     const own = entry.max_rework ?? maxRework;
     if (!Number.isInteger(own) || own < 0 || own > MAX_REWORK_LIMIT) problems.push(`${where}.max_rework must be an integer from 0 to ${MAX_REWORK_LIMIT}`);
@@ -208,6 +218,8 @@ function taskState(ctx, id) {
 
 /** Where an existing run of a side stands, so a resumed plan continues instead of repeating steps. */
 export function nextStep(s) {
+  if (canRecheckSourceBlock(s)) return 'check';
+  if (canRetryImplementationBlock(s)) return 'implement';
   if (s?.status === 'blocked' || s?.steps?.implement?.blocked || s?.steps?.implement?.secret_hits?.length
       || s?.steps?.implement?.git_metadata_changed) return 'blocked';
   const at = (step) => (s?.steps?.[step] ? Date.parse(s.steps[step].at) : -1);
@@ -326,9 +338,9 @@ async function review(ctx, item, attempt = 1) {
   // Native Claude is a long-lived REPL and may remain open after quota rejection.
   // Check before starting it rather than waiting through two review timeouts.
   if (attempt === 1 && (await ctx.claudeAvailable()).limited) return reviewFallback(ctx, item, before);
-  const prompt = `Review task ${relative(WORKSPACE, item.runFile)}.`;
+  const prompt = `Review task ${relative(WORKSPACE, item.runFile)}.\n\n${skillPrompt(item.task, 'review')}`;
   ctx.progress(item, attempt === 1 ? 'review' : 'review (reviewer restarted)');
-  const reviewer = await ctx.startReviewer(prompt, item.task.review_config);
+  const reviewer = await ctx.startReviewer(prompt, item.task.review_config, requiredSkills(item.task, 'review'));
   let failure = null;
   try {
     const deadline = Date.now() + (item.task.review_config?.timeout_minutes ? item.task.review_config.timeout_minutes * 60_000 : ctx.reviewTimeoutMs);
@@ -368,15 +380,24 @@ function materialize(ctx, item) {
     if (value.startsWith('after:')) {
       const dep = ctx.state.tasks[value.slice(6)];
       const commit = dep?.commits?.[side];
-      if (dep?.status !== 'ready_for_human_merge' || !commit) throw new Stop(`${item.id}: ${value.slice(6)} has no reviewed ${side} commit to stack on`);
+      if (!['ready_for_human_merge', 'needs_contract_pilot'].includes(dep?.status) || !commit) throw new Stop(`${item.id}: ${value.slice(6)} has no reviewed ${side} commit to stack on`);
       base[side] = commit;
     } else base[side] = ctx.state.refs[`${side}:${value}`] ?? value;
   }
   const task = {
-    ...item.task, status: 'approved',
+    ...structuredClone(item.task), status: 'approved',
     approval: { source: `plan ${ctx.plan.id} (sha256 ${ctx.digest}) approved: ${ctx.approval}`, approved_by: 'user', plan_sha256: ctx.digest },
     base_revision: base,
   };
+  for (const spec of Object.values(task.sides)) {
+    if (spec.reference_inputs !== undefined) spec.reference_inputs = resolveReferenceInputs(spec.reference_inputs, {
+      repositories: ctx.repositories,
+      reviewedCommit: (id, repository) => {
+        const dependency = ctx.state.tasks[id];
+        return ['ready_for_human_merge', 'needs_contract_pilot'].includes(dependency?.status) ? dependency.commits?.[repository] : null;
+      },
+    });
+  }
   const file = join(ctx.dir, 'tasks', `${item.id}.json`);
   if (existsSync(file)) {
     // A resumed plan keeps the copy its run was prepared from (its digest binds the run).
@@ -435,9 +456,9 @@ async function runTask(ctx, item) {
 }
 
 /** Starts orch-reviewer through cockpit's checks; returns { exited(), stop() }. */
-async function startReviewerSession(prompt, role) {
+async function startReviewerSession(prompt, role, skillBindings = []) {
   const { reviewerCommand } = await import('./cockpit.mjs');
-  const { command, args, env, cwd, problems } = reviewerCommand(prompt, role ? { role } : {});
+  const { command, args, env, cwd, problems } = reviewerCommand(prompt, { ...(role ? { role } : {}), skillBindings });
   if (problems.length) throw new Stop(`cannot start the reviewer: ${problems.join('; ')}`);
   // `omnigent run` is a REPL: give it a terminal (script) and an stdin that stays open.
   const child = spawn('script', ['-qfec', [command, ...args].map(shellQuote).join(' '), '/dev/null'], {
@@ -485,9 +506,10 @@ export async function runApprovedTask(taskPath, options = {}) {
 export async function runPlan(planPath, {
   approval = 'typed `autopilot run` in a terminal', workspace = WORKSPACE, stateRoot = STATE_ROOT, cli = CLI, env = process.env,
   gateRunner = GATE_RUNNER, step0 = STEP0,
+  checkoutProject = checkoutReviewedProject, handoffPolicy = readAgentConfig().handoff ?? { checkout: 'project' },
   startReviewer = startReviewerSession, reviewTimeoutMs = REVIEW_TIMEOUT_MS, reviewPollMs = REVIEW_POLL_MS,
   claudeAvailable = async () => claudeCheck({ env }),
-  resolveRef = (side, ref) => gitRevParse(REPOS[side], ref), log = (m) => console.log(m),
+  resolveRef = (side, ref) => gitRevParse(REPOS[side], ref), repositories = REPOS, log = (m) => console.log(m),
 } = {}) {
   const checked = checkPlan(planPath, { workspace, stateRoot });
   if (checked.problems.length) {
@@ -525,11 +547,12 @@ export async function runPlan(planPath, {
       tasks: Object.fromEntries(tasks.map((t) => [t.id, { file: t.rel, status: 'pending' }])),
     };
   }
+  state.handoff_policy ??= structuredClone(handoffPolicy);
   state.status = 'running';
   state.runs = [...(state.runs ?? []), { approval, at: now(), pid: process.pid }];
   delete state.stopped;
   const ctx = {
-    plan, digest, dir, state, cli, env, gateRunner, step0, stateRoot, approval, startReviewer, reviewTimeoutMs, reviewPollMs, claudeAvailable, child: null,
+    plan, digest, dir, state, cli, env, gateRunner, step0, stateRoot, approval, startReviewer, reviewTimeoutMs, reviewPollMs, claudeAvailable, repositories, child: null,
     log: (m) => writeFileSync(logFile, `[${now()}] ${m}\n`, { flag: 'a', mode: 0o600 }),
     progress: (item, what) => {
       state.tasks[item.id].status = 'running';
@@ -552,6 +575,23 @@ export async function runPlan(planPath, {
       delete state.tasks[item.id].step;
       writeState(dir, state);
       log(`autopilot ${plan.id}: ${item.id} ${state.tasks[item.id].status}`);
+    }
+    if (ctx.interrupted) throw new Stop('interrupted');
+    if (state.handoff_policy.checkout === 'project') {
+      const latest = {};
+      for (const item of tasks) for (const side of item.sides) latest[side] = item;
+      state.project_checkout ??= {};
+      for (const [side, item] of Object.entries(latest)) {
+        const record = state.tasks[item.id];
+        if (state.project_checkout[side]?.status === 'checked_out' && state.project_checkout[side].commit === record.commits[side]) continue;
+        const source = taskState(ctx, item.id)?.sides?.[side];
+        const target = { repository: repositories[side], worktree: source?.worktree, branch: record.branches[side], commit: record.commits[side] };
+        const result = await checkoutProject(target);
+        state.project_checkout[side] = { ...result, task: item.id, branch: target.branch, commit: target.commit, at: now() };
+        const message = `project checkout ${side}: ${result.status}${result.reason ? ` — ${result.reason}` : ` ${target.branch} in ${target.repository}`}`;
+        ctx.log(message); log(`autopilot ${plan.id}: ${message}`);
+        writeState(dir, state);
+      }
     }
     state.status = 'done';
     state.summary = summary(state);
@@ -576,7 +616,8 @@ export async function runPlan(planPath, {
 
 function summary(state) {
   return Object.entries(state.tasks).map(([id, t]) => `${id} ${t.status}${t.branches ? ` (${Object.values(t.branches).join(', ')})` : ''}`).join('; ')
-    + '. Nothing was pushed: push and merge the branches in order.';
+    + Object.entries(state.project_checkout ?? {}).map(([side, result]) => `; ${side} project checkout ${result.status}${result.reason ? ` (${result.reason})` : ''}`).join('')
+    + '. Nothing was pushed. Complete any required contract pilot before pushing/merging in plan order.';
 }
 
 function gitRevParse(repo, ref) {

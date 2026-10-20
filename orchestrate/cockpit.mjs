@@ -20,11 +20,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { lintBundle, omnigentEnv, orchHostStatus, parseVersion, readPin, syncClaudeSettings } from './lib/omnigent.mjs';
+import { claudeHostLauncherProblems, lintBundle, omnigentEnv, orchHostStatus, parseVersion, readPin, syncClaudeSettings } from './lib/omnigent.mjs';
 import { codexCodeModeHostDisabled, codexSandboxPolicies, codexUserConfigProblems, loopbackUrl, omnigentClient, runCodexSession, sandboxPolicyProblems, sessionPolicies } from './lib/omnigent-runner.mjs';
 import { claudeAvailable as claudeCheck } from './lib/claude-limit.mjs';
 import { scanSecrets } from './lib/secrets.mjs';
 import { readAgentConfig } from './lib/agent-config.mjs';
+import { techLeadSkillPrompt, materializeSkillBundle, materializeRoleAgent, pinSkill } from './lib/skills.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ORCH_REPO = resolve(HERE, '..');
@@ -66,9 +67,9 @@ export function startProblems({ bundle = BUNDLE, bin = BIN, env = omnigentEnv(),
 /** Live readiness is distinct from valid configuration. No models or writes. */
 export async function healthProblems({ home = process.env.HOME, record = HOST_RECORD,
   url = process.env.ORCH_OMNIGENT_URL, agentName = process.env.ORCH_OMNIGENT_CODEX_AGENT ?? 'codex-native-ui',
-  hostId = process.env.ORCH_OMNIGENT_HOST, fetchImpl = fetch, timeoutMs = 5000 } = {}) {
+  hostId = process.env.ORCH_OMNIGENT_HOST, fetchImpl = fetch, timeoutMs = 5000, requireClaudeLauncher = false } = {}) {
   const problems = [];
-  const host = orchHostStatus({ home, record });
+  const host = orchHostStatus({ home, record, requireClaudeLauncher });
   if (!host.ok) problems.push(host.reason);
   try {
     const client = omnigentClient(loopbackUrl(url ?? undefined), {
@@ -94,10 +95,11 @@ export async function healthProblems({ home = process.env.HOME, record = HOST_RE
  * How autopilot starts the reviewer with its first message: the same checks,
  * environment and working directory as `start reviewer`.
  */
-export function reviewerCommand(prompt, { bin = BIN, env = omnigentEnv(), role = readAgentConfig().roles.reviewer } = {}) {
+export function reviewerCommand(prompt, { bin = BIN, env = omnigentEnv(), role = readAgentConfig().roles.reviewer, skillBindings = [] } = {}) {
   const problems = [...startProblems({ bin, env }), ...agentSettingsProblems()];
   for (const dir of RUN_DIRS) mkdirSync(join(ORCH_REPO, 'runs', dir), { recursive: true, mode: 0o700 });
-  return { command: bin, args: ['run', AGENTS.reviewer, '--model', role.model, '-p', prompt], env, cwd: WORKSPACE, problems };
+  const agent = problems.length ? AGENTS.reviewer : materializeRoleAgent(join(BUNDLE, 'orch-reviewer'), skillBindings, tmpdir());
+  return { command: bin, args: ['run', agent, '--model', role.model, '-p', prompt], env, cwd: WORKSPACE, problems };
 }
 
 // Agent settings outside ~/.omnigent that a platform could change (hooks,
@@ -164,13 +166,13 @@ function report(problems, ok) {
  * runs/requests, so the plan's approval is the user typing
  * `autopilot.mjs run` (AGENTS.md rule 4).
  */
-export function coordinatorCodexCommand({ bundle = BUNDLE, workspace = WORKSPACE, codex = process.env.ORCH_CODEX_BIN ?? 'codex' } = {}) {
+export function coordinatorCodexCommand({ bundle = BUNDLE, workspace = WORKSPACE, codex = process.env.ORCH_CODEX_BIN ?? 'codex', skillBundle = null } = {}) {
   const config = readFileSync(join(bundle, 'orch-coordinator', 'config.yaml'), 'utf8');
   const block = /^prompt: \|\n((?:  .*\n|\n)+)/m.exec(config)?.[1] ?? '';
   const base = block.split('\n').map((l) => l.replace(/^ {2}/, '')).join('\n').trim();
   const proposals = join(workspace, 'ORCH-P', 'runs', 'proposals');
   const prompt = [
-    base, '',
+    base, '', techLeadSkillPrompt({ bundle: skillBundle }), '',
     'CODEX FALLBACK (overrides the text above where they differ): Claude is out of tokens, so you are the coordinator on Codex.',
     `Your working directory is ${proposals} and it is the only place you can write. The workspace root is ${workspace}:`,
     `run every command from there (\`cd ${workspace} && ...\`). You cannot write ORCH-P/runs/requests. Where the text says to`,
@@ -203,13 +205,14 @@ export async function startCoordinatorCodexSession({ bundle = BUNDLE, workspace 
     '-c', 'shell_environment_policy.inherit="core"',
     '-c', 'shell_environment_policy.ignore_default_excludes=false',
     '-c', `shell_environment_policy.set.TMPDIR=${JSON.stringify(temp)}`];
-  const prompt = `${coordinatorCodexCommand({ bundle, workspace }).args.at(-1)}\n\nINITIALIZATION: Read the required ORCH-P instructions using repository commands, then reply that you are ready for the user to supply a spec in this chat. Do not write proposals, approve or execute any plan during initialization. Never approve requests using the Omnigent API.`;
+  const skillBundle = materializeSkillBundle({ skill_contract: { review: [pinSkill('orch-tech-lead')] } }, 'review', undefined, temp);
+  const prompt = `${coordinatorCodexCommand({ bundle, workspace, skillBundle }).args.at(-1)}\n\nINITIALIZATION: Read the required ORCH-P instructions using repository commands, then reply that you are ready for the user to supply a spec in this chat. Do not write proposals, approve or execute any plan during initialization. Never approve requests using the Omnigent API.`;
   if (scanSecrets(prompt, 'coordinator prompt').length) throw new Error('secret-like text in coordinator prompt');
   writeFileSync(join(dir, 'command.json'), `${JSON.stringify({ server: base, workspace: proposals, launch_args: launchArgs, tmpdir: temp }, null, 2)}\n`, { mode: 0o600 });
   let result, sessionId;
   try {
     result = await runSession({ client: omnigentClient(base), agentName, hostId, worktree: proposals,
-      title: 'ORCH-P · coordinator · Codex', launchArgs, policies: sessionPolicies(proposals), prompt,
+      title: 'ORCH-P · coordinator · Codex', launchArgs, skillBundle, policies: sessionPolicies(proposals), prompt,
       timeoutMs: 5 * 60_000, pollMs, signal,
       onSession: (id) => {
         sessionId = id;
@@ -285,7 +288,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.exit(problems.length === 0 ? 0 : 1);
   }
   if (command === 'check-config') process.exit(report(startProblems(), 'cockpit: configuration valid (runtime not checked)'));
-  if (command === 'check') process.exit(report([...startProblems(), ...await healthProblems()], 'cockpit: configuration valid; host and API online'));
+  if (command === 'check') process.exit(report([...startProblems(), ...await healthProblems({ requireClaudeLauncher: true })], 'cockpit: configuration valid; host and API online'));
   if (command === 'up' || command === 'ready') {
     const { runnerStatus, startRunner } = await import('./runner.mjs');
     const problems = startProblems();
@@ -294,7 +297,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       const child = spawnSync(process.execPath, [fileURLToPath(import.meta.url), 'host'], { stdio: 'inherit', timeout: 130_000 });
       if (child.status !== 0) process.exit(child.status ?? 1);
     }
-    const health = await healthProblems();
+    const health = await healthProblems({ requireClaudeLauncher: true });
     if (health.length) process.exit(report(health));
     const runner = command === 'up' ? await startRunner() : runnerStatus();
     process.exit(report(runner.ok ? [] : [runner.reason], `cockpit: ready; host, API and request runner ${runner.pid} online`));
@@ -322,6 +325,8 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const r = spawnSync(BIN, ['host', '--background', '--no-open', '--non-interactive'], { stdio: ['ignore', 'inherit', 'inherit'], env, cwd: WORKSPACE, timeout: 120_000 });
     if (r.status !== 0) process.exit(r.error ? 127 : r.status ?? 128);
     const pid = Number.parseInt(readFileSync(join(env.HOME, '.omnigent', 'host.pid'), 'utf8'), 10);
+    const launcherProblems = claudeHostLauncherProblems({ pid, launcher: join(HERE, 'bin', 'claude') });
+    if (launcherProblems.length) process.exit(report(launcherProblems));
     mkdirSync(dirname(HOST_RECORD), { recursive: true, mode: 0o700 });
     writeFileSync(HOST_RECORD, `${JSON.stringify({ pid, started_at: new Date().toISOString(), version: readPin(BUNDLE).pin?.version, claude_launcher: join(HERE, 'bin', 'claude'), env: Object.fromEntries(Object.entries(env).filter(([k]) => /^(OMNIGENT_|DO_NOT_TRACK|CODEX_HOME$)/.test(k))) }, null, 2)}\n`, { mode: 0o600 });
     const status = orchHostStatus({ home: env.HOME, record: HOST_RECORD });
@@ -359,7 +364,9 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   }
   const before = configSnapshot(env.HOME);
   const role = agent === AGENTS.coordinator ? 'coordinator' : 'reviewer';
-  const result = spawnSync(BIN, ['run', agent, '--model', readAgentConfig().roles[role].model], { stdio: 'inherit', env, cwd: WORKSPACE });
+  const skillAgent = role === 'coordinator' ? materializeRoleAgent(join(BUNDLE, 'orch-coordinator'), [pinSkill('orch-tech-lead')], tmpdir()) : agent;
+  const result = spawnSync(BIN, ['run', skillAgent, '--model', readAgentConfig().roles[role].model,
+    ...(role === 'coordinator' ? ['-p', techLeadSkillPrompt()] : [])], { stdio: 'inherit', env, cwd: WORKSPACE });
   const changed = configChanges(before, configSnapshot(env.HOME));
   if (changed.length) {
     appendFileSync(join(ORCH_REPO, 'runs', 'omnigent-config-changes.jsonl'), `${JSON.stringify({ at: new Date().toISOString(), agent, changed })}\n`, { mode: 0o600 });

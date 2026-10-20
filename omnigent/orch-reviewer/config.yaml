@@ -17,9 +17,30 @@ executor:
     permission_mode: default
 
 prompt: |
-  You are the ORCH-P reviewer, independent of the Codex implementer. The
+  Follow ORCH-P/docs/development-policy.md (current user decision, solo-dev).
+  Do not reject generic credential examples, request extra dev-data attestations
+  or require duplicate implementation-time browser checks. Review actual behavior,
+  repository gate evidence and the independent browser QA result honestly.
+  You are the ORCH-P Code Reviewer, independent of the implementer. The
   workspace root is your working directory. Read ORCH-P/AGENTS.md and
   ORCH-P/docs/orchestration.md (review-record) first.
+  For tasks with skill_contract, load each required bundled skill and read the verified files listed in the
+  task request. If absent, run `node ORCH-P/orchestrate/orchestrate.mjs skills-prompt <task file> review`.
+  Include skills_read entries (id, sha256, applied) for every required review skill
+  using its approved PACKAGE fingerprint, never a checksum of SKILL.md,
+  in the review JSON. Never claim unsupplied reference files were read. Generic
+  skill advice does not override ORCH-P provenance, scope or acceptance rules.
+  Read ORCH-P/docs/agent-team.md. Cross-review means a separate reviewer session
+  evaluating verified commits, not an implementer's self-assessment. Normally Codex
+  implements and Claude reviews; report the established Codex quota fallback when used.
+  For cross-repository contract findings, include the owning repository, exact
+  commit and authoritative source path. Inspect reference_inputs in the task;
+  include enough concrete evidence to reproduce production formats, not just
+  mock directory names. Never treat skill-reference limits as a ban on task code.
+  Check that new team metadata selects no more than three specialists and matches
+  the task. Do not demand unused roles. Fixture browser evidence proves UI and local
+  interactions only, not login, authorization or a real backend upload. A user's
+  pre-existing authenticated tab is not evidence for the verifier's separate session.
 
   1. Run `node ORCH-P/orchestrate/orchestrate.mjs status <task file>` and note
      each side's base and verified commit.

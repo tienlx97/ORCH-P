@@ -14,6 +14,8 @@
 // published schema. Everything here is checked again by the O1 probe.
 
 import { scanSecrets } from './secrets.mjs';
+import { codexQuotaLimited } from './provider-limit.mjs';
+import { nativeSkillArchive } from './skills.mjs';
 
 export const CODEX_APPROVAL_LABEL = 'omnigent.codex_native.approval_mode';
 const BUSY = new Set(['launching', 'running', 'waiting']);
@@ -57,6 +59,17 @@ export function omnigentClient(base, { fetchImpl = fetch, timeoutMs = 30_000 } =
     agents: async () => listOf(await call('GET', '/v1/agents'), 'agents'),
     hosts: async () => listOf(await call('GET', '/v1/hosts'), 'hosts'),
     createSession: (body) => call('POST', '/v1/sessions', body),
+    async installSkillAgent(bundle, agentName) {
+      const { name, bytes } = nativeSkillArchive(bundle, agentName);
+      const form = new FormData();
+      form.append('bundle', new Blob([bytes], { type: 'application/gzip' }), 'bundle.tar.gz');
+      const response = await fetchImpl(`${base}/v1/agents`, { method: 'POST', body: form,
+        redirect: 'error', signal: AbortSignal.timeout(timeoutMs) });
+      if (!response.ok) throw new Error(`native skill bundle installation failed: HTTP ${response.status}`);
+      const agent = await response.json();
+      if (!agent.id || agent.name !== name) throw new Error('native skill bundle installation returned a different agent');
+      return agent;
+    },
     addPolicy: (id, policy) => call('POST', `/v1/sessions/${encodeURIComponent(id)}/policies`, policy),
     postMessage: (id, text) => call('POST', `/v1/sessions/${encodeURIComponent(id)}/events`, {
       type: 'message', data: { role: 'user', content: [{ type: 'input_text', text }] },
@@ -256,13 +269,14 @@ export function sessionFailureNote(session) {
  * timeout (the session is interrupted), 128 when the caller aborted.
  */
 export async function runCodexSession({
-  client, agentName, hostId, worktree, title, launchArgs, policies, prompt,
+  client, agentName, hostId, worktree, title, launchArgs, policies, prompt, skillBundle = null,
   timeoutMs, pollMs = 2000, startGraceMs = 120_000, labelGraceMs = 20_000, signal, onHeartbeat = () => {}, onStatus = () => {}, onSession = () => {}, parentSessionId = null,
-  approvalLabel = CODEX_APPROVAL_LABEL, onItems = null,
+  approvalLabel = CODEX_APPROVAL_LABEL, onItems = null, quotaExceeded = null,
 }) {
   const agents = await client.agents();
-  const agent = agents.find((a) => nameOf(a) === agentName);
+  let agent = agents.find((a) => nameOf(a) === agentName);
   if (!agent) throw new Error(`no Omnigent agent named ${agentName} (set ORCH_OMNIGENT_CODEX_AGENT)`);
+  if (skillBundle) agent = await client.installSkillAgent(skillBundle, agentName);
   let host = hostId;
   if (!host) {
     const live = (await client.hosts()).filter(online);
@@ -323,12 +337,17 @@ export async function runCodexSession({
     if (BUSY.has(session.status)) sawBusy = true;
     if (signal?.aborted) outcome = { status: 128, interrupted: signal.reason ?? 'signal' };
     else if (Date.now() - posted > timeoutMs) outcome = { status: 127, timedOut: true };
+    else if (quotaExceeded && await quotaExceeded()) {
+      outcome = { status: 1, note: 'provider usage limit' };
+      await client.interrupt(sessionId);
+    }
     else if (session.status === 'failed') outcome = { status: 1, note: sessionFailureNote(session) };
     else if (session.status === 'idle' && sawBusy) outcome = { status: 0 };
     else if (session.status === 'idle' && Date.now() - posted > startGraceMs) outcome = { status: 1, note: 'session never started working' };
   }
   if (outcome.status === 127 || outcome.status === 128) await client.interrupt(sessionId).catch(() => {});
   const items = await client.items(sessionId);
+  if (outcome.status === 0 && codexQuotaLimited(items)) outcome = { status: 1, note: 'provider usage limit' };
   // Idle means the turn ended, not that the implementer completed its task.
   // Preserve a blocked report as failure instead of wasting gate/rework rounds.
   if (outcome.status === 0) {

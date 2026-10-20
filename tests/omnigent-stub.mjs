@@ -2,6 +2,7 @@
 // shapes: /v1/agents, /v1/hosts, /v1/sessions, policies, events, items). It
 // records every request; tests script what the "Codex session" does.
 import { createServer } from 'node:http';
+import { gunzipSync } from 'node:zlib';
 
 export async function startOmnigentStub({
   agents = [{ id: 'ag_codex', name: 'codex-native-ui' }],
@@ -21,14 +22,24 @@ export async function startOmnigentStub({
   let polls = 0;
   let working = false;
   const server = createServer((req, res) => {
-    let raw = '';
-    req.on('data', (c) => { raw += c; });
+    const chunks = [];
+    req.on('data', (c) => { chunks.push(c); });
     req.on('end', async () => {
-      const body = raw ? JSON.parse(raw) : undefined;
+      const raw = Buffer.concat(chunks);
+      const multipart = req.headers['content-type']?.startsWith('multipart/form-data');
+      const body = multipart ? { multipart: true } : raw.length ? JSON.parse(raw.toString()) : undefined;
       const url = new URL(req.url, 'http://x');
       requests.push({ method: req.method, path: url.pathname, query: url.search, body });
       const send = (code, value) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(value === undefined ? '' : JSON.stringify(value)); };
       const p = url.pathname;
+      if (req.method === 'POST' && p === '/v1/agents' && multipart) {
+        const boundary = req.headers['content-type'].split('boundary=')[1];
+        const start = raw.indexOf('\r\n\r\n') + 4;
+        const end = raw.indexOf(`\r\n--${boundary}`, start);
+        body.archive = gunzipSync(raw.subarray(start, end));
+        const name = /name: (orch-(?:codex|claude)-native-skills-[a-f0-9]+)/.exec(body.archive.toString())?.[1];
+        return send(200, { id: 'ag_skills', name });
+      }
       if (req.method === 'GET' && p === '/v1/agents') return send(200, { data: agents });
       if (req.method === 'GET' && p === '/v1/hosts') return send(200, { data: hosts });
       if (req.method === 'POST' && p === '/v1/sessions') {

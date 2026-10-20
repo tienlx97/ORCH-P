@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { coordinatorCodexCommand, healthProblems, probeApi, shapeOf, startCoordinatorCodexSession, startProblems } from '../orchestrate/cockpit.mjs';
 import { CLAUDE_LIMIT } from '../orchestrate/lib/claude-limit.mjs';
 import {
-  BUNDLE_AGENTS, claudeSettings, KNOWN_RISKS, lintBundle, step0Acceptance, OMNIGENT_OPT_OUTS, omnigentEnv, parseVersion, readPin,
+  BUNDLE_AGENTS, claudeSettings, claudeHostLauncherProblems, KNOWN_RISKS, lintBundle, step0Acceptance, OMNIGENT_OPT_OUTS, omnigentEnv, parseVersion, readPin,
   syncClaudeSettings,
 } from '../orchestrate/lib/omnigent.mjs';
 import {
@@ -285,7 +285,10 @@ test('cockpit start runs the coordinator from the workspace root with the allowl
   });
   assert.equal(result.status, 7, result.stderr);
   const seen = JSON.parse(result.stdout.trim().split('\n').at(-1));
-  assert.deepEqual(seen.args, ['run', 'ORCH-P/omnigent/orch-coordinator', '--model', 'claude-opus-5-5']);
+  assert.deepEqual([seen.args[0], ...seen.args.slice(2, 5)], ['run', '--model', 'claude-opus-5-5', '-p']);
+  assert.match(readFileSync(join(seen.args[1], 'config.yaml'), 'utf8'), /name: orch-coordinator-skills-/);
+  assert.ok(existsSync(join(seen.args[1], 'skills/orch-tech-lead/SKILL.md')));
+  assert.match(seen.args[5], /Required coordinator skill orch-tech-lead; sha256 [a-f0-9]{64}/);
   assert.equal(seen.cwd, join(REPO, '..'));
   assert.equal(seen.env.ANTHROPIC_API_KEY, undefined);
   assert.equal(seen.env.OPENAI_API_KEY, undefined);
@@ -555,6 +558,21 @@ test('timeout and abort interrupt the session', async () => {
 });
 
 // ── O1 API probe ─────────────────────────────────────────────────────────
+test('Claude host readiness checks the running process PATH rather than a newly written record', () => {
+  const wrapped = fresh('launcher');
+  const stale = fresh('old-host-path');
+  for (const directory of [wrapped, stale]) {
+    writeFileSync(join(directory, 'claude'), '#!/bin/sh\nexit 0\n');
+    chmodSync(join(directory, 'claude'), 0o755);
+  }
+  const launcher = join(wrapped, 'claude');
+  const check = path => claudeHostLauncherProblems({ pid: 123, launcher, readEnvironment: () => `PATH=${path}\0` });
+  assert.deepEqual(check(`${wrapped}:${stale}`), []);
+  assert.match(check(`${stale}:${wrapped}`).join(' '), /running Omnigent host does not resolve/);
+  assert.match(check(stale).join(' '), /host-stop/);
+  assert.match(claudeHostLauncherProblems({ pid: 123, launcher, readEnvironment: () => { throw new Error('permission denied'); } }).join(' '), /cannot verify/);
+});
+
 test('health requires a live recorded daemon, reachable API, selected agent and online host', async () => {
   const home = homeWith('telemetry: false\n');
   writeFileSync(join(home, '.omnigent', 'host.pid'), String(process.pid));
@@ -665,7 +683,7 @@ test('coordinator-codex: the coordinator prompt on Codex, writable only in runs/
   assert.equal(cwd, '/ws/ORCH-P/runs/proposals');
   assert.deepEqual(args.slice(0, 6), ['-C', '/ws/ORCH-P/runs/proposals', '-s', 'workspace-write', '-a', 'on-request']);
   const prompt = args.at(-1);
-  assert.match(prompt, /^You are the ORCH-P coordinator/);
+  assert.match(prompt, /^You are the ORCH-P Orchestrator \/ Tech Lead/);
   assert.match(prompt, /cannot write ORCH-P\/runs\/requests/);
   assert.match(prompt, /autopilot\.mjs run <plan path>/);
   assert.ok(!args.some((a) => /danger|bypass|never/.test(a) && a !== prompt));

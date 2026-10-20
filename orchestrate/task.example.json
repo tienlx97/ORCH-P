@@ -48,10 +48,10 @@
       "acceptance_criteria": [
         "Observable UI behavior",
         "Adapter tests",
-        "browser: what the page must show"
+        "browser: Login, navigate through Logistics and the selected dev contract/shipment to Documents; inspect the feature on desktop/mobile using real dev API responses. No fixture substitution."
       ],
       "browser": {
-        "url": "http://127.0.0.1:3101/test-page",
+        "url": "http://127.0.0.1:3101/logistics/contract/dev-contract/shipment/dev-shipment",
         "start_command": [
           "pnpm",
           "dev",
@@ -60,13 +60,35 @@
           "--hostname",
           "127.0.0.1"
         ],
-        "test_data_only": true
+        "test_data_only": true,
+        "workflow": "application",
+        "api_base_url": "http://localhost:8081",
+        "application": {
+          "path": "/logistics/contract/dev-contract/shipment/dev-shipment",
+          "authentication": "fe-local",
+          "navigation": [
+            "Login",
+            "Logistics",
+            "Contract detail",
+            "Shipment detail",
+            "Documents tab"
+          ],
+          "mutations": []
+        }
       },
       "inputs": [
         "BE handoff: docs/api changes and the verified BE commit"
       ],
       "claude_transport": "omnigent",
-      "browser_timeout_minutes": 30
+      "browser_timeout_minutes": 30,
+      "reference_inputs": [
+        {
+          "repository": "be",
+          "revision": "<full 40-character reviewed BE commit SHA>",
+          "path": "docs/api/ShipmentFiles.md",
+          "sha256": "<SHA-256 of the exact Git blob at that commit>"
+        }
+      ]
     }
   },
   "review_config": {

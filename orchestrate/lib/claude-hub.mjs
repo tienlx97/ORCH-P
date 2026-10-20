@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { CLAUDE_LIMIT } from './claude-limit.mjs';
 import { lastAssistantText, loopbackUrl, omnigentClient, runCodexSession, sessionPolicies } from './omnigent-runner.mjs';
 import { SANDBOX_DISABLED } from './claude-runner.mjs';
-import { scanSecrets } from './secrets.mjs';
+import { scanBlockingSecrets as scanSecrets } from './secrets.mjs';
 
 const WRAPPER = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'claude');
 export const CLAUDE_LAUNCH_MARKER = '--orch-launch';
@@ -102,7 +102,8 @@ export async function launchClaude(args, { executable = realClaude(), env = proc
       effective.push(args[i]);
     }
     effective.push('--settings', file, '--session-id', manifest.claudeSessionId);
-    const permitted = ['ORCH_IMPLEMENTER', 'TMPDIR', 'NEXT_TELEMETRY_DISABLED', 'API_BASE_URL'];
+    const permitted = ['ORCH_IMPLEMENTER', 'TMPDIR', 'NEXT_TELEMETRY_DISABLED', 'API_BASE_URL',
+      'AGENT_BROWSER_SESSION', 'AGENT_BROWSER_SOCKET_DIR', 'AGENT_BROWSER_CONFIG', 'AGENT_BROWSER_SCREENSHOT_DIR', 'AGENT_BROWSER_ALLOWED_DOMAINS'];
     if (Object.keys(manifest.env).some((key) => !permitted.includes(key))) throw new Error('unexpected launcher environment field');
     childEnv = { ...env, ...manifest.env };
     writeFileSync(manifest.attestation, JSON.stringify({
@@ -124,21 +125,27 @@ export async function launchClaude(args, { executable = realClaude(), env = proc
 /** A native Claude turn with the same settings/environment as its CLI transport. */
 export async function runClaudeHub({ worktree, dir, tmpDir, settings, env, model, effort, prompt, schema,
   title, timeoutMs, signal, onSession = () => {}, onHeartbeat = () => {}, onItems = null,
-  client = omnigentClient(loopbackUrl(process.env.ORCH_OMNIGENT_URL ?? undefined)), pollMs = 2000,
+  client = omnigentClient(loopbackUrl(process.env.ORCH_OMNIGENT_URL ?? undefined)), pollMs = 2000, chrome = true, skillBundle = null,
+  nativeTranscriptRoot = join(homedir(), '.claude', 'projects'),
 }) {
   const manifestFile = join(dir, 'claude-hub-launch.json');
   const attestation = join(dir, 'claude-hub-attestation.json');
   const claudeSessionId = randomUUID();
+  const native = join(nativeTranscriptRoot, worktree.replace(/[^a-zA-Z0-9]/g, '-'), `${claudeSessionId}.jsonl`);
   const manifest = { worktree, tmpDir, settings, env, claudeSessionId, attestation };
   writeFileSync(manifestFile, JSON.stringify(manifest), { mode: 0o600 });
   const manifestHash = digest(readFileSync(manifestFile));
-  const launchArgs = ['--chrome', '--model', model, '--effort', effort, '--permission-mode', 'acceptEdits', CLAUDE_LAUNCH_MARKER, manifestFile];
+  const launchArgs = [...(chrome ? ['--chrome'] : []), '--model', model, '--effort', effort, '--permission-mode', 'acceptEdits', CLAUDE_LAUNCH_MARKER, manifestFile];
   let id;
   try {
-    const result = await runCodexSession({ client, agentName: 'claude-native-ui', worktree, title,
+    const result = await runCodexSession({ client, agentName: 'claude-native-ui', worktree, title, skillBundle,
       launchArgs, policies: sessionPolicies(worktree), approvalLabel: null, pollMs, signal, timeoutMs,
       prompt: `${prompt}\n\nReturn only a JSON report matching this schema:\n${JSON.stringify(schema)}`,
       onSession: (sessionId) => { id = sessionId; onSession(sessionId); }, onHeartbeat, onItems,
+      // Native quota prompts can leave the bridge "running" indefinitely.
+      // End only a confirmed API quota rejection; attestation, permission,
+      // sandbox, secret and worktree checks still decide whether fallback is safe.
+      quotaExceeded: () => existsSync(attestation) && existsSync(native) && nativeQuotaLimited(readFileSync(native, 'utf8')),
     });
     writeFileSync(join(dir, 'claude-hub-items.jsonl'), result.items.map((item) => JSON.stringify(item)).join('\n'), { mode: 0o600 });
     if (!existsSync(attestation)) throw new Error('Claude hub launcher did not attest the execution settings; restart the host through cockpit host');
@@ -154,13 +161,12 @@ export async function runClaudeHub({ worktree, dir, tmpDir, settings, env, model
         || JSON.stringify(permissions) !== JSON.stringify(expected.permissions)) throw new Error('Claude hub effective settings differ from the required settings');
     if (result.permissionChanged) throw new Error('Claude hub permissions changed during the turn');
     // The original native transcript preserves Chrome image tool results.
-    const native = join(homedir(), '.claude', 'projects', worktree.replace(/[^a-zA-Z0-9]/g, '-'), `${claudeSessionId}.jsonl`);
     const raw = existsSync(native) ? readFileSync(native, 'utf8') : '';
     writeFileSync(join(dir, 'claude-hub-native.jsonl'), raw, { mode: 0o600 });
     const text = lastAssistantText(result.items) ?? '';
     if (SANDBOX_DISABLED.test(raw + JSON.stringify(result.items))) throw new Error('Claude hub sandbox disabled');
     if (scanSecrets(raw + JSON.stringify(result.items), 'Claude hub evidence').length) throw new Error('secret-like text in Claude hub evidence');
-    const limited = !result.timedOut && !result.interrupted && (CLAUDE_LIMIT.test(text) || nativeQuotaLimited(raw));
+    const limited = !result.timedOut && !result.interrupted && ((!text.trim().startsWith('{') && CLAUDE_LIMIT.test(text)) || nativeQuotaLimited(raw));
     let report = null;
     if (!limited && result.status === 0) {
       try { report = JSON.parse(text); } catch { throw new Error('invalid Claude hub report JSON'); }

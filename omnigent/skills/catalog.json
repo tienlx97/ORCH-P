@@ -1,0 +1,212 @@
+{
+  "version": 1,
+  "skills": {
+    "dotnet-webapi": {
+      "directory": "vendor/dotnet-webapi",
+      "source": "https://github.com/dotnet/skills/tree/10d85e25fb42d5f65c568d5e979a005ee69eecb3/plugins/dotnet-aspnetcore/skills/dotnet-webapi",
+      "revision": "10d85e25fb42d5f65c568d5e979a005ee69eecb3",
+      "files": {
+        "SKILL.md": "70e10d74aa367ee63060b64edc397c5998c03da0fbdaf120f5aa8c94d373b77d",
+        "UPSTREAM-LICENSE.txt": "cfc21f5e8bd655ae997eec916138b707b1d290b83272c02a95c9f821b8c87310"
+      },
+      "sha256": "07e48ca421c5cfc8f47fd2299f096d9b4c343db8f09f1dd2cc1c6ba7546ee85f"
+    },
+    "run-tests": {
+      "directory": "vendor/run-tests",
+      "source": "https://github.com/dotnet/skills/tree/10d85e25fb42d5f65c568d5e979a005ee69eecb3/plugins/dotnet-test/skills/run-tests",
+      "revision": "10d85e25fb42d5f65c568d5e979a005ee69eecb3",
+      "files": {
+        "SKILL.md": "7b9698bb5c1f172ca35695dc3b614957c2cb8badf7b230a4b8118d173650fe2b",
+        "UPSTREAM-LICENSE.txt": "cfc21f5e8bd655ae997eec916138b707b1d290b83272c02a95c9f821b8c87310"
+      },
+      "sha256": "9f56ad1461e6aedd3329be0c108823f67a21b256f06ceb9c5bceac9dcad23bd9"
+    },
+    "mysql": {
+      "directory": "vendor/mysql",
+      "source": "https://github.com/planetscale/database-skills/tree/f6ed002d03084cb39c01d1d58904d47a36f5322a/skills/mysql",
+      "revision": "f6ed002d03084cb39c01d1d58904d47a36f5322a",
+      "files": {
+        "SKILL.md": "e4ea38add289809904805cc9e078a9b84a8fd8184da277466717aee8c51dc110",
+        "UPSTREAM-LICENSE.txt": "13990a7ef816ecccad065c66f3ecd66cff7ec9da3b7aa49124dd78bacd3fee66",
+        "references/character-sets.md": "b70988fc8178ab397ff483405b84abf508696905d25ec29a7091973a7ba46249",
+        "references/composite-indexes.md": "7fe7a078620cdbf6a9ea37fde7dd72b9696549dd9892c0cd661bc972bdb3e6b4",
+        "references/connection-management.md": "7d1ae65f30e7273e6527207c44160a30239600a7535f042801dc7023a59ae20c",
+        "references/covering-indexes.md": "a0e228d797def5e9a5dd573e64c9ee1e73456dac7cfda2a8974204c011f9e0c6",
+        "references/data-types.md": "a2f1979eaacc1b7c9e988db36c0c400a132ccb73e5d12d67564bdab25cdd1a86",
+        "references/deadlocks.md": "93889236cf5f5c8adf82f71e6761f106d17d690d32221e28d29de2827a92df25",
+        "references/explain-analysis.md": "c19881c0fc49eb717fe4c9c27d97131f644463748a1119176c9181055ff3c0cf",
+        "references/fulltext-indexes.md": "562ed3ff620381bf79f3db5bcf26e6fe11427caf88bac05352fe85664b2fd50b",
+        "references/index-maintenance.md": "15b18fbae4dbed69b63769673be75b9c01bd4fda79b3cf17414c8ea3bfee4e59",
+        "references/isolation-levels.md": "f6ecc50d16cf801934bea281f9c33e9ddd8b886902025714caf0bbbcc1ed7f43",
+        "references/json-column-patterns.md": "22367dfff76fb00436e922f99a75b6793315b953f9a2a0986b48bcab7f492595",
+        "references/n-plus-one.md": "b7291bfe39dc01320c8198db4b8540c0a4b4df70363505e7a1bc58b8677aa7ef",
+        "references/online-ddl.md": "3323025f273458c2163770eb803906c320dbcecdb50382bef13e48a99da7e187",
+        "references/partitioning.md": "0661f59c3d3505033396e45e5d589e3a01e580f956e00c94b32b22daea54ffdd",
+        "references/primary-keys.md": "f5f57d8c77f317abbade87ea9fa64d2393c315271f3f44c66cfb8686df546c0e",
+        "references/query-optimization-pitfalls.md": "71582f0ec1ba30684f43f1351578213242d5310cc4e0150494cca31ff5e61c44",
+        "references/replication-lag.md": "3e47cab20a2142d3b39a5b798c1b3203e8ea985d8bcb97387b90ef6798b33c80",
+        "references/row-locking-gotchas.md": "62a6157522c1f8d800f34a33bcde0be220c43a0d978f725b7b32bac10e4da873"
+      },
+      "sha256": "508fb704db4383be79d14e63fc5df4d35ef663dc2918e15f162bfda910340b98"
+    },
+    "multi-stage-dockerfile": {
+      "directory": "vendor/multi-stage-dockerfile",
+      "source": "https://github.com/github/awesome-copilot/tree/cb64ad12e32737ae764becd6885462e9b4c7cb00/skills/multi-stage-dockerfile",
+      "revision": "cb64ad12e32737ae764becd6885462e9b4c7cb00",
+      "files": {
+        "SKILL.md": "7dfea7d31f3744930cb07869e15a79f90dbd47d2ddc56d165715fbd257db9ba7",
+        "UPSTREAM-LICENSE.txt": "e32449d23085399adc1222f7a17408b730550258e51627c153cb108ca9955823"
+      },
+      "sha256": "f36fe11d7f97fd2db667e7cbbcd46d7276b61b3d8e17dea4beea8650435d8459"
+    },
+    "code-review-and-quality": {
+      "directory": "vendor/code-review-and-quality",
+      "source": "https://github.com/addyosmani/agent-skills/tree/aeac41d4d005999432bb7312f7ff06383a91d59d/skills/code-review-and-quality",
+      "revision": "aeac41d4d005999432bb7312f7ff06383a91d59d",
+      "files": {
+        "SKILL.md": "2db1e850379f255fd3091ef278cde24cd6c7d2ba23e360cc52ea522c40d4396e",
+        "UPSTREAM-LICENSE.txt": "6f202f8bd568cd730dbb2b0d1f8e243bc74c2fa1f64dbce9b2c7ea08bd5c9fd7"
+      },
+      "sha256": "fb78c1f023316cc75232db4e9b19c69bbb36edb5cfe5b3dd2d6b4241c0d8ab81"
+    },
+    "frontend-design": {
+      "directory": "vendor/frontend-design",
+      "source": "https://github.com/anthropics/skills/tree/dbd4588f9e1033efb41dad4bef2f7947c8993d44/skills/frontend-design",
+      "revision": "dbd4588f9e1033efb41dad4bef2f7947c8993d44",
+      "files": {
+        "LICENSE.txt": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+        "SKILL.md": "d91970639e9f5c37682ac7ab60094d35f1c7c1f38d731bd56396563aee10c1d3"
+      },
+      "sha256": "89a6e59de80320a32e8b4c597a329ef3c503f624a2e68874bb0475dfb66dbf4b"
+    },
+    "vercel-react-best-practices": {
+      "directory": "vendor/vercel-react-best-practices",
+      "source": "https://github.com/vercel-labs/agent-skills/tree/063bee94c3f4df8453406c830b0a7df0f2860278/skills/react-best-practices",
+      "revision": "063bee94c3f4df8453406c830b0a7df0f2860278",
+      "files": {
+        "AGENTS.md": "fc93e7421177bbf869cce892bc60a6c83a4517d974bc3bf65c4e2c1e58a6ccf6",
+        "README.md": "9eafb2123d3b8b2aef41fba0db2648a3f4f49996f8c7c8bb2c86263befd8b48a",
+        "SKILL.md": "71ed7794962fa6e803ee83030517b5b93a9f70fbfeb431ec4535c5480a8d8355",
+        "async-cheap-condition-before-await.md": "03107c1f70a293cd58a8abc5474c5548e20ea4efdf01b6d45aae7ad0ac1cb32c",
+        "async-defer-await.md": "f3c142d090615abdcc99d31c123be37b31f0f1ed8d9ec9f7789a3bc6883ae0fb",
+        "metadata.json": "c4e18bac3290fbe1b471a605867d4df68b03144ea26b8befdbe8f9d8fd124354",
+        "rules/_sections.md": "01c59969e4e867f0708c8f8ef9c6d87fab9a07d0586244f429ff84013db8a115",
+        "rules/_template.md": "99df2a3ea088c6c22de2484ddc7e964d0e9923846f44c63380343ecc64455442",
+        "rules/advanced-effect-event-deps.md": "55ed8f9f27a1bff803d6fa55828176207714b02123cbb97ddb8a90d88024a723",
+        "rules/advanced-event-handler-refs.md": "a3097edeecfb2ff6851cd66ed8cdf0617c3c88180504bee824aa6e75a215bbbc",
+        "rules/advanced-init-once.md": "3e4dc22173eb0e2b6dcf583e3babd862b8696328f8f59aee7c4d746c5bc05f6c",
+        "rules/advanced-use-latest.md": "8a3f64dfe5a77d1564248faf17fe662ae75b55d497a243cb30b38eb07ccbbf9a",
+        "rules/async-api-routes.md": "523338540d73427dc14c0cbb19f2741ebccdf8b105a7b2c1b33d2905cf237a42",
+        "rules/async-cheap-condition-before-await.md": "03107c1f70a293cd58a8abc5474c5548e20ea4efdf01b6d45aae7ad0ac1cb32c",
+        "rules/async-defer-await.md": "f3c142d090615abdcc99d31c123be37b31f0f1ed8d9ec9f7789a3bc6883ae0fb",
+        "rules/async-dependencies.md": "16ef469f877e30c6b8e1e1b4bc3e527312fa3c6318cb785a4eca186ea236131a",
+        "rules/async-parallel.md": "6d2f841896279e976dfcdc1ac89e70771ac188baadfd43c096b5706cb838b961",
+        "rules/async-suspense-boundaries.md": "de05fedac2eb7ae563b887b5a424464ec3dfaf84e5b7797467ebe2a796ac8afc",
+        "rules/bundle-analyzable-paths.md": "62090b5c815fd71bf1133dce754f51abc16a9456d0ccd025fd627de27726e92a",
+        "rules/bundle-barrel-imports.md": "e648f6d54525f07a691357040ca5bff6ea3424788a91ff63812adb29622a671b",
+        "rules/bundle-conditional.md": "09c8259c3efb04fc0abb8e412ccbda217c222ae8118516283e571c995fe3a7d4",
+        "rules/bundle-defer-third-party.md": "3719fb47b191e8db4fe22686ec88448ad5af9e6838585425abbe103d0b642e37",
+        "rules/bundle-dynamic-imports.md": "401817a7369f315fc5a68a1095742ff7d53d0461906880dc9d64a41495ee1986",
+        "rules/bundle-preload.md": "d1f7cc28da7cd5ab249acd287edc5b761afcfb194e9cb62cd44c5f3543db2de2",
+        "rules/client-event-listeners.md": "242a873349febc1ce685e85617994784dbab92c2eaa68aed7fed5a83e7680e93",
+        "rules/client-localstorage-schema.md": "0fb7cdf9dc93fdf22f87e3669f953fb9d4ac9b0be42eec4a29fe9a2560610b88",
+        "rules/client-passive-event-listeners.md": "1f35016f9053de69e884ee9be00654e37979c2ca85f5e57764dc2626ff7acb4b",
+        "rules/client-swr-dedup.md": "644652c39c6cc00de8d1c77a7273612e868dc3f7edda30764164c12ec0f764a3",
+        "rules/js-batch-dom-css.md": "480b891b9eaf96e929dc1e964274a4828e3a78009b7d00ccd965a0d425215959",
+        "rules/js-cache-function-results.md": "3daaa11d24f4295cb6be8bc6f407f2ce83cc7b5bd1f0e68891ea8ab835721dc7",
+        "rules/js-cache-property-access.md": "73e47431e74878a927061bf0ddc7cd91a7556cb35d2573f3421e82300d9ae311",
+        "rules/js-cache-storage.md": "11b826b0433898c1ece2d3547010d8e77db9fb240185748c45db91493de9b6cc",
+        "rules/js-combine-iterations.md": "71add08aeeb43091d4ff4c0b2842cce8b4bdef8ad3e732cc034bb5a84827e746",
+        "rules/js-early-exit.md": "925ce5ce87f3347186ca62212f29cc6baa2b8c85a96d2720ad07c3d0abf781c0",
+        "rules/js-flatmap-filter.md": "9e5b166a41914d975bef7635467f8fb32cd98b5c3126c0bc6f163490812fb5f0",
+        "rules/js-hoist-regexp.md": "f9e9aef2f7c2307dd7310f283df85dcada45fc43e9bb941b0c3aa414dec21ec4",
+        "rules/js-index-maps.md": "5df1bdc2cfabb2c98abd55d26762e5c18189535c2e686184f426082e62920391",
+        "rules/js-length-check-first.md": "8b54a311c826b299272f29187fc58bc55772a04c4a72eeb29456ee96dc9fc624",
+        "rules/js-min-max-loop.md": "87dfb67e2f39df6ad8bcfb5b78c5fb364d3c07554ad188a202408d99f3763421",
+        "rules/js-request-idle-callback.md": "ee08f83905b4011abbc33d594033157d77561b5bbd9b36b04f0f409581ffec32",
+        "rules/js-set-map-lookups.md": "a7fd781a6ba9ad49065961b6f9a90ef486bf6b648390e1a08704025f98e1642b",
+        "rules/js-tosorted-immutable.md": "d0a5e1b0fec48a0a81397957e2f068e224329f7c42cb5feeed8aae6fa64025e8",
+        "rules/rendering-activity.md": "1e5e7eaf3555e61d6a2e900089c676527d26259501db5594f59544b6c664f85a",
+        "rules/rendering-animate-svg-wrapper.md": "9c6ae0ca7a51434e803887c64cded760956579a1452ccb80a461a03f9c937c77",
+        "rules/rendering-conditional-render.md": "2ec2fa23c4148285144687050c52369adba3da2fbe3d486f8d3e0aad8f06f2bc",
+        "rules/rendering-content-visibility.md": "64eee6d5b916fe74df33363994b27fc7f71bea3bcedc7ee04bda23107ca3e6e4",
+        "rules/rendering-hoist-jsx.md": "93b229560fae92005ed9a2a829064607b39b2e984e92d221d05b2d41df2b7c0e",
+        "rules/rendering-hydration-no-flicker.md": "dc7ab358c67c177bca6e6f360fbc935ebe4efa928c0ba3ebd3f9f3d9e2000ca3",
+        "rules/rendering-hydration-suppress-warning.md": "915bacb934e2927d84b37a3f3d225a47b309ac8f9e494ed2bcb66ce07c5676a2",
+        "rules/rendering-resource-hints.md": "351b1095d641717b930f1b2253282b7120af3023bc74e06c17675168d4286864",
+        "rules/rendering-script-defer-async.md": "4cea07b7875ba7fc2c7465ff23b63a2bb334f90aaf2d9293d38d67b05fdb32ab",
+        "rules/rendering-svg-precision.md": "ed468533f6e95f622859c884b122cf21f9f593ed6bb3d500a54de4b9f9bcb9fb",
+        "rules/rendering-usetransition-loading.md": "3a1249c3f13026b6f54ab5712c388df219d6af01b12aa542749acd99a46f4bc1",
+        "rules/rerender-defer-reads.md": "234050a77faf50cb306be10a9e15bd4421134ab5907e75f13e6d78e2bd262dc9",
+        "rules/rerender-dependencies.md": "17eb5830956fb56486fd3cfc7431f5849d39751730c05ad9e77dd4f0c27169c5",
+        "rules/rerender-derived-state-no-effect.md": "cb11ec76f50aa7b6847269f02d79b120c889a30d9ecd2c1d578f75144419c77a",
+        "rules/rerender-derived-state.md": "1c326bb67b01fb084eb00c8911b0a7cff54681c2315b629f88e49b64eaa6481d",
+        "rules/rerender-functional-setstate.md": "5e68df6b2ae8058e67f476ff1ac67bde159f5a9d18df439e46eabcdeb7b52e58",
+        "rules/rerender-lazy-state-init.md": "4ae844740f266fc8cbf050701230286624a2440ec5be67b9a63d9edc3c580573",
+        "rules/rerender-memo-with-default-value.md": "81c47476564ad8a79fc68fc442734255ca7d6829424359464503fda0a9f9a0dd",
+        "rules/rerender-memo.md": "1f258990c2f27ff6256b3cc5c43300631bb3f0d81f749aed08d07fcdcc131dd1",
+        "rules/rerender-move-effect-to-event.md": "abc2cbf167bee056743023351e96806a411d3398da8802093620aecf0721f029",
+        "rules/rerender-no-inline-components.md": "1cc32907a770272524ba682eef9e7efdd8ad4533b6f89b718a1fcd7d1d0eb6a3",
+        "rules/rerender-simple-expression-in-memo.md": "5bdcf2d1558ba5204e643c887b7b4060f89630969425651eb68e96427d97f800",
+        "rules/rerender-split-combined-hooks.md": "6f45d703343484ef9acef9388397f3642966ae6a5a258899a0cf1f9977cfbf6c",
+        "rules/rerender-transitions.md": "60f4033909a62df5e5b8c601494f9e50a562e2f8c1c2d81eac24f38142265f1c",
+        "rules/rerender-use-deferred-value.md": "8c3579576a61a949884167745dcfaf1d5426ba305cc61fd0a79602d70fda4909",
+        "rules/rerender-use-ref-transient-values.md": "f1a649af9d1d0b5c762f6c9c4c1c70c90d7df82aa10296ee87aadb78c1b76c54",
+        "rules/server-after-nonblocking.md": "d0b8d24a3db9f0f65f9e2bddbf230b0e03a5f60e1229d93a4a18f5e7a991c7c2",
+        "rules/server-auth-actions.md": "a2ca8aa102839251c7971ec784560fab943c20b36fe6f80365d4110c13260c23",
+        "rules/server-cache-lru.md": "1924b64561841923b88a657085097a0aeba3e0ba2d5470b9f5c15cc10d6ae70f",
+        "rules/server-cache-react.md": "fddeea6c870bb3da4134b61d54b7d09b83d2603f929b7547cd3dc1dc269edd5c",
+        "rules/server-dedup-props.md": "c2747424cdac46be62f835f245a0aa887b0090b416d28e2ac8676702645eeb37",
+        "rules/server-hoist-static-io.md": "5abea4dd882b13661bd5f7dfb93f9e547d5f08176c61c448ade91b210ed5d49f",
+        "rules/server-no-shared-module-state.md": "4d869bf1cd2f1632e5ca4c0e64b1cf0e71c5f5a0f940bc8a22174d205e735ed7",
+        "rules/server-parallel-fetching.md": "569a2e9fc04f9606686cd75c5894ef8781b502786a7fffe241396846c7733472",
+        "rules/server-parallel-nested-fetching.md": "ad5d9656984d4a959997a2367bf59cc6632297b4634a1dd13a087939d83f30b3",
+        "rules/server-serialization.md": "f4c7d68b29c82381baad059c4a7f09e868e71ec9c3115a26ad3ae7d24c0dfe1f",
+        "server-hoist-static-io.md": "5abea4dd882b13661bd5f7dfb93f9e547d5f08176c61c448ade91b210ed5d49f"
+      },
+      "sha256": "e76115e461c4fc27a084fc49e1d1a35985cd21badc51dbfe34baa1859b977a52",
+      "packaging_note": "Compiled AGENTS.md links use rule-local paths. Three exact upstream rule copies are also provided at package root to resolve those links."
+    },
+    "agent-browser": {
+      "directory": "vendor/agent-browser",
+      "source": "https://github.com/vercel-labs/agent-browser/tree/dac13bb87468fe9d74a040d862720f6cc17a9565/skills/agent-browser",
+      "revision": "dac13bb87468fe9d74a040d862720f6cc17a9565",
+      "files": {
+        "SKILL.md": "3a7520e64de2dfaa516b6721c001e84e06e3c06a187b82af029ae721540ebfac",
+        "UPSTREAM-LICENSE.txt": "014bb31e83d5c2e76aea1cc6e82217346ab41362f32cb355ad0f5c10aa0aeaff"
+      },
+      "sha256": "5a44e6143eb50ee9d978cfac6d65d0cb0ba0c7bde0b9d5a4e1e9ac5c76b3d133"
+    },
+    "filter-syntax": {
+      "directory": "vendor/filter-syntax",
+      "source": "https://github.com/dotnet/skills/tree/10d85e25fb42d5f65c568d5e979a005ee69eecb3/plugins/dotnet-test/skills/filter-syntax",
+      "revision": "10d85e25fb42d5f65c568d5e979a005ee69eecb3",
+      "files": {
+        "SKILL.md": "64c294d0fc2d0c4d5887d391c6684429fc4d7a66b6b9f99a475e6abe390c5d19",
+        "UPSTREAM-LICENSE.txt": "cfc21f5e8bd655ae997eec916138b707b1d290b83272c02a95c9f821b8c87310"
+      },
+      "sha256": "7fa997b1ade5aeeb407a199202edfef4069cb292bcae1b2307b40e3c10c1f5d4"
+    },
+    "platform-detection": {
+      "directory": "vendor/platform-detection",
+      "source": "https://github.com/dotnet/skills/tree/10d85e25fb42d5f65c568d5e979a005ee69eecb3/plugins/dotnet-test/skills/platform-detection",
+      "revision": "10d85e25fb42d5f65c568d5e979a005ee69eecb3",
+      "files": {
+        "SKILL.md": "c824bf8f8cbf1233b8b0dbc6e38fae6ac2486c42a6a1f6553a6335daa6838c1a",
+        "UPSTREAM-LICENSE.txt": "cfc21f5e8bd655ae997eec916138b707b1d290b83272c02a95c9f821b8c87310",
+        "references/command-mode.md": "08e276dcafe6bd5bfbaab435065ca24a5800a4eae3ffd7fc15daa1e81354bbc4"
+      },
+      "sha256": "d8268d5b779e6c1a60e40b34176c5e9c23b41d798ee51b4c048a37d0bb3cf137"
+    },
+    "orch-tech-lead": {
+      "directory": "local/orch-tech-lead",
+      "source": "ORCH-P",
+      "revision": "local-v1",
+      "files": {
+        "SKILL.md": "5ff4aafa8830a0f1cff63cf948526442b8b0a925c6d3c321cbaa4493d40b07eb",
+        "agents/openai.yaml": "d9f8ddb6a88d57aff3093cde183f03e082d79961bf1f6720f9a83bb0d4f70f93"
+      },
+      "sha256": "ab6409af9c31623c0c543ec6a4f8c158a13b2bfbc18a95e3c8264cca1f386765"
+    }
+  }
+}

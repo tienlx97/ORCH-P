@@ -8,9 +8,12 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
 | Need | Source of truth |
 |---|---|
 | How it works, commands, security controls, residual risk | [docs/orchestration.md](docs/orchestration.md) |
+| Single-developer security/data policy | [docs/development-policy.md](docs/development-policy.md) |
 | Why there is no Ruflo | [docs/ruflo-evaluation.md](docs/ruflo-evaluation.md) |
 | Omnigent hub: evaluation, decision, open questions | [docs/omnigent-evaluation.md](docs/omnigent-evaluation.md) |
 | Agent models, fallbacks, effort and timeout defaults | [omnigent/agents.json](omnigent/agents.json), [configuration workflow](docs/orchestration.md#agent-configuration) |
+| Tech Lead, six specialists, per-task selection and Polly integration status | [docs/agent-team.md](docs/agent-team.md) |
+| Installed skills, task bindings, provider-neutral prompts and skill reports | [docs/agent-skills.md](docs/agent-skills.md) |
 | Coordination policy (roles, approvals, handoff, contract changes) | `../BE-P/docs/coordination/README.md` |
 | Workspace phase gates | `../AI-AGENTS.md` (if present) |
 | BE / FE implementation rules and gates | Each repository's AGENTS.md and `harness/verify.sh` |
@@ -31,6 +34,12 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
 - `runs/` — run state and evidence (gitignored).
 
 ## Rules
+
+Current user preference (2026-10-19): keep this single-developer workspace simple.
+Follow [the development policy](docs/development-policy.md): generic secret matches are
+advisory, approved dev actions need no extra attestation, browser QA runs after the gate,
+and ordinary environment blocks may be retried. Do not add duplicate checks or approval
+rounds. Preserve existing data, actual acceptance evidence and the repository gate.
 
 1. Run `./harness/verify.sh` before marking work done; use `--container` after changing
    `verify-container/` (rebuild with `node verify-container/run-gate.mjs build-image`).
@@ -56,6 +65,10 @@ reviews it, and a human pushes and merges. It never pushes, merges, deploys or o
    docs/orchestration.md#claude-fallback-to-codex) and `orch-defaults` (Codex implementers use
    Codex's default sandbox with network and loopback, no Step 0 requirement; see
    docs/orchestration.md#omnigent-defaults).
+   Active since 2026-10-19: `http-file-secret-hits` (user-approved exemption for `.http`
+   files from source secret scanning; scope/protected paths and prompt/output scans remain).
+   Also active: `solo-dev` (generic secret matches advisory, no extra dev-data attestations,
+   browser acceptance after the gate, retry ordinary implementation blocks; see the policy above).
    Never add or widen an accepted risk without that decision.
 3. Changes that alter what ORCH-P expects from BE-P or FE-P (`INTERFACES` in
    `orchestrate/orchestrate.mjs`) need the matching change in that repository first.

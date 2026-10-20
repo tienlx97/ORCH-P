@@ -1,5 +1,21 @@
 # Lightweight orchestration (AI-AGENTS.md §7.4)
 
+**Current single-developer policy (2026-10-19):** follow
+[Simple development policy](development-policy.md). Generic secret matches are advisory;
+approved dev-data actions need no extra attestation; independent browser QA runs after the
+gate; ordinary implementation/environment blocks can be retried. This supersedes older
+strict defaults below where they describe those four points. Actual QA, gates, approval
+binding, scope, Git integrity and review provenance still decide the outcome.
+
+Browser sessions use a short private directory under the host temporary directory
+for both agent-browser sockets and Chrome's `TMPDIR`. Long task worktree paths can
+exceed Chrome's Unix `SingletonSocket` path limit and prevent login before the page opens.
+Temporary screenshots use that same writable directory. ORCH-P copies them into the
+task's evidence directory before removing the private browser temp directory.
+QA can also receive optional host runtime notes from the side's `browser_notes`
+state, only when its API URL matches the approved `api_base_url`. These can explain
+local storage mappings and prepared fixtures; they never stand in for browser checks.
+
 Codex implements one side of an approved task in an isolated Git worktree; the existing
 BE/FE gates verify it; Claude Code reviews it; a human pushes and merges. **Omnigent is the hub**
 where the agents run, are coordinated and share their history ([Omnigent hub](#omnigent-hub),
@@ -15,6 +31,11 @@ human merges ◄── ready_for_human_merge ◄── review-record (Claude Cod
 ```
 
 ## Commands
+
+The [agent team](agent-team.md) defines one Tech Lead and six specialist roles,
+with at most three specialists selected per new task. BE defaults to Codex; FE follows its configured primary provider
+(currently Claude); the Claude FE path below remains available for explicit existing tasks.
+Native Polly integration is documented there and is not enabled yet.
 
 `node orchestrate/orchestrate.mjs <command> <task.json> [be|fe]` from ORCH-P (BE-P and FE-P are its
 siblings; override with `ORCH_BE_REPO` / `ORCH_FE_REPO`). Run state goes to `ORCH-P/runs/`.
@@ -198,8 +219,29 @@ runner ──► orchestrate/autopilot.mjs, per task in plan order:
   prepare → per side implement → check → verify ─gate findings→ implement (≤ max_rework)
           → browser-verify (FE browser: criteria) → commit → reviewer → review-record
           ─rework_required→ implement … commit → review again (≤ max_rework rounds)
-user: pushes and merges the branches in order (ORCH-P never does)
+ORCH-P: checks out the final reviewed branch per repo in the original BE-P/FE-P folders for testing
+user: completes any required contract pilot, then pushes and merges (ORCH-P never does)
 ```
+
+**Testing in the project folders.** The default `handoff.checkout: "project"`
+in `omnigent/agents.json` runs after every task in the plan has passed review.
+ORCH-P selects the final reviewed branch for each side, detaches its isolated task
+worktree at the same reviewed commit, then checks out that branch in the original
+`BE-P`/`FE-P` checkout. No source is copied, reset, stashed or deleted. Existing
+local environment/login files stay in the original project. Worktrees and evidence
+remain available, and `needs_contract_pilot` still gates merge.
+
+Tracked changes in the project, a dirty/moved task worktree, a moved branch,
+ongoing Git operation or an untracked-file collision leave `project checkout
+pending` with a reason. Unrelated untracked files are retained. A refused project
+switch restores the branch to the task worktree when possible. No force option
+exists. Fix the local conflict and resume the same plan to retry only the pending
+handoff. A successful handoff is not repeated on resume, so changing branches
+manually afterwards is respected. Set `handoff.checkout: "worktree"` before a new
+run to retain the previous worktree-only behavior. The host policy is recorded
+once per plan run; it never changes approved worker/model/task settings.
+For later rework of the same task, return its branch to the task worktree before
+implementation; do not edit the committed worktree and original branch separately.
 
 - **Plan** (`runs/proposals/<PLAN>.plan.json`): `id`, `max_rework` (0–3, default 2) and `tasks`
   in run order, each `{file, sha256, base}`. `base` per side is a full SHA, a branch name
@@ -238,13 +280,17 @@ user: pushes and merges the branches in order (ORCH-P never does)
   with `max_rework` on its entry, 0–3); a reviewer that records nothing. Fix the cause and approve the same
   plan again: it resumes where each task stands. A task with `contract_check` ends as
   `needs_contract_pilot` (run [pilot.md](../../BE-P/docs/coordination/pilot.md) before merging);
-  later tasks still run.
+  later tasks still run and may stack on its reviewed commit with `after:<task>`.
+  Stacking does not satisfy the contract pilot or clear `needs_contract_pilot`.
 - **Status:** `node orchestrate/autopilot.mjs status <plan>` (also allowed to the coordinator);
   log in `runs/autopilot/<PLAN>/autopilot.log`. One autopilot per plan and one runner per
   requests directory (`.runner.lock`); while a plan runs, the runner refuses single-step
   requests. `stop` with the plan's `plan` and `plan_sha256` stops it.
 
 ## FE implementer (Claude)
+
+This is the explicit Claude runner path for existing or deliberately configured
+tasks. New proposals follow the current `frontend` role defaults; see the [agent team](agent-team.md).
 
 FE tasks run on Claude Code with Claude in Chrome (`"runner": "claude"`, optional
 `"claude_transport": "omnigent"` for Web UI sessions, a Claude model id such as
@@ -298,20 +344,32 @@ defaults so agents can use as much as possible.
 
 ## Claude fallback to Codex
 
-When Claude is out of tokens (usage, rate or spend limit: `lib/claude-limit.mjs`):
+Provider fallback is configured per role in `omnigent/agents.json` version 2.
+Implementation supports both Codex → Claude and Claude → Codex, once per attempt,
+only for confirmed usage, rate or spend limits. Authentication, infrastructure,
+sandbox, evidence or gate failures do not qualify. Both attempts keep the approved
+scope and worktree; partial changes are read before continuing. Codex quota
+classification uses structured provider error events (`lib/provider-limit.mjs`).
+Claude classification uses `lib/claude-limit.mjs`.
+Native Claude may remain in the hub's running state while displaying a quota
+prompt. ORCH-P polls its own attested session's native transcript for structured
+API quota errors, interrupts that session, and runs the approved fallback without
+waiting for the implementation timeout. Ordinary timeouts and user interruptions
+retain exit codes 127/128; evidence, sandbox and source checks still precede fallback.
 
 | Role | Normally | Fallback |
 |---|---|---|
-| FE implementer | Claude Code + Chrome (`runner: claude`) | the task's `fallback` (`{runner, model[, effort]}`, a Codex model, checked against the catalog): `implement` records the Claude attempt and runs Codex on the same worktree, told to read the partial changes first. No `fallback` → implement fails and says so. |
-| BE implementer | Codex | — |
+| Frontend, Backend, Database, QA test implementation, DevOps | Codex in the selected specialist's BE/FE task | Approved `fallback` to Claude (model, effort, runner and optional `claude_transport`); both attempts are recorded on the same worktree. Claude backend runs without Chrome and retains the existing strict shell sandbox. Explicit Claude-primary tasks can fall back to Codex. Missing fallback or a second quota failure stops the attempt. |
+| QA browser | Codex using the approved `qa_config` snapshot | Approved Claude fallback; reverse fallback also works for Claude-primary QA. Each provider must stop its server and preserve the tree before switching. Legacy tasks without `qa_config` keep the implementer's provider behavior. |
 | Reviewer | orch-reviewer (Claude) | when the reviewer session ends twice without a review or times out, autopilot asks Claude for one word; only a usage-limit answer switches to `orchestrate.mjs review-codex <task>`. Codex reviews in a new read-only Omnigent session visible as `<task id> · review · Codex`; when the hub is unavailable or the session fails, read-only `codex exec` in ORCH-P backs it up. ORCH-P validates review.schema.json and commit binding and records provenance `reviewer: codex-fallback`, runner and session ID. Accepted risk `codex-review-fallback`. |
 | Coordinator | orch-coordinator in Omnigent (Claude) | `cockpit.mjs start coordinator` probes Claude before starting and again after an unsuccessful exit. Only a confirmed usage/rate/spend limit switches to Codex. With a healthy hub, Codex opens a persistent `ORCH-P · coordinator · Codex` chat on the Web UI, restricted to `runs/proposals` with network disabled. If the hub is unavailable before initialization, the CLI remains available. Hub initialization/security failures stop. The user approves by typing `autopilot.mjs run <plan>`. `cockpit.mjs coordinator-codex` starts the same path manually. |
 
 ## Agent configuration
 
-Edit `omnigent/agents.json` for role defaults. It controls coordinator/reviewer Claude models,
-the coordinator Codex fallback model/effort, BE/FE implementer runner/model/timeout, FE Claude
-transport and Codex fallback, reviewer timeout/fallback and browser timeout. Implementer
+Edit `omnigent/agents.json` for role defaults and the host handoff policy (`handoff.checkout`: `project` by default, or `worktree`). It controls coordinator/reviewer Claude models,
+the coordinator Codex fallback model/effort, and runner/model/timeout/fallback for
+frontend, backend, database, qa and devops. QA also owns browser timeout; Claude
+transport is explicit on Claude provider settings. Reviewer timeout/fallback is separate. Implementer
 reasoning effort defaults by complexity; explicit values in a proposal override defaults.
 Claude coordinator/reviewer effort remains their native harness default because Omnigent
 0.18.0's `run` command does not expose an effort option; this file does not claim to set it.
@@ -320,11 +378,20 @@ in this file. `cockpit lint` validates it with the bundle.
 
 ```bash
 node orchestrate/agents.mjs show
+node orchestrate/agents.mjs team
 node orchestrate/agents.mjs template fe
 node orchestrate/agents.mjs resolve runs/proposals/NEW-TASK.json
 ```
 
-`resolve` prints a proposal with explicit side settings and a `review_config` snapshot. It
+Resolved proposals also bind required skills for implementation, browser QA and
+review. Both providers and their fallbacks receive verified skill bundles loaded on demand; new
+contract reports must include matching `skills_read` acknowledgments. See
+[task-bound skills](agent-skills.md) for selection, pinned sources, reference files
+and compatibility with already approved tasks.
+
+`resolve` prints a proposal with explicit side settings, specialist ownership, a team
+of at most three roles, a `review_config` snapshot and a separate `qa_config`
+snapshot when browser checks are required. It
 refuses approved tasks. Save that JSON as the proposal before computing its plan digest.
 Changing defaults then affects new proposals and new coordinator sessions; approved side and
 review snapshots keep their values. Existing tasks without snapshots retain their legacy
@@ -332,10 +399,18 @@ reviewer defaults and transport. `ORCH_REVIEW_CODEX_MODEL` remains an explicit o
 
 ### Claude FE/browser transport
 
-New FE templates explicitly set `claude_transport: omnigent`; legacy tasks without this field
-keep `cli`. Both transports use the same Claude settings and `fe-claude-chrome` accepted risk.
+New specialist templates set `claude_transport: omnigent` on their Claude fallback;
+legacy Claude tasks without this field keep `cli`. Backend Claude runs omit Chrome. Both transports use the same Claude settings and `fe-claude-chrome` accepted risk.
 The native path creates separately titled implementer/browser sessions visible on the Web UI.
 Start/restart the host through `cockpit host` to install its first-party PATH wrapper. The
+`host` command can reuse an already-running Omnigent daemon; it cannot update that
+process's PATH. ORCH-P checks the live daemon's Claude executable resolution before
+recording launcher readiness and before native Claude runs. If it reports a stale
+launcher, run `node orchestrate/cockpit.mjs host-stop`, then
+`node orchestrate/cockpit.mjs host`, when other sessions are idle. A missing
+attestation remains blocking: rerun `implement` on the approved task after fixing
+the host, then resume autopilot; do not clear the block by editing run state.
+The
 wrapper merges ORCH restrictions after the Omnigent bridge settings, preserves native hooks,
 denies extra Omnigent MCP tools and project MCP auto-approval, sets only approved per-run environment fields, and emits
 an attestation. Missing/mutated settings, permission switches, sandbox warnings, secret hits,
@@ -353,33 +428,74 @@ are the same as for the CLI transport.
 
 ### Browser verification
 
-An FE acceptance criterion prefixed `browser:` requires a real browser check after the repository
-gate, before commit and review. The task's approved FE spec supplies:
+New FE source proposals require an actual application browser flow after the
+repository gate and before final commit/review. FE must wire and exercise the
+feature at its business location; independent QA repeats the approved navigation.
+The proposal resolver rejects new `src/` tasks without application browser criteria.
+Example (replace record IDs with dedicated development data before approval):
 
 ```json
 "browser": {
-  "url": "http://127.0.0.1:3101/test-page",
+  "workflow": "application",
+  "url": "http://127.0.0.1:3101/logistics/contract/dev-contract/shipment/dev-shipment",
+  "api_base_url": "http://localhost:8081",
   "start_command": ["pnpm", "dev", "-p", "3101", "--hostname", "127.0.0.1"],
-  "test_data_only": true
+  "test_data_only": true,
+  "application": {
+    "path": "/logistics/contract/dev-contract/shipment/dev-shipment",
+    "authentication": "fe-local",
+    "navigation": ["Login", "Logistics", "Contract detail", "Shipment detail", "Documents tab"],
+    "mutations": []
+  }
 }
 ```
 
-The URL needs an explicit loopback port. The verifier starts this command inside the gated
-worktree's agent sandbox and stops its own server afterwards; an occupied port blocks the run
-to avoid checking somebody else's build. Use a fixture/test environment with no production/LAN
-dependencies. Credentials are never put in task files. Missing login/fixtures, mutating-data
-actions, unavailable browser tools or an unclosed server block verification.
-For a backend-backed fixture page, set optional `browser.api_base_url` to the approved local
-HTTP test backend (explicit port). Otherwise the server receives `API_BASE_URL=http://127.0.0.1:1`
-and must use frontend fixtures; browser verification never inherits the implementer's pilot backend.
+Use FE-P/AGENTS.md's environment pointers. The local login account already lives
+in the original FE checkout's ignored `.ai-login.local.md`; never paste its values
+or `.env` contents into tasks/prompts. ORCH-P supplies a trusted login helper command
+that reads the file privately and submits the real login form via isolated
+agent-browser batch stdin. It suppresses child output, including failures, and
+never persists account values. Both QA providers use agent-browser for application
+workflows; the Claude shell sandbox remains enabled and its Chrome tools are denied
+for that workflow. No user profile/session is imported. Agents must never read
+credentials, cookies or auth tokens or capture the filled login screen.
 
-The provider follows the actual successful implementer (including Claude-to-Codex fallback):
+`application.path` must match the browser URL and cannot be a `/dev`, test or fixture
+route. `navigation` describes the actual menu → parent/detail → tab steps, not merely
+a deep link. Passing QA needs ordered per-step observations, authentication and real
+API evidence in addition to every `browser:` criterion and screenshots. Do not mock
+API responses, inject authorization or replace a missing environment with a fixture.
+Design and implement directly in the business screen; do not create, extend or
+use standalone `/dev`, test or fixture UI pages, including supplementary checks.
+The proposal resolver rejects explicit fixture route edit scopes. For application
+tasks the source check also rejects creating/modifying those route files under
+`app/` or `pages/`, including Next.js route groups, even with a broad `src/**`
+scope. Deleting an obsolete fixture route is allowed when in the approved scope.
+Synthetic data inside focused unit tests is still permitted.
+
+The verifier starts the gated FE worktree on an explicit unused loopback port and
+stops its own server afterwards. Occupied ports block verification so another build
+cannot stand in for the task. `api_base_url` must explicitly identify the approved
+local development/test backend; it is never inherited from another run. Only login
+and read-only actions are permitted when `application.mutations` is empty. To test
+upload/edit/delete, enumerate the writes and disposable records/files in that list
+and supply `application.cleanup`. No production/LAN access or unrelated dev writes.
+Missing login/backend/data blocks acceptance. Keep any required paired contract
+pilot pending until it has separately passed.
+
+Existing approved fixture tasks retain their original browser settings. Without an
+explicit backend they still receive `API_BASE_URL=http://127.0.0.1:1`; their reports
+cannot be reused as authenticated application evidence. Re-propose a task to change
+its approved browser scope; never alter its stored approval or gate evidence.
+
+New tasks use their approved `qa_config` provider/model/fallback. Legacy tasks without
+that snapshot follow the actual successful implementer:
 Codex gets a new Omnigent session `<task> · browser verification · Codex` with agent-browser's
 bundled core skill, a private named browser session and the accepted `orch-defaults` sandbox.
-Claude uses its approved native hub or `claude -p --chrome` transport with the same sandbox
+For legacy fixture tasks, Claude uses its approved native hub or `claude -p --chrome` transport with the same sandbox
 and accepted `fe-claude-chrome` risk;
-its screenshot image tool results are captured as image evidence. Claude quota errors may use
-the task's Codex fallback via Omnigent. Browser verification never weakens the read-only reviewer.
+its screenshot image tool results are captured as image evidence. Confirmed provider quota
+errors may use the approved QA fallback once, after source, evidence and server checks. Browser verification never weakens the read-only reviewer.
 
 Evidence is under `runs/orch-<task>/fe-browser-<timestamp>/`: report.json, raw tool events,
 screenshots, provider, session ID, verified tree and gate timestamp. Every browser criterion
@@ -435,6 +551,18 @@ rendered into the prompt (Codex sees only its worktree). The task file's digest 
   them in `protected_paths_override`.
 - **Secret scanning** of prompts, Codex output, diffs and new files is defense in depth only;
   locations are reported, values never.
+  The exact documentation placeholder `REPLACE_WITH_ACCESS_TOKEN` in an assignment is
+  recognized across source, prompts, output and JSON session evidence. Other credentials
+  on the same line and values with extra token characters remain subject to scanning.
+  Accepted risk `http-file-secret-hits` (user decision, 2026-10-19) excludes files ending
+  in `.http` from the source secret scan, including tracked diffs and new files. This permits
+  actual credentials as well as placeholders in those request examples. Scope and protected-path
+  checks still apply; prompts, model output and all other source files are still scanned.
+  Remove the risk from `omnigent/pin.json` to restore scanning of `.http` files.
+  On resume, a prior source check blocked solely by named `.http` hits is checked again
+  under the accepted policy. Only a passing fresh check clears that block, preserving the
+  previous finding in `recovered_block`; gate and review still follow. Scope, implementation
+  output, Git metadata and later security blocks are never cleared by this exception.
 - **Review provenance**: `review-record` requires `CLAUDECODE=1`, a `claude` process in its
   process ancestry and no Codex process or `CODEX_*` variable, and stores the ancestry with the
   review. This is execution metadata, not a cryptographic signature: someone with the user's
@@ -482,3 +610,49 @@ processes' environment, Windows drives, credential files, canaries), checks that
 and `dotnet` on PATH resolve outside every denied path (Codex re-executes itself inside the
 sandbox: a Codex under `~/.asdf` fails with `bwrap: execvp`), then makes one real
 read-only `codex exec` call that tries to read a canary file. Rerun it after Codex upgrades.
+
+## Verified cross-repository reference inputs
+
+A task's `sides.<side>.reference_inputs` provides read-only evidence from another
+repository. Use this for API adapters, enum-to-folder mappings, normalization and
+path layouts. Prose findings and UI fixtures alone do not establish these rules.
+
+```json
+{
+  "reference_inputs": [{
+    "repository": "be",
+    "revision": "<full reviewed commit SHA>",
+    "path": "src/CompanyManagement.Domain/Shipments/Documents/ShipmentDocumentFolders.cs",
+    "sha256": "<SHA-256 of this exact Git blob>"
+  }]
+}
+```
+
+For a producer earlier in the same plan, use `revision: "after:PRODUCER-TASK-ID"`
+and omit `sha256`. Plan validation checks the dependency's order and owning side.
+Before preparing the consumer, autopilot resolves the selector to the producer's
+reviewed commit and records the exact blob hash in the approved task copy. A
+producer awaiting its disposable contract pilot can supply reviewed source evidence;
+this never marks that pilot passed or permits merge. Fixed references always need
+both a full commit SHA and a hash. Mutable branches and unapproved selectors fail.
+
+The runner reads only regular Git blobs under source/documentation/test paths;
+symlinks, hidden/private paths, binary/oversized content, secret-like text and hash
+mismatches fail before a model starts. It never reads another checkout's dirty
+files. Every implementation attempt, including provider fallback and rework,
+gets snapshots in its existing permitted temp directory, a `references.json`
+manifest and a prompt listing exact paths and provenance. Review receives the
+same pinned evidence. This adds no cross-repository write or network permissions.
+`INTERFACES` and the owning repositories' gates are unchanged.
+
+Skill resource selection constrains skill dependencies; it does not prohibit
+reading task code or verified contract inputs. Agents must consult those snapshots
+before asking for mappings already supplied by the approved task. Review findings
+about another repository should identify its commit and authoritative source path,
+not just one illustrative value or a mock-only fixture.
+
+Missing inputs in an already approved task require a new proposal/task identity,
+not editing its digest or clearing blocked state. Retain the old evidence, use the
+existing implementation commit as the recovery base, supply the pinned references
+and findings, and have the user approve the replacement plan. No prior work needs
+to be discarded or blindly rerun.

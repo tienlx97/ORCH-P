@@ -65,14 +65,24 @@ test('native launch merges ORCH restrictions after native hook settings and pres
   assert.throws(() => mergeClaudeSettings([], { permissions: {} }), /sandbox/);
 });
 
-for (const mode of ['pass', 'quota', 'missing-proof', 'changed-settings', 'bad-json', 'mode-change', 'sandbox-disabled']) test(`native Claude session: ${mode}`, async (t) => {
+for (const mode of ['pass', 'no-chrome', 'quota', 'quota-running', 'quota-running-unsafe', 'missing-proof', 'changed-settings', 'bad-json', 'mode-change', 'sandbox-disabled']) test(`native Claude session: ${mode}`, async (t) => {
   const f = fixture(t);
   const report = { status: 'implemented', summary: 'done' };
-  const stub = await startOmnigentStub({ agents: [{ id: 'claude_agent', name: 'claude-native-ui' }],
+  const nativeTranscriptRoot = join(f.dir, 'native-transcripts');
+  const hangingQuota = mode.startsWith('quota-running');
+  const stub = await startOmnigentStub({ hang: hangingQuota, agents: [{ id: 'claude_agent', name: 'claude-native-ui' }],
     onMessage: ({ session }) => {
       if (mode === 'missing-proof') return;
+      if (mode === 'no-chrome') assert.equal(session.terminal_launch_args.includes('--chrome'), false);
       const result = spawnSync(wrapper, [...session.terminal_launch_args, '--settings', f.nativeSettings], { cwd: f.worktree, env: f.env, encoding: 'utf8' });
       assert.equal(result.status, 0, result.stderr);
+      if (hangingQuota) {
+        const manifest = JSON.parse(readFileSync(join(f.dir, 'claude-hub-launch.json'), 'utf8'));
+        const directory = join(nativeTranscriptRoot, f.worktree.replace(/[^a-zA-Z0-9]/g, '-'));
+        mkdirSync(directory, { recursive: true });
+        writeFileSync(join(directory, `${manifest.claudeSessionId}.jsonl`), JSON.stringify({ type: 'assistant', isApiErrorMessage: true, apiError: 'usage_limit_reached', message: { content: [{ type: 'text', text: "You've hit your weekly limit" }] } }) + '\n');
+        if (mode === 'quota-running-unsafe') writeFileSync(join(f.dir, 'claude-hub-effective-settings.json'), '{}');
+      }
       if (mode === 'changed-settings') writeFileSync(join(f.dir, 'claude-hub-effective-settings.json'), '{}');
     },
     afterMessage: ({ items }) => {
@@ -83,11 +93,17 @@ for (const mode of ['pass', 'quota', 'missing-proof', 'changed-settings', 'bad-j
   t.after(() => stub.close());
   const options = { ...f, env: { ORCH_IMPLEMENTER: '1', TMPDIR: f.tmpDir, API_BASE_URL: 'http://127.0.0.1:1' },
     model: 'claude-opus-5-5', effort: 'medium', prompt: 'Test only', schema: { type: 'object' },
-    title: 'test', timeoutMs: 1000, pollMs: 5, client: omnigentClient(stub.url) };
-  if (['pass', 'quota'].includes(mode)) {
+    nativeTranscriptRoot, chrome: mode !== 'no-chrome', title: 'test', timeoutMs: 1000, pollMs: 5, client: omnigentClient(stub.url) };
+  if (['pass', 'no-chrome', 'quota', 'quota-running'].includes(mode)) {
     const result = await runClaudeHub(options);
-    assert.equal(result.status, mode === 'pass' ? 0 : 1);
-    assert.equal(result.limited, mode === 'quota');
-    if (mode === 'pass') assert.deepEqual(result.report, report);
+    const limited = ['quota', 'quota-running'].includes(mode);
+    assert.equal(result.status, limited ? 1 : 0);
+    assert.equal(result.limited, limited);
+    if (mode === 'quota-running') {
+      assert.equal(result.timedOut, false);
+      assert.equal(result.interrupted, null);
+      assert.ok(stub.requests.some(r => r.body?.type === 'interrupt'));
+    }
+    if (!limited) assert.deepEqual(result.report, report);
   } else await assert.rejects(runClaudeHub(options), /attest|settings|JSON|permissions changed|sandbox disabled/);
 });

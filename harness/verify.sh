@@ -24,9 +24,9 @@ step() {
 SECRET_PATTERN='-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{30,}|sk-[A-Za-z0-9]{20,}'
 
 step "syntax" bash -c 'for f in $(git ls-files --cached --others --exclude-standard "*.mjs"); do node --check "$f" || exit 1; done; node --check orchestrate/bin/claude'
-step "tests" node --test tests/agent-config.test.mjs tests/claude-hub.test.mjs tests/orchestrate.test.mjs tests/browser-verification.test.mjs tests/verify-container.test.mjs tests/observability.test.mjs tests/omnigent.test.mjs tests/runner.test.mjs tests/autopilot.test.mjs
+step "tests" node --test tests/development-policy.test.mjs tests/reference-inputs.test.mjs tests/skills.test.mjs tests/agent-config.test.mjs tests/claude-hub.test.mjs tests/orchestrate.test.mjs tests/browser-verification.test.mjs tests/browser-login.test.mjs tests/project-checkout.test.mjs tests/verify-container.test.mjs tests/observability.test.mjs tests/omnigent.test.mjs tests/runner.test.mjs tests/autopilot.test.mjs
 step "omnigent-bundle" node orchestrate/cockpit.mjs lint
-step "secret-scan" bash -c "! git grep -nE -- '$SECRET_PATTERN' -- . ':!harness/verify.sh'"
+step "secret-scan" bash -c "! git grep -lE -- '$SECRET_PATTERN' -- . ':!harness/verify.sh'"
 step "whitespace" bash -c 'git diff --check HEAD && git diff --check --cached'
 step "links" node harness/check-links.mjs
 if [ "${1:-}" = "--container" ]; then

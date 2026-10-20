@@ -99,6 +99,26 @@
       "source": "Claude Code conversation 2026-10-16, the user's words: \"bạn ko cần chặn loopback, nói chung: ở ORCH-P bạn hãy đề mặc định, để dùng được nhiếu nhất khả năng của ominigen\", then \"làm đi\"",
       "date": "2026-10-16",
       "until": "the user withdraws it; removing this entry restores the ORCH-P profile and the Step 0 requirement"
+    },
+    {
+      "id": "http-file-secret-hits",
+      "checks": [],
+      "reason": "The user permits secret_hits in .http files for development request examples. Source scanning skips .http tracked diffs and new files, permitting actual secrets as well as placeholders in those files. Scope, protected paths, prompt/output scanning, gate and review remain enforced.",
+      "scope": "Source secret scanning for files ending in .http only",
+      "approved_by": "user",
+      "source": "Codex conversation 2026-10-19: user wrote \"cho phép - secret_hits  trong .http file\" after requesting development secret-hit allowance.",
+      "date": "2026-10-19",
+      "until": "the user withdraws it; remove this entry to restore .http source scanning"
+    },
+    {
+      "id": "solo-dev",
+      "checks": [],
+      "approved_by": "user",
+      "date": "2026-10-19",
+      "source": "Codex conversation 2026-10-19: user requested a whole-project review and simple security/data rules for a single developer to reduce task failures.",
+      "scope": "Generic secret matches become advisory throughout the pipeline; approved local dev actions need no additional data attestation; browser acceptance runs after the gate; explicit resume retries ordinary implementation/environment blocks.",
+      "reason": "Reduce false positives, duplicate browser work and permanent environment blocks. Unknown credentials may evade recognizable-format blocking; broad output redaction remains. Real browser failures, source scope, Git integrity, gates, approval binding, review provenance and no push/merge remain enforced.",
+      "until": "the user withdraws it; remove this risk to restore strict defaults"
     }
   ]
 }

@@ -11,9 +11,11 @@
 // and a static lint of the agent bundle in omnigent/. The lint is a text
 // guard, not a YAML parser: it refuses settings that would undo the security
 // posture and requires the guardrails the coordinator depends on.
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { delimiter, dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { readAgentConfig } from './agent-config.mjs';
+import { lintSkills } from './skills.mjs';
 
 const PASS_ENV = ['HOME', 'PATH', 'USER', 'LOGNAME', 'SHELL', 'TERM', 'COLORTERM', 'NO_COLOR', 'LANG', 'LC_ALL', 'TMPDIR', 'TZ'];
 
@@ -79,7 +81,9 @@ export function readPin(bundleDir) {
 
 // Gaps the user may accept, by name, with the Step 0 checks each one covers.
 // Only the listed risks may waive their named checks. Write isolation,
-// credential variables, private TMPDIR and secret scanning remain required;
+// credential variables and private TMPDIR remain required. Secret scanning
+// excludes .http source files only under http-file-secret-hits;
+// solo-dev makes generic matches advisory while recognizable credentials block.
 // orch-defaults explicitly permits implementer network and loopback access.
 // `debby-unsandboxed` covers no Step 0 check: it concerns
 // Omnigent's built-in debby, which never runs a pipeline step. Neither does
@@ -94,6 +98,8 @@ export const KNOWN_RISKS = Object.freeze({
   'fe-claude-chrome': Object.freeze([]),
   'codex-review-fallback': Object.freeze([]),
   'orch-defaults': Object.freeze(['NETWORK', 'LOOPBACK_OMNIGENT']),
+  'http-file-secret-hits': Object.freeze([]),
+  'solo-dev': Object.freeze([]),
 });
 
 const accepts = (pin, id) => (pin?.accepted_risks ?? []).some((r) => r?.id === id);
@@ -243,13 +249,14 @@ export const BUNDLE_AGENTS = Object.freeze({
 });
 
 function agentDirs(bundleDir) {
-  return readdirSync(bundleDir).filter((entry) => statSync(join(bundleDir, entry)).isDirectory());
+  return readdirSync(bundleDir).filter((entry) => entry !== 'skills' && statSync(join(bundleDir, entry)).isDirectory());
 }
 
 /** Static checks of omnigent/: pin, server config, every agent config. */
 export function lintBundle(bundleDir) {
   const { pin, problems: pinProblems } = readPin(bundleDir);
   const problems = [...pinProblems];
+  if (existsSync(join(bundleDir, 'skills'))) problems.push(...lintSkills(join(bundleDir, 'skills')));
   try { readAgentConfig(join(bundleDir, 'agents.json')); } catch (error) { problems.push(`agents.json: ${error.message}`); }
   const cel = !accepts(pin, 'agent-no-cel');
   const server = join(bundleDir, 'config.yaml');
@@ -284,7 +291,19 @@ export function lintBundle(bundleDir) {
  * started (allowlisted environment, opt-outs, minimal Codex config): its
  * record names the pid that ~/.omnigent/host.pid names now, and it is alive.
  */
-export function orchHostStatus({ home, record }) {
+export function claudeHostLauncherProblems({ pid, launcher, readEnvironment = (id) => readFileSync(`/proc/${id}/environ`, 'utf8') }) {
+  try {
+    const path = readEnvironment(pid).split('\0').find(entry => entry.startsWith('PATH='))?.slice(5);
+    if (!path) return ['cannot verify the Omnigent host PATH; restart with cockpit host-stop then cockpit host'];
+    const selected = path.split(delimiter).map(directory => join(directory, 'claude')).find(file => {
+      try { const stat = statSync(file); return stat.isFile() && (stat.mode & 0o111) !== 0; } catch { return false; }
+    });
+    if (!selected || realpathSync(selected) !== realpathSync(launcher)) return ['the running Omnigent host does not resolve Claude through the ORCH launcher; run cockpit host-stop then cockpit host'];
+    return [];
+  } catch { return ['cannot verify the Omnigent host Claude launcher; run cockpit host-stop then cockpit host']; }
+}
+
+export function orchHostStatus({ home, record, requireClaudeLauncher = false }) {
   let saved;
   try { saved = JSON.parse(readFileSync(record, 'utf8')); } catch { return { ok: false, reason: 'no host record; start the daemon with `node orchestrate/cockpit.mjs host`' }; }
   let current;
@@ -295,6 +314,12 @@ export function orchHostStatus({ home, record }) {
     if (saved.env?.[key] !== value) return { ok: false, reason: `the host record lacks ${key}=${value}; restart with \`node orchestrate/cockpit.mjs host\`` };
   }
   if (!saved.env?.CODEX_HOME) return { ok: false, reason: 'the host record lacks CODEX_HOME (the hub Codex home); restart with `node orchestrate/cockpit.mjs host`' };
+  if (requireClaudeLauncher) {
+    const launcher = resolve(dirname(fileURLToPath(import.meta.url)), '../bin/claude');
+    if (saved.claude_launcher !== launcher) return { ok: false, reason: 'the host record has no current ORCH Claude launcher; run cockpit host-stop then cockpit host' };
+    const problems = claudeHostLauncherProblems({ pid: current, launcher });
+    if (problems.length) return { ok: false, reason: problems.join('; ') };
+  }
   return { ok: true, record: saved, codexHome: saved.env.CODEX_HOME };
 }
 

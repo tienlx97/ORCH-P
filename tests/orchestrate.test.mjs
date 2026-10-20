@@ -4,6 +4,7 @@
 // wrappers that log every invocation so the tests can prove nothing is pushed.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import {
   appendFileSync, chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
@@ -15,12 +16,14 @@ import { fileURLToPath } from 'node:url';
 
 import {
   buildFilesystemPolicy, deniedBy, gateFindings, gitMetadataDigest, globToRegExp, hiddenToolchain, matchesAny, profileArgs, reviewProvenance,
-  sanitizedEnv, scanSecrets,
+  sanitizedEnv, scanSecrets, canRetryImplementationBlock,
 } from '../orchestrate/orchestrate.mjs';
+import { nextStep } from '../orchestrate/autopilot.mjs';
 
 import { DatabaseSync } from 'node:sqlite';
 
 import { startOmnigentStub } from './omnigent-stub.mjs';
+import { pinSkill, verifySkill } from '../orchestrate/lib/skills.mjs';
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'orchestrate', 'orchestrate.mjs');
 // Not under /tmp: the generated sandbox profile denies /tmp, and implement
@@ -214,6 +217,35 @@ function runToCommit(ctx, side) {
 }
 
 // ── pure helpers ─────────────────────────────────────────────────────────
+test('FE implement receives a pinned backend contract snapshot inside its own sandbox', () => {
+  const ctx = setup();
+  const path = 'docs/api/ShipmentFolders.md';
+  const source = 'ContainerDropOff -> PHIEU_HA; CoInvoice -> HOA_DON_CO; supplier = normalized CODE_COMPANYNAME.\n';
+  mkdirSync(dirname(join(ctx.be, path)), { recursive: true });
+  writeFileSync(join(ctx.be, path), source);
+  sh(ctx.be, 'git add docs/api/ShipmentFolders.md');
+  sh(ctx.be, 'git -c user.name=Test -c user.email=test@example.invalid -c core.hooksPath=/dev/null commit -qm contract');
+  const revision = sh(ctx.be, 'git rev-parse HEAD');
+  const reference = { repository: 'be', revision, path, sha256: createHash('sha256').update(source).digest('hex') };
+  ctx.task.sides.fe.reference_inputs = [reference];
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+  writeFileSync(join(ctx.be, path), 'dirty mapping must not be read');
+  const result = orch(ctx, ['implement', ctx.taskFile, 'fe']);
+  assert.equal(result.status, 0, result.stderr);
+  const prompt = readFileSync(join(state(ctx).sides.fe.steps.implement.dir, 'prompt.md'), 'utf8');
+  assert.match(prompt, /Verified contract references/);
+  assert.ok(prompt.includes(reference.sha256));
+  const location = JSON.parse(/Read ("[^\n]+ShipmentFolders\.md")\./.exec(prompt)[1]);
+  assert.ok(location.startsWith(join(ctx.ws, 'worktrees', `${ctx.task.id}-fe-tmp`)));
+  assert.equal(readFileSync(location, 'utf8'), source);
+  ctx.task.sides.fe.reference_inputs[0].sha256 = '0'.repeat(64);
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  const invalid = orch(ctx, ['validate', ctx.taskFile]);
+  assert.equal(invalid.status, 2);
+  assert.match(invalid.stderr, /reference input hash mismatch/);
+});
+
 test('glob matching', () => {
   assert.ok(globToRegExp('src/**').test('src/a/b.cs'));
   assert.ok(globToRegExp('**/.env').test('.env'));
@@ -228,6 +260,22 @@ test('secret scan reports locations, never values', () => {
   const hits = scanSecrets(`ok\nconst k = "${fakeToken}"\nServer=x;Password=hunter22;`, 'f');
   assert.deepEqual(hits, ['f:2', 'f:3']);
   assert.ok(!hits.join().includes('ghp_'));
+});
+
+test('documentation token placeholders pass every evidence format without hiding other secrets', () => {
+  const placeholder = '@token = REPLACE_WITH_ACCESS_TOKEN';
+  for (const text of [placeholder, `${placeholder}\n`, `${placeholder};`,
+    'token = "REPLACE_WITH_ACCESS_TOKEN"', JSON.stringify({ output: `${placeholder}\n` }),
+    JSON.stringify({ result: JSON.stringify({ output: `${placeholder}\n` }) })]) {
+    assert.deepEqual(scanSecrets(text, 'evidence'), [], 'placeholder in source, prompt or session evidence');
+  }
+  const credential = `${'gh'}p_${'a'.repeat(36)}`;
+  for (const text of [
+    `${placeholder} ${credential}`, `${placeholder}; token=${'z'.repeat(24)}`,
+    `token=REPLACE_WITH_ACCESS_TOKEN${'z'.repeat(20)}`,
+    'token=REPLACE_WITH_ACCESS_TOKEN/actual', 'token=REPLACE_WITH_ACCESS_TOKEN.actual',
+    `${placeholder}\nPassword=hunter22`,
+  ]) assert.ok(scanSecrets(text, 'evidence').length, 'other secrets and extended values remain blocked');
 });
 
 test('sanitized environment keeps only the allowlist', () => {
@@ -261,6 +309,27 @@ test('review provenance needs a Claude Code process and no Codex process', () =>
 });
 
 // ── validation ───────────────────────────────────────────────────────────
+test('approval-bound team rejects invalid dispatch and specialists before prepare', () => {
+  for (const [team, message] of [
+    [{ mode: 'polly', specialists: ['backend', 'frontend', 'reviewer'] }, /native Polly dispatch/],
+    [{ mode: 'direct', specialists: ['backend', 'frontend', 'qa', 'reviewer'] }, /1\.\.3/],
+    [{ mode: 'direct', specialists: ['backend', 'frontend'] }, /independent reviewer/],
+  ]) {
+    const ctx = setup({ team });
+    const result = orch(ctx, ['prepare', ctx.taskFile]);
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, message);
+    assert.equal(existsSync(join(ctx.ws, 'worktrees')), false);
+  }
+  const ctx = setup({ team: { mode: 'direct', specialists: ['backend', 'frontend', 'reviewer'] } });
+  assert.equal(orch(ctx, ['validate', ctx.taskFile]).status, 0);
+  ctx.task.sides.fe.agent_role = 'database';
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  const invalid = orch(ctx, ['validate', ctx.taskFile]);
+  assert.equal(invalid.status, 2);
+  assert.match(invalid.stderr, /agent_role/);
+});
+
 test('refuses unapproved tasks and ambiguous or missing baselines', () => {
   const cases = [
     [{ status: 'proposed' }, /status must be "approved"/],
@@ -373,6 +442,8 @@ process.stdin.resume(); process.stdin.on('data', () => {}); process.stdin.on('en
 
 test('runner claude: at the usage limit the task falls back to its Codex model on the same worktree', () => {
   const ctx = setup();
+  const skill = pinSkill('frontend-design');
+  ctx.task.skill_contract = { version: 1, implementation: { be: [], fe: [skill] }, browser: {}, review: [] };
   ctx.task.sides.fe = { ...ctx.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5', fallback: { runner: 'codex-exec', model: 'test-model' } };
   writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
   assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
@@ -387,6 +458,8 @@ process.stdin.resume(); process.stdin.on('data', () => {}); process.stdin.on('en
 });
 `);
   chmodSync(stub, 0o755);
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'v2\n' },
+    output: { status: 'implemented', skills_read: [{ id: skill.id, sha256: skill.sha256, applied: 'Used readable action labels and progressive disclosure.' }] } }));
   rmSync(join(root, 'home', 'codex-calls.jsonl'), { force: true });
   const r = orch(ctx, ['implement', ctx.taskFile, 'fe'], { ORCH_CLAUDE_BIN: stub, ORCH_CLAUDE_SANDBOX_TOOLS: 'sh' });
   assert.equal(r.status, 0, r.stderr);
@@ -398,6 +471,12 @@ process.stdin.resume(); process.stdin.on('data', () => {}); process.stdin.on('en
   assert.equal(s.sides.fe.status, 'in_progress', 'a clean new implementation clears the old attempt status');
   assert.equal(JSON.parse(orch(ctx, ['status', ctx.taskFile]).stdout).sides.fe.live.provider, 'codex');
   assert.deepEqual(s.log.filter((e) => e.side === 'fe' && e.step === 'implement').map((e) => e.exit), [1, 0], 'the Claude attempt, then Codex');
+  for (const attempt of s.log.filter(e => e.side === 'fe' && e.step === 'implement')) {
+    const prompt = readFileSync(join(attempt.dir, 'prompt.md'), 'utf8');
+    assert.ok(prompt.includes(skill.sha256), 'both providers receive identical approved skill identity');
+    assert.ok(prompt.includes('SKILL.md'), 'verified skill paths are supplied to both providers');
+    assert.ok(!prompt.includes('Frontend Design'), 'skill body is loaded on demand');
+  }
   // Without a fallback the run fails and says so.
   const bare = setup();
   bare.task.sides.fe = { ...bare.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5' };
@@ -406,6 +485,82 @@ process.stdin.resume(); process.stdin.on('data', () => {}); process.stdin.on('en
   const none = orch(bare, ['implement', bare.taskFile, 'fe'], { ORCH_CLAUDE_BIN: stub, ORCH_CLAUDE_SANDBOX_TOOLS: 'sh' });
   assert.equal(none.status, 1);
   assert.match(none.stderr, /names no fallback/);
+});
+
+// Both directions use the same worktree and preserve each attempt's evidence.
+for (const [role, side] of [['frontend', 'fe'], ['backend', 'be'], ['database', 'be'], ['qa', 'be'], ['devops', 'fe']]) {
+  test(`Codex quota switches ${role} to Claude exactly once, preserving partial changes`, () => {
+    const ctx = setup();
+    ctx.task.sides[side] = { ...ctx.task.sides[side], agent_role: role,
+      fallback: { runner: 'claude', model: 'claude-opus-5-5', effort: 'high', claude_transport: 'cli' } };
+    writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+    assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+    const stub = join(ctx.ws, 'claude-replacement.cjs');
+    writeFileSync(stub, String.raw`#!/usr/bin/env node
+const fs = require('node:fs'); let input = '';
+process.stdin.on('data', c => input += c);
+process.stdin.on('end', () => {
+  if (fs.readFileSync('src/app.txt', 'utf8') !== 'partial\n') process.exit(9);
+  fs.writeFileSync('src/app.txt', 'finished\n');
+  fs.writeFileSync(process.env.HOME + '/replacement-call.json', JSON.stringify({ args: process.argv.slice(2), input, cwd: process.cwd(), api: process.env.API_BASE_URL }));
+  console.log(JSON.stringify({ type: 'result', is_error: false, structured_output: { status: 'implemented', summary: 'Finished', changed_files: ['src/app.txt'], checks: [], not_verified: [], risks: [] } }));
+});
+`);
+    chmodSync(stub, 0o755);
+    writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'partial\n' }, exit: 1,
+      stream: [{ event: { type: 'turn.failed', error: { code: 'usage_limit_reached', message: 'usage limit reached' } } }] }));
+    const result = orch(ctx, ['implement', ctx.taskFile, side], { ORCH_CLAUDE_BIN: stub, ORCH_CLAUDE_SANDBOX_TOOLS: 'sh' });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    const current = state(ctx);
+    assert.deepEqual(current.log.filter(e => e.side === side && e.step === 'implement').map(e => e.runner), ['codex-exec', 'claude']);
+    assert.equal(current.sides[side].steps.fallback.reason, 'provider_usage_limit');
+    assert.equal(readFileSync(join(current.sides[side].worktree, 'src/app.txt'), 'utf8'), 'finished\n');
+    const call = JSON.parse(readFileSync(join(root, 'home', 'replacement-call.json'), 'utf8'));
+    assert.equal(call.cwd, current.sides[side].worktree);
+    assert.match(call.input, /read `git status` and `git diff` first/);
+    assert.equal(call.args.includes('--chrome'), side === 'fe');
+    const settings = JSON.parse(readFileSync(call.args[call.args.indexOf('--settings') + 1], 'utf8'));
+    assert.equal(settings.sandbox.allowUnsandboxedCommands, false);
+    if (side === 'be') { assert.equal(call.api, undefined); assert.ok(settings.permissions.deny.includes('mcp__claude-in-chrome')); }
+  });
+}
+
+test('Codex does not fall back for auth/tool errors, secret leakage or changed Git metadata', () => {
+  for (const scenario of ['auth', 'tool-output', 'secret', 'metadata', 'out-of-scope', 'source-secret', 'blocked-report']) {
+    const ctx = setup();
+    ctx.task.sides.be.fallback = { runner: 'claude', model: 'claude-opus-5-5', effort: 'high', claude_transport: 'cli' };
+    writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+    assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+    const quota = { type: 'error', code: 'usage_limit_reached', message: 'usage limit reached' };
+    const event = scenario === 'auth' ? { type: 'error', message: 'Authentication failed' }
+      : scenario === 'tool-output' ? { type: 'function_call_output', output: 'usage limit reached' } : quota;
+    writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ exit: 1, stream: [{ event }],
+      ...(scenario === 'secret' ? { leak: 'sk-' + 'Z'.repeat(30) } : {}), ...(scenario === 'metadata' ? { hook: true } : {}),
+      ...(scenario === 'out-of-scope' ? { write: { 'outside.txt': 'unauthorized' } } : {}),
+      ...(scenario === 'source-secret' ? { write: { 'src/app.txt': 'sk-' + 'Z'.repeat(30) } } : {}),
+      ...(scenario === 'blocked-report' ? { output: { status: 'blocked', summary: 'requires external change' } } : {}) }));
+    const result = orch(ctx, ['implement', ctx.taskFile, 'be']);
+    assert.notEqual(result.status, 0);
+    assert.equal(state(ctx).log.filter(e => e.step === 'implement' && e.side === 'be').length, 1);
+    assert.equal(state(ctx).sides.be.steps.fallback, undefined);
+  }
+});
+
+test('a second quota failure stops after the approved replacement without cycling providers', () => {
+  const ctx = setup();
+  ctx.task.sides.be.fallback = { runner: 'claude', model: 'claude-opus-5-5', effort: 'medium', claude_transport: 'cli' };
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  orch(ctx, ['prepare', ctx.taskFile]);
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ exit: 1, stream: [{ event: { type: 'error', message: 'usage limit reached' } }] }));
+  const stub = join(ctx.ws, 'claude-also-limited.cjs');
+  writeFileSync(stub, `process.stdin.resume(); process.stdin.on('end', () => { console.log(JSON.stringify({type:'result',is_error:true,result:'usage limit reached'})); process.exit(1); });`);
+  chmodSync(stub, 0o755);
+  // The CLI must be executable and have an interpreter.
+  writeFileSync(stub, '#!/usr/bin/env node\n' + readFileSync(stub, 'utf8'));
+  const result = orch(ctx, ['implement', ctx.taskFile, 'be'], { ORCH_CLAUDE_BIN: stub, ORCH_CLAUDE_SANDBOX_TOOLS: 'sh' });
+  assert.equal(result.status, 1, result.stderr);
+  assert.match(result.stderr, /no further provider switch/);
+  assert.equal(state(ctx).log.filter(e => e.side === 'be' && e.step === 'implement').length, 2);
 });
 
 test('an implementer session cannot record a review', () => {
@@ -444,6 +599,41 @@ test('implement is blocked until Step 0 passed', () => {
     const r = orch(ctx, ['implement', ctx.taskFile, 'be'], { ORCH_STEP0_REPORT: join(root, report) });
     assert.equal(r.status, 2);
     assert.match(r.stderr, /Step 0/);
+  }
+});
+
+test('required skills are supplied to the implementer and missing/hash-mismatched reports block commit', () => {
+  const binding = pinSkill('dotnet-webapi');
+  for (const scenario of ['missing', 'wrong-hash', 'file-hash', 'valid']) {
+    const ctx = setup();
+    ctx.task.skill_contract = { version: 1, implementation: { be: [binding], fe: [] }, browser: {}, review: [] };
+    writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+    const prepared = orch(ctx, ['prepare', ctx.taskFile]);
+    assert.equal(prepared.status, 0, prepared.stderr);
+    writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'v2\n' }, output: {
+      status: 'implemented', ...(scenario === 'missing' ? {} : { skills_read: [{ id: binding.id,
+        sha256: scenario === 'valid' ? binding.sha256 : scenario === 'file-hash' ? createHash('sha256').update(verifySkill(binding)[0].content).digest('hex') : 'bad', applied: 'Preserved controller error mapping.' }] }),
+    } }));
+    const result = orch(ctx, ['implement', ctx.taskFile, 'be']);
+    assert.equal(result.status, scenario === 'valid' ? 0 : 1, result.stderr);
+    const impl = state(ctx).sides.be.steps.implement;
+    const prompt = readFileSync(join(impl.dir, 'prompt.md'), 'utf8');
+    assert.ok(prompt.includes(binding.sha256));
+    assert.ok(!prompt.includes('ASP.NET Core Web API'), 'skill body is absent from the initial prompt');
+    const skillPath = JSON.parse(/Read ("[^\n]+SKILL\.md")\./.exec(prompt)[1]);
+    assert.match(readFileSync(skillPath, 'utf8'), /ASP.NET Core Web API/);
+    const schema = JSON.parse(readFileSync(join(impl.dir, 'report.schema.json'), 'utf8'));
+    assert.ok(schema.required.includes('skills_read'));
+    if (scenario === 'valid') assert.equal(impl.skills_read[0].id, binding.id);
+    else {
+      assert.equal(impl.blocked, true);
+      assert.match(result.stderr, /required-skill report/);
+      if (scenario === 'file-hash') {
+        assert.match(impl.skill_report_error, /PACKAGE sha256/);
+        assert.equal(impl.skills_read[0].sha256, createHash('sha256').update(verifySkill(binding)[0].content).digest('hex'), 'the rejected acknowledgment remains evidence');
+      }
+      assert.equal(orch(ctx, ['commit', ctx.taskFile, 'be']).status, 2);
+    }
   }
 });
 
@@ -502,7 +692,8 @@ test('check passes in-scope changes and blocks scope, protected-path and secret 
     [{ 'src/app.txt': 'v2\n' }, 0, null],
     [{ 'docs/readme.md': 'x\n' }, 1, /outside allowed_paths/],
     [{ 'src/x.txt': 'x\n', 'harness/verify.sh': 'exit 0\n' }, 1, /outside allowed_paths|protected/],
-    [{ 'src/config.txt': 'Server=db;Password=supersecret;' }, 1, /secret-like text at/],
+    [{ 'src/config.txt': 'Server=db;Password=supersecret;' }, 0, /warning:/],
+    [{ 'src/config.txt': `${'gh'}p_${'a'.repeat(36)}` }, 1, /secret-like text at/],
   ];
   for (const [write, expected, message] of variants) {
     const ctx = setup();
@@ -518,7 +709,108 @@ test('check passes in-scope changes and blocks scope, protected-path and secret 
   }
 });
 
+test('the accepted .http exemption covers new files and diffs, remains scoped and can be withdrawn', () => {
+  const ctx = setup();
+  ctx.task.sides.be.allowed_paths.push('harness/**');
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+  const worktree = state(ctx).sides.be.worktree;
+  const example = `@token = ${'test'.repeat(6)}\n# ${'gh'}p_${'b'.repeat(36)}\n`;
+  writeFileSync(join(worktree, 'src/example.http'), example);
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be']).status, 0, 'new .http is exempt');
+  sh(worktree, 'git add src/example.http');
+  writeFileSync(join(worktree, 'src/another.http'), example);
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be']).status, 0, 'tracked diff and untracked .http are exempt');
+
+  writeFileSync(join(worktree, 'src/app.txt'), example);
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be']).status, 1, 'other source still scanned');
+  assert.ok(state(ctx).sides.be.steps.check.secret_hits.length);
+  writeFileSync(join(worktree, 'src/app.txt'), 'v1\n');
+  writeFileSync(join(worktree, 'outside.http'), example);
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be']).status, 1, 'scope still enforced');
+  assert.deepEqual(state(ctx).sides.be.steps.check.out_of_scope, ['outside.http']);
+  rmSync(join(worktree, 'outside.http'));
+  writeFileSync(join(worktree, 'harness/protected.http'), example);
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be']).status, 1, 'protected paths still enforced');
+  assert.deepEqual(state(ctx).sides.be.steps.check.protected, ['harness/protected.http']);
+  rmSync(join(worktree, 'harness/protected.http'));
+
+  const bundle = join(ctx.ws, 'risk-bundle');
+  mkdirSync(bundle);
+  const pin = JSON.parse(readFileSync(join(dirname(CLI), '..', 'omnigent/pin.json')));
+  pin.accepted_risks = pin.accepted_risks.filter(r => !['http-file-secret-hits', 'solo-dev'].includes(r.id));
+  writeFileSync(join(bundle, 'pin.json'), JSON.stringify(pin));
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be'], { ORCH_OMNIGENT_BUNDLE: bundle }).status, 1, 'withdrawing the risk restores .http scanning');
+  const hits = state(ctx).sides.be.steps.check.secret_hits;
+  assert.ok(hits.some(hit => hit.startsWith('diff:')), 'tracked .http diff scanned');
+  assert.ok(hits.includes('src/another.http:1'), 'untracked .http scanned');
+});
+
+test('a fresh check recovers only an accepted .http source block and preserves its evidence', () => {
+  const ctx = setup();
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+  assert.equal(orch(ctx, ['implement', ctx.taskFile, 'be']).status, 0);
+  const worktree = state(ctx).sides.be.worktree;
+  writeFileSync(join(worktree, 'src/example.http'), `@token = ${'test'.repeat(6)}\n`);
+  const bundle = join(ctx.ws, 'old-risk-bundle');
+  mkdirSync(bundle);
+  const pin = JSON.parse(readFileSync(join(dirname(CLI), '..', 'omnigent/pin.json')));
+  pin.accepted_risks = pin.accepted_risks.filter(r => !['http-file-secret-hits', 'solo-dev'].includes(r.id));
+  writeFileSync(join(bundle, 'pin.json'), JSON.stringify(pin));
+  const oldPolicy = { ORCH_OMNIGENT_BUNDLE: bundle };
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be'], oldPolicy).status, 1);
+  assert.equal(state(ctx).sides.be.status, 'blocked');
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be'], oldPolicy).status, 1, 'without the risk the block stays');
+  const previous = state(ctx).sides.be.steps.check;
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'be']).status, 0);
+  const recovered = state(ctx).sides.be;
+  assert.equal(recovered.status, 'implemented');
+  assert.deepEqual(recovered.steps.check.recovered_block, { risk: 'solo-dev', previous_check: previous });
+  assert.equal(orch(ctx, ['commit', ctx.taskFile, 'be']).status, 2, 'a fresh gate is still required');
+});
+
 // ── verify / commit ──────────────────────────────────────────────────────
+test('ordinary blocked reports can resume in the same worktree while security blocks remain stopped', () => {
+  const ctx = setup();
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile, 'be']).status, 0);
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'partial work\n' },
+    output: { status: 'blocked', summary: 'dev login unavailable', checks: [] } }));
+  assert.equal(orch(ctx, ['implement', ctx.taskFile, 'be']).status, 1);
+  const blocked = state(ctx).sides.be;
+  assert.equal(canRetryImplementationBlock(blocked), true);
+  assert.equal(nextStep(blocked), 'implement');
+  for (const change of [{ secret_hits: ['output:1'] }, { git_metadata_changed: true },
+    { permission_changed: true }, { sandbox_problems: ['unsafe sandbox'] },
+    { block_reason: 'invalid required-skill report' }]) {
+    const unsafe = { ...blocked, steps: { ...blocked.steps, implement: { ...blocked.steps.implement, ...change } } };
+    assert.equal(canRetryImplementationBlock(unsafe), false);
+    assert.equal(nextStep(unsafe), 'blocked');
+  }
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ output: { status: 'implemented' } }));
+  assert.equal(orch(ctx, ['implement', ctx.taskFile, 'be']).status, 0);
+  assert.equal(readFileSync(join(blocked.worktree, 'src/app.txt'), 'utf8'), 'partial work\n');
+  assert.equal(nextStep(state(ctx).sides.be), 'check');
+});
+
+test('solo-dev defers mandatory browser proof to QA after the gate without letting commit bypass QA', () => {
+  const ctx = setup();
+  ctx.task.sides.fe.browser = { workflow: 'application', url: 'http://localhost:3101/logistics/demo', api_base_url: 'http://localhost:8081',
+    start_command: ['pnpm', 'dev', '-p', '3101'], test_data_only: true,
+    application: { path: '/logistics/demo', authentication: 'fe-local', navigation: ['Login', 'Logistics'], mutations: [] } };
+  ctx.task.sides.fe.acceptance_criteria.push('browser: check actual screen');
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile, 'fe']).status, 0);
+  assert.equal(orch(ctx, ['implement', ctx.taskFile, 'fe']).status, 0, 'no implementation-time browser pass required');
+  const prompt = readFileSync(join(state(ctx).sides.fe.steps.implement.dir, 'prompt.md'), 'utf8');
+  assert.match(prompt, /independent browser QA runs after the repository gate/);
+  assert.ok(!prompt.includes('Your implementation report MUST include checks'));
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'fe']).status, 0);
+  assert.equal(orch(ctx, ['verify', ctx.taskFile, 'fe']).status, 0);
+  const commit = orch(ctx, ['commit', ctx.taskFile, 'fe']);
+  assert.equal(commit.status, 2);
+  assert.match(commit.stderr, /browser verification/);
+});
+
 test('verify returns the gate exit code and commit is refused unless it passed', () => {
   const ctx = setup();
   orch(ctx, ['prepare', ctx.taskFile]);
@@ -641,6 +933,30 @@ test('review-codex: Codex reviews read-only when the risk is accepted, and this 
   const stored = JSON.parse(readFileSync(state(ctx).review.file, 'utf8'));
   assert.equal(stored.provenance.reviewer, 'codex-fallback');
   assert.equal(orch(ctx, ['review-codex', ctx.taskFile], { ORCH_IMPLEMENTER: '1' }).status, 2, 'never from an implementer');
+});
+
+test('review skill acknowledgment is required before a new-contract task can become ready for merge', () => {
+  const ctx = setup();
+  const skill = pinSkill('code-review-and-quality');
+  ctx.task.skill_contract = { version: 1, implementation: { be: [], fe: [] }, browser: {}, review: [skill] };
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'v2\n' }, output: { status: 'implemented', skills_read: [] } }));
+  runToCommit(ctx, 'be'); runToCommit(ctx, 'fe');
+  const s = state(ctx);
+  const commits = { be: s.sides.be.steps.commit.commit, fe: s.sides.fe.steps.commit.commit };
+  const output = { commits, verdict: 'accept', acceptance: [], findings: [] };
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ output }));
+  const missing = orch(ctx, ['review-codex', ctx.taskFile]);
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /skills_read/);
+  assert.notEqual(state(ctx).review?.status, 'ready_for_human_merge');
+  output.skills_read = [{ id: skill.id, sha256: skill.sha256, applied: 'Checked correctness, architecture and security against the approved criteria.' }];
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ output }));
+  const valid = orch(ctx, ['review-codex', ctx.taskFile]);
+  assert.equal(valid.status, 0, valid.stderr);
+  const stored = JSON.parse(readFileSync(state(ctx).review.file, 'utf8'));
+  assert.equal(stored.review.skills_read[0].sha256, skill.sha256);
 });
 
 test('nothing is ever pushed, merged or sent to GitHub', () => {
@@ -1108,11 +1424,13 @@ test('live: secrets, terminal escapes, outside paths and malformed lines never r
 test('live: timeout and SIGTERM keep run() exit codes and record why codex stopped', async () => {
   let ctx = setup();
   ctx.task.sides.be.timeout_minutes = 0.005;
+  ctx.task.sides.be.fallback = { runner: 'claude', model: 'claude-opus-5-5', effort: 'medium', claude_transport: 'cli' };
   writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
   orch(ctx, ['prepare', ctx.taskFile]);
-  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ stream: [{ sleep: 20_000 }] }));
+  writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ stream: [{ event: { type: 'error', message: 'usage limit reached' } }, { sleep: 20_000 }] }));
   let r = await orchAsync(ctx, ['implement', ctx.taskFile, 'be']).done;
   assert.equal(r.code, 127, 'timeout → 127, as spawnSync reported it');
+  assert.equal(state(ctx).sides.be.steps.fallback, undefined, 'timeout must not use provider fallback even after a quota event');
   let step = state(ctx).sides.be.steps.implement;
   assert.deepEqual([step.exit, step.signal, step.timed_out], [127, 'SIGTERM', true]);
   assert.deepEqual([live(ctx, 'be').state, live(ctx, 'be').summary], ['failed', 'codex exit 127 (timed out)']);
@@ -1198,21 +1516,79 @@ const omnigentEnvFor = (ctx, bundle, extra = {}) => ({
   ORCH_OMNIGENT_HOST_RECORD: join(ctx.ws, 'omnigent-host.json'), ...extra,
 });
 
-for (const scenario of ['passed', 'failed', 'blocked', 'changed-source', 'no-tool', 'no-screenshot', 'missing-criterion']) {
+test('Omnigent implement quota switches to Claude through the approved fallback', async () => {
+  const { ctx, bundle } = omnigentSetup();
+  ctx.task.sides.be.fallback = { runner: 'claude', model: 'claude-opus-5-5', effort: 'medium', claude_transport: 'cli' };
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  orch(ctx, ['prepare', ctx.taskFile]);
+  const claude = join(ctx.ws, 'replacement.cjs');
+  writeFileSync(claude, String.raw`#!/usr/bin/env node
+const fs = require('node:fs'); process.stdin.resume(); process.stdin.on('end', () => {
+  if (fs.readFileSync('src/app.txt', 'utf8') !== 'partial\n') process.exit(9);
+  fs.writeFileSync('src/app.txt', 'done\n');
+  console.log(JSON.stringify({type:'result',structured_output:{status:'implemented'}}));
+});
+`);
+  chmodSync(claude, 0o755);
+  const stub = await startOmnigentStub({ busyPolls: 1000,
+    onMessage: ({session}) => writeFileSync(join(session.workspace, 'src/app.txt'), 'partial\n'),
+    afterMessage: ({session}) => { session.status = 'failed'; session.last_task_error = { message: 'usage limit exceeded' }; },
+  });
+  try {
+    const result = await orchAsync(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, {
+      ORCH_OMNIGENT_URL: stub.url, ORCH_CLAUDE_BIN: claude, ORCH_CLAUDE_SANDBOX_TOOLS: 'sh',
+    })).done;
+    assert.equal(result.code, 0, result.out);
+    const attempts = state(ctx).log.filter(e => e.step === 'implement' && e.side === 'be');
+    assert.deepEqual(attempts.map(a => a.runner), ['omnigent', 'claude']);
+    assert.equal(attempts[0].session_id, 'conv_1');
+    assert.equal(state(ctx).sides.be.steps.implement.runner, 'claude');
+  } finally { await stub.close(); }
+});
+
+for (const scenario of ['passed', 'failed', 'blocked', 'changed-source', 'no-tool', 'no-screenshot', 'missing-criterion', 'skills-passed', 'skills-missing', 'application-passed', 'application-mocked']) {
   test(`browser verification Codex: ${scenario}`, async () => {
     const { ctx, bundle } = omnigentSetup();
     const criterion = 'browser: show a folder tree at 390px';
     ctx.task.sides.fe.acceptance_criteria.push(criterion);
     ctx.task.sides.fe.browser = { url: 'http://127.0.0.1:64991/test', start_command: ['pnpm', 'dev', '-p', '64991'], test_data_only: true };
+    const skill = pinSkill('agent-browser');
+    const app = scenario.startsWith('application-');
+    const passed = scenario === 'passed' || scenario === 'skills-passed' || scenario === 'application-passed';
+    if (app) {
+      ctx.task.sides.fe.browser = { ...ctx.task.sides.fe.browser, workflow: 'application', url: 'http://127.0.0.1:64991/logistics/contract/demo', api_base_url: 'http://localhost:8081',
+        application: { path: '/logistics/contract/demo', authentication: 'fe-local', navigation: ['Login', 'Logistics', 'Contract detail', 'Documents'], mutations: [] } };
+      writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'v2\n' }, output: { status: 'implemented', checks: [{ command: 'browser: /logistics/contract/demo login and Documents', exit_code: 0 }] } }));
+    }
+    if (scenario.startsWith('skills-')) {
+      ctx.task.skill_contract = { version: 1, implementation: { be: [], fe: [] }, browser: { fe: [skill] }, review: [] };
+      writeFileSync(join(root, 'home', 'stub.json'), JSON.stringify({ write: { 'src/app.txt': 'v2\n' }, output: { status: 'implemented', skills_read: [] } }));
+    }
     writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
     assert.equal(orch(ctx, ['prepare', ctx.taskFile]).status, 0);
     for (const command of ['implement', 'check', 'verify']) assert.equal(orch(ctx, [command, ctx.taskFile, 'fe']).status, 0);
     assert.equal(orch(ctx, ['commit', ctx.taskFile, 'fe']).status, 2, 'missing browser verification blocks commit');
     const report = { status: ['failed', 'blocked'].includes(scenario) ? scenario : 'passed', summary: 'Browser result', checks: scenario === 'missing-criterion' ? [] : [{ criterion, status: ['failed', 'blocked'].includes(scenario) ? scenario : 'passed', observations: 'Selected a folder; viewport 390px; scrollWidth 390px; screenshot tree.png' }] };
+    if (app) report.application = { path: '/logistics/contract/demo', authenticated: true, real_api: scenario !== 'application-mocked',
+      navigation: ctx.task.sides.fe.browser.application.navigation.map(step => ({ step, observations: 'Clicked actual application navigation; live dev API' })) };
+    if (scenario === 'skills-passed') report.skills_read = [{ id: skill.id, sha256: skill.sha256, applied: 'Used isolated browser snapshots at mobile width.' }];
     const stub = await startOmnigentStub({
-      onMessage: ({ body }) => {
+      onMessage: ({ body, session }) => {
         const prompt = body.data.content[0].text;
+        const args = session.terminal_launch_args;
+        const temp = args.filter(a => a.startsWith('shell_environment_policy.set.TMPDIR='));
+        const socket = args.find(a => a.startsWith('shell_environment_policy.set.AGENT_BROWSER_SOCKET_DIR='));
+        assert.ok(temp.length && socket, 'browser temp/socket paths are explicit');
+        for (const value of temp) {
+          const path = JSON.parse(value.slice(value.indexOf('=') + 1));
+          assert.ok(path.length < 48, 'Chrome temp path leaves room for SingletonSocket');
+          assert.equal(path, JSON.parse(socket.slice(socket.indexOf('=') + 1)));
+        }
+        if (scenario.startsWith('skills-')) assert.ok(prompt.includes(skill.sha256));
+        if (app) { assert.match(prompt, /browser-login.mjs/); assert.match(prompt, /Contract detail/); assert.doesNotMatch(prompt, /Never connect this server to production\/LAN databases or services/); }
         const artifactDir = /Save screenshots\/snapshots only in ([^;]+);/.exec(prompt)[1];
+        const browserTemp = JSON.parse(temp[0].slice(temp[0].indexOf('=') + 1));
+        assert.ok(artifactDir.startsWith(browserTemp + '/'), 'screenshots must remain inside the sandbox-writable browser temp root');
         if (scenario !== 'no-screenshot') writeFileSync(join(artifactDir, 'tree.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
         if (scenario === 'changed-source') writeFileSync(join(state(ctx).sides.fe.worktree, 'src/app.txt'), 'unexpected edit\n');
       },
@@ -1224,11 +1600,12 @@ for (const scenario of ['passed', 'failed', 'blocked', 'changed-source', 'no-too
     try {
       const env = omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: stub.url, ORCH_DEFAULTS: '1' });
       const result = await orchAsync(ctx, ['browser-verify', ctx.taskFile, 'fe'], env).done;
-      assert.equal(result.code, scenario === 'passed' ? 0 : 1, result.out);
+      assert.equal(result.code, passed ? 0 : 1, result.out);
       const s = state(ctx).sides.fe;
       assert.equal(s.steps.browser.provider, 'codex');
       assert.equal(s.steps.browser.tree, s.steps.verify.tree);
-      if (scenario === 'passed') {
+      if (passed) {
+        for (const name of s.steps.browser.screenshots) assert.ok(existsSync(join(s.steps.browser.dir, name)), 'screenshots copied before temporary browser files are removed');
         assert.equal(orch(ctx, ['commit', ctx.taskFile, 'fe']).status, 0);
         writeFileSync(join(s.steps.browser.dir, 'report.json'), '{}');
         const retry = await orchAsync(ctx, ['browser-verify', ctx.taskFile, 'fe'], env).done;
@@ -1240,24 +1617,40 @@ for (const scenario of ['passed', 'failed', 'blocked', 'changed-source', 'no-too
   });
 }
 
-for (const scenario of ['chrome', 'quota-fallback', 'sandbox-disabled']) {
+for (const scenario of ['chrome', 'quota-fallback', 'codex-quota-fallback', 'sandbox-disabled', 'application']) {
   test(`browser verification Claude: ${scenario}`, async () => {
     const { ctx, bundle } = omnigentSetup();
     const criterion = 'browser: folder selection is highlighted';
     ctx.task.sides.fe = { ...ctx.task.sides.fe, runner: 'claude', model: 'claude-opus-5-5', fallback: { runner: 'omnigent', model: 'test-model' },
       acceptance_criteria: [criterion], browser: { url: 'http://127.0.0.1:64992/test', start_command: ['pnpm', 'dev', '-p', '64992'], test_data_only: true } };
+    if (scenario === 'application') {
+      ctx.task.sides.fe.browser = { ...ctx.task.sides.fe.browser, workflow: 'application', url: 'http://127.0.0.1:64992/logistics/contract/demo', api_base_url: 'http://localhost:8081',
+        application: { path: '/logistics/contract/demo', authentication: 'fe-local', navigation: ['Login', 'Logistics', 'Documents'], mutations: [] } };
+    }
+    if (scenario === 'codex-quota-fallback') ctx.task.qa_config = { runner: 'omnigent', model: 'test-model', effort: 'medium', browser_timeout_minutes: 30, fallback: { runner: 'claude', model: 'claude-opus-5-5', effort: 'high', claude_transport: 'cli' } };
     writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
     orch(ctx, ['prepare', ctx.taskFile]);
     const report = { status: 'passed', summary: 'Highlighted', checks: [{ criterion, status: 'passed', observations: 'Clicked folder in Chrome and captured screenshot' }] };
+    if (scenario === 'application') report.application = { path: '/logistics/contract/demo', authenticated: true, real_api: true,
+      navigation: ['Login', 'Logistics', 'Documents'].map(step => ({ step, observations: 'Used real navigation' })) };
     const stubClaude = join(ctx.ws, 'claude-browser.cjs');
     writeFileSync(stubClaude, `#!/usr/bin/env node
 const fs = require('node:fs'); let input = '';
 const out = (e) => process.stdout.write(JSON.stringify(e) + '\\n');
 process.stdin.on('data', (c) => input += c);
 process.stdin.on('end', () => {
+  if (input.includes('browser verifier') && (!process.env.TMPDIR?.startsWith('/tmp/ab-') || process.env.TMPDIR.length >= 48)) {
+    process.stderr.write('Browser TMPDIR is too long for Chrome SingletonSocket'); process.exitCode = 1; return;
+  }
   if (!input.includes('browser verifier')) {
     fs.writeFileSync('src/app.txt', 'v2\\n');
-    out({ type: 'result', structured_output: { status: 'implemented' } }); return;
+    out({ type: 'result', structured_output: { status: 'implemented', checks: [{ command: 'browser: /logistics/contract/demo read-only application', exit_code: 0 }] } }); return;
+  }
+  if (${JSON.stringify(scenario)} === 'application') {
+    const artifactDir = /Save screenshots\\/snapshots only in ([^;]+);/.exec(input)[1];
+    fs.writeFileSync(artifactDir + '/app.png', Buffer.from('89504e470d0a1a0a', 'hex'));
+    out({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'browser-call', name: 'Bash', input: { command: 'agent-browser --session own snapshot -i' } }] } });
+    out({ type: 'result', structured_output: ${JSON.stringify(report)} }); return;
   }
   if (${JSON.stringify(scenario)} === 'quota-fallback') {
     out({ type: 'result', is_error: true, result: "You've hit your weekly limit" }); process.exitCode = 1; return;
@@ -1273,6 +1666,7 @@ process.stdin.on('end', () => {
       const artifactDir = /Save screenshots\/snapshots only in ([^;]+);/.exec(body.data.content[0].text)[1];
       writeFileSync(join(artifactDir, 'tree.png'), Buffer.from('89504e470d0a1a0a', 'hex'));
     }, afterMessage: ({ items }) => {
+      if (scenario === 'codex-quota-fallback') { items.push({ type: 'error', code: 'usage_limit_reached', message: 'usage limit reached' }); return; }
       items.at(-1).content[0].text = JSON.stringify(report);
       items.push({ type: 'function_call', name: 'shell', arguments: JSON.stringify({ command: 'agent-browser --session own screenshot tree.png' }) });
     } });
@@ -1285,6 +1679,13 @@ process.stdin.on('end', () => {
       assert.equal(browser.provider, scenario === 'quota-fallback' ? 'codex' : 'claude');
       const settings = JSON.parse(readFileSync(join(browser.dir, 'claude-settings.json'), 'utf8'));
       assert.ok(settings.permissions.deny.includes('Edit') && settings.permissions.deny.includes('Write'));
+      if (scenario === 'codex-quota-fallback') {
+        assert.deepEqual(browser.attempts.map(a => a.provider), ['codex', 'claude']);
+        assert.equal(browser.attempts[0].reason, 'provider_usage_limit');
+        assert.ok(browser.evidence.includes('session-items.jsonl'));
+        assert.ok(existsSync(join(browser.dir, 'chrome-1.png')));
+      }
+      if (scenario === 'application') { assert.ok(settings.permissions.deny.includes('mcp__claude-in-chrome')); assert.ok(existsSync(join(browser.dir, 'app.png'))); }
       if (scenario === 'chrome') assert.ok(existsSync(join(browser.dir, 'chrome-1.png')));
       if (scenario === 'sandbox-disabled') assert.equal(stub.requests.length, 0, 'safety failure must not switch provider');
     } finally { await stub.close(); }
@@ -1485,4 +1886,32 @@ test('omnigent runner: a non-loopback server URL is refused', () => {
   const r = orch(ctx, ['implement', ctx.taskFile, 'be'], omnigentEnvFor(ctx, bundle, { ORCH_OMNIGENT_URL: 'http://0.0.0.0:6767' }));
   assert.equal(r.status, 2);
   assert.match(r.stderr, /loopback/);
+});
+
+test('application source checks block fixture UI additions despite broad scope and allow scoped removal', () => {
+  const ctx = setup();
+  const obsolete = 'src/app/(protected)/dev/obsolete/page.jsx';
+  mkdirSync(dirname(join(ctx.fe, obsolete)), { recursive: true });
+  writeFileSync(join(ctx.fe, obsolete), 'export default function Obsolete() {}\n');
+  sh(ctx.fe, 'git add src');
+  sh(ctx.fe, 'git -c user.name=Test -c user.email=test@example.invalid commit -m baseline-fixture');
+  ctx.task.base_revision.fe = sh(ctx.fe, 'git rev-parse HEAD');
+  ctx.task.sides.fe.browser = { workflow: 'application', url: 'http://localhost:3101/logistics/contracts/demo', api_base_url: 'http://localhost:8081',
+    start_command: ['pnpm', 'dev', '-p', '3101'], test_data_only: true,
+    application: { path: '/logistics/contracts/demo', authentication: 'fe-local', navigation: ['Login', 'Logistics', 'Contract', 'Documents'], mutations: [] } };
+  writeFileSync(ctx.taskFile, JSON.stringify(ctx.task));
+  assert.equal(orch(ctx, ['prepare', ctx.taskFile, 'fe']).status, 0);
+  const wt = state(ctx).sides.fe.worktree;
+  const added = 'src/app/(protected)/dev/new/page.jsx';
+  mkdirSync(dirname(join(wt, added)), { recursive: true });
+  writeFileSync(join(wt, added), 'export default function Fixture() {}\n');
+  writeFileSync(join(wt, 'src/app.txt'), 'business screen changes\n');
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'fe']).status, 1);
+  assert.ok(state(ctx).sides.fe.steps.check.protected.includes(added));
+  rmSync(join(wt, added));
+  writeFileSync(join(wt, obsolete), 'export default function ExtendedFixture() {}\n');
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'fe']).status, 1);
+  assert.ok(state(ctx).sides.fe.steps.check.protected.includes(obsolete));
+  rmSync(join(wt, obsolete));
+  assert.equal(orch(ctx, ['check', ctx.taskFile, 'fe']).status, 0);
 });

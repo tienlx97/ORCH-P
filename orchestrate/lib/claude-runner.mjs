@@ -15,7 +15,7 @@ const DENIED_HOME = ['.ssh', '.gnupg', '.aws', '.config/gh', '.codex', '.omnigen
  * worktree by the permission mode, no Git history changes, no web access
  * beyond the browser.
  */
-export function claudeImplementerSettings({ worktree, tmpDir, home, denied = [] }) {
+export function claudeImplementerSettings({ worktree, tmpDir, home, denied = [], chrome = true }) {
   const denyRead = [...DENIED_HOME.map((d) => join(home, d)), ...denied];
   return {
     sandbox: {
@@ -26,22 +26,23 @@ export function claudeImplementerSettings({ worktree, tmpDir, home, denied = [] 
       network: { allowedDomains: ['localhost', '127.0.0.1'], allowLocalBinding: true },
     },
     permissions: {
-      allow: ['Bash', 'Read', 'Glob', 'Grep', `Edit(/${worktree}/**)`, 'TodoWrite', 'mcp__claude-in-chrome'],
+      allow: ['Bash', 'Read', 'Glob', 'Grep', `Edit(/${worktree}/**)`, 'TodoWrite', ...(chrome ? ['mcp__claude-in-chrome'] : [])],
       deny: [
         ...denyRead.map((p) => `Read(/${p}/**)`),
         'Bash(git commit:*)', 'Bash(git push:*)', 'Bash(git merge:*)', 'Bash(git rebase:*)', 'Bash(git reset:*)', 'Bash(git checkout:*)',
         'Bash(git config:*)', 'Bash(gh:*)', 'Bash(curl:*)', 'Bash(wget:*)', 'Bash(pnpm install:*)', 'Bash(pnpm add:*)', 'Bash(npm install:*)',
-        'WebFetch', 'WebSearch', 'Agent',
+        'WebFetch', 'WebSearch', 'Agent', ...(!chrome ? ['mcp__claude-in-chrome'] : []),
       ],
     },
   };
 }
 
-export function claudeArgs({ model, effort, settingsFile, schema }) {
+export function claudeArgs({ model, effort, settingsFile, schema, chrome = true, skillBundle = null }) {
   return [
-    '-p', '--chrome', '--model', model, '--effort', effort,
+    '-p', ...(chrome ? ['--chrome'] : []), '--model', model, '--effort', effort,
     '--output-format', 'stream-json', '--verbose', '--json-schema', schema,
     '--permission-mode', 'acceptEdits', '--settings', settingsFile,
+    ...(skillBundle ? ['--plugin-dir', skillBundle] : []),
   ];
 }
 

@@ -3,6 +3,7 @@
 // records reviews. No Git, no Docker, no Omnigent, no model calls.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
@@ -117,8 +118,54 @@ function reviewer(stateRoot, verdicts) {
 const opts = (env, extra = {}) => ({
   workspace: env.ws, stateRoot: env.stateRoot, cli: env.cli, env: { PATH: process.env.PATH, ORCH_STATE_ROOT: env.stateRoot, ...extra.env },
   gateRunner: env.gateRunner, step0: env.step0,
+  checkoutProject: async target => ({ status: 'checked_out', ...target }),
   resolveRef: () => 'b'.repeat(40), reviewPollMs: 5, reviewTimeoutMs: 2000, log: () => {}, approval: 'test',
   claudeAvailable: async () => ({ ok: true, limited: false }), ...extra.opts,
+});
+
+test('a consumer pins source files from its reviewed producer without bypassing the contract pilot', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-BE', base: { be: 'main' }, contract: true }, { id: 'TASK-FE', sides: ['fe'], base: { fe: 'main' } }] });
+  const repository = join(env.ws, 'source-be');
+  mkdirSync(join(repository, 'src'), { recursive: true });
+  const text = 'CoInvoice -> HOA_DON_CO\n';
+  writeFileSync(join(repository, 'src/Folders.cs'), text);
+  const git = args => {
+    const result = spawnSync('git', ['-C', repository, ...args], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
+  };
+  git(['init', '-q']); git(['add', '.']);
+  git(['-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', '-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'contract']);
+  const revision = git(['rev-parse', 'HEAD']);
+  const file = join(env.stateRoot, 'proposals/TASK-FE.json');
+  const proposal = JSON.parse(readFileSync(file));
+  proposal.sides.fe.reference_inputs = [{ repository: 'be', revision: 'after:TASK-BE', path: 'src/Folders.cs' }];
+  writeFileSync(file, JSON.stringify(proposal));
+  const plan = JSON.parse(readFileSync(env.planPath));
+  plan.tasks[1].sha256 = sha(readFileSync(file));
+  writeFileSync(env.planPath, JSON.stringify(plan));
+  assert.deepEqual(checkPlan(env.planPath, { workspace: env.ws }).problems, []);
+  const reviewerStub = reviewer(env.stateRoot, []);
+  const options = opts(env, { opts: { repositories: { be: repository }, startReviewer: async prompt => {
+    const running = await reviewerStub.start(prompt);
+    if (prompt.includes('TASK-BE.json')) {
+      const f = join(env.stateRoot, 'orch-TASK-BE/state.json');
+      const state = JSON.parse(readFileSync(f));
+      state.sides.be.steps.commit.commit = revision;
+      writeFileSync(f, JSON.stringify(state));
+    }
+    return running;
+  } } });
+  assert.equal(await runPlan(env.planPath, options), 0);
+  const approved = JSON.parse(readFileSync(join(env.stateRoot, 'autopilot/PLAN-T/tasks/TASK-FE.json')));
+  assert.deepEqual(approved.sides.fe.reference_inputs, [{ repository: 'be', revision, path: 'src/Folders.cs', sha256: sha(text) }]);
+  assert.equal(JSON.parse(readFileSync(file)).sides.fe.reference_inputs[0].revision, 'after:TASK-BE');
+  const state = JSON.parse(readFileSync(join(env.stateRoot, 'autopilot/PLAN-T/state.json')));
+  assert.equal(state.tasks['TASK-BE'].status, 'needs_contract_pilot');
+  proposal.sides.fe.reference_inputs[0].revision = 'after:NOT-IN-PLAN';
+  writeFileSync(file, JSON.stringify(proposal));
+  plan.tasks[1].sha256 = sha(readFileSync(file));
+  writeFileSync(env.planPath, JSON.stringify(plan));
+  assert.ok(checkPlan(env.planPath, { workspace: env.ws }).problems.some(p => p.includes('earlier task')));
 });
 
 test('automatic single-task continuation preserves approval and rejects proposals or changed tasks', async () => {
@@ -205,6 +252,35 @@ test('a plan runs every task to a reviewed commit, with gate and review rework, 
   assert.equal(rev.prompts.length, 3);
 });
 
+test('stacking and resume use a reviewed commit while its contract pilot remains pending', async () => {
+  const env = setup({ tasks: [
+    { id: 'TASK-A', base: { be: 'main' }, contract: true },
+    { id: 'TASK-B', base: { be: 'after:TASK-A' }, contract: true },
+  ] });
+  const rev = reviewer(env.stateRoot, []);
+  const stateFile = join(env.stateRoot, 'autopilot/PLAN-T/state.json');
+  const options = opts(env, { opts: { startReviewer: async prompt => {
+    if (prompt.includes('TASK-B.json')) throw new Error('review transport interrupted');
+    return rev.start(prompt);
+  } } });
+  assert.equal(await runPlan(env.planPath, options), 1);
+  const stopped = JSON.parse(readFileSync(stateFile));
+  assert.match(stopped.stopped, /review transport interrupted/);
+  const producer = stopped.tasks['TASK-A'];
+  assert.equal(producer.status, 'needs_contract_pilot');
+  const copy = JSON.parse(readFileSync(join(env.stateRoot, 'autopilot/PLAN-T/tasks/TASK-B.json')));
+  assert.equal(copy.base_revision.be, producer.commits.be);
+  assert.equal(copy.approval.plan_sha256, sha(readFileSync(env.planPath)));
+
+  assert.equal(await runPlan(env.planPath, opts(env, { opts: { startReviewer: rev.start } })), 0);
+  const resumed = JSON.parse(readFileSync(stateFile));
+  assert.equal(resumed.status, 'done');
+  assert.deepEqual(resumed.tasks['TASK-A'], producer, 'resume preserves the reviewed producer and its pending pilot');
+  assert.equal(resumed.tasks['TASK-B'].status, 'needs_contract_pilot');
+  assert.match(resumed.tasks['TASK-B'].note, /pilot.md manually before merging/);
+  assert.equal(rev.prompts.length, 2, 'resume reviews only the consumer');
+});
+
 test('the plan stops with a reason when the rework budget is spent, and a changed plan is refused', async () => {
   const env = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }], plan: { max_rework: 1 } });
   const rev = reviewer(env.stateRoot, []);
@@ -264,6 +340,19 @@ test('nextStep resumes a side where its run stands', () => {
   assert.equal(nextStep(undefined), 'implement');
   assert.equal(nextStep({ status: 'blocked', steps: { implement: { exit: 0, at: at(1) } } }), 'blocked');
   assert.equal(nextStep({ steps: { implement: { exit: 0, at: at(1), secret_hits: ['output:1'] } } }), 'blocked');
+  const httpBlocked = { status: 'blocked', steps: {
+    implement: { exit: 0, at: at(1) },
+    check: { exit: 1, at: at(2), out_of_scope: [], protected: [], secret_hits: ['requests/Upload.http:1'] },
+  } };
+  assert.equal(nextStep(httpBlocked), 'check', 'accepted .http risk requires a fresh source check');
+  for (const change of [
+    { secret_hits: ['diff:1'] }, { secret_hits: ['src/config.cs:1'] },
+    { out_of_scope: ['outside.http'] }, { protected: ['harness/example.http'] },
+  ]) {
+    assert.equal(nextStep({ ...httpBlocked, steps: { ...httpBlocked.steps, check: { ...httpBlocked.steps.check, ...change } } }), 'check', 'fresh check must validate remaining findings');
+  }
+  assert.equal(nextStep({ ...httpBlocked, steps: { ...httpBlocked.steps, implement: { exit: 0, at: at(1), blocked: true } } }), 'blocked');
+  assert.equal(nextStep({ ...httpBlocked, steps: { ...httpBlocked.steps, browser: { exit: 1, at: at(3) } } }), 'blocked', 'later blocks cannot be cleared');
   const reviewedTree = { implement: { exit: 0, at: at(1) }, check: { exit: 0, at: at(2) }, verify: { exit: 0, at: at(3) } };
   assert.equal(nextStep({ steps: reviewedTree, rework: [{ source: 'operator-diagnostic', at: at(4) }] }), 'implement', 'new operator diagnosis requires rework before reusing a gate');
   assert.equal(nextStep({ steps: reviewedTree, rework: [{ source: 'operator-diagnostic', at: at(0) }] }), 'commit', 'already-addressed diagnosis does not create a loop');
@@ -405,4 +494,46 @@ test('known Claude quota falls back before starting a long-lived reviewer; unrel
   const other = setup({ tasks: [{ id: 'TASK-A', base: { be: 'main' } }] });
   const fine = async () => ({ ok: true, limited: false });
   assert.equal(await runPlan(other.planPath, opts(other, { opts: { startReviewer: silent, claudeAvailable: fine } })), 1, 'other reviewer failures still stop the plan');
+});
+
+test('project handoff selects only the last reviewed task per repo and does not repeat a successful checkout', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-BE', base: { be: 'main' } }, { id: 'TASK-TREE', sides: ['fe'], base: { fe: 'main' } },
+    { id: 'TASK-UPLOAD', sides: ['fe'], base: { fe: 'after:TASK-TREE' }, contract: true }] });
+  const rev = reviewer(env.stateRoot, []), targets = [];
+  const options = opts(env, { opts: { startReviewer: rev.start, checkoutProject: async target => { targets.push(target); return { status: 'checked_out' }; } } });
+  assert.equal(await runPlan(env.planPath, options), 0);
+  assert.deepEqual(targets.map(t => t.branch), ['agent/task-be-be', 'agent/task-upload-fe']);
+  let state = JSON.parse(readFileSync(join(env.stateRoot, 'autopilot/PLAN-T/state.json')));
+  assert.equal(state.project_checkout.fe.commit, state.tasks['TASK-UPLOAD'].commits.fe);
+  assert.equal(state.tasks['TASK-UPLOAD'].status, 'needs_contract_pilot');
+  assert.equal(await runPlan(env.planPath, options), 0);
+  assert.equal(targets.length, 2, 'a resume must not switch the user back after successful handoff');
+});
+
+test('pending checkout is explicit and retries without rerunning implementation or review', async () => {
+  const env = setup({ tasks: [{ id: 'TASK-BE', base: { be: 'main' } }] });
+  const rev = reviewer(env.stateRoot, []); let pending = true;
+  const options = opts(env, { opts: { startReviewer: rev.start, checkoutProject: async () => pending ? { status: 'pending', reason: 'project has tracked local changes' } : { status: 'checked_out' } } });
+  assert.equal(await runPlan(env.planPath, options), 0);
+  let state = JSON.parse(readFileSync(join(env.stateRoot, 'autopilot/PLAN-T/state.json')));
+  assert.equal(state.project_checkout.be.status, 'pending');
+  assert.match(state.summary, /project checkout pending/);
+  assert.equal(state.tasks['TASK-BE'].status, 'ready_for_human_merge');
+  pending = false;
+  assert.equal(await runPlan(env.planPath, options), 0);
+  state = JSON.parse(readFileSync(join(env.stateRoot, 'autopilot/PLAN-T/state.json')));
+  assert.equal(state.project_checkout.be.status, 'checked_out');
+  assert.equal(rev.prompts.length, 1);
+});
+
+test('stopped plans and worktree-only policy do not checkout a project', async () => {
+  for (const stopped of [false, true]) {
+    const env = setup({ tasks: [{ id: 'TASK-BE', base: { be: 'main' } }] }); let calls = 0;
+    const rev = reviewer(env.stateRoot, []);
+    const options = opts(env, { env: stopped ? { STUB_FIRST_CHECK: '1:scope violation' } : {}, opts: {
+      startReviewer: rev.start, ...(stopped ? {} : { handoffPolicy: { checkout: 'worktree' } }), checkoutProject: async () => { calls++; return { status: 'checked_out' }; },
+    } });
+    assert.equal(await runPlan(env.planPath, options), stopped ? 1 : 0);
+    assert.equal(calls, 0);
+  }
 });

@@ -4,6 +4,10 @@ The working directory is an isolated Git worktree at base revision {{BASE}}.
 Read and follow this repository's AGENTS.md (and CLAUDE.md if present) before editing.
 Its rules govern how you implement, test and document the change.
 
+{{SPECIALIST}}
+
+{{SKILLS}}
+
 ## Objective
 {{OBJECTIVE}}
 
@@ -12,6 +16,8 @@ Its rules govern how you implement, test and document the change.
 
 ## Inputs
 {{INPUTS}}
+
+{{REFERENCES}}
 
 ## Context from the approved spec
 {{CONTEXT}}
@@ -42,6 +48,9 @@ Fix every one of them; keep the rest of the existing work.
   fixtures only.
 - Do not modify harness, CI, lockfile or agent-configuration files unless they are listed in
   the allowed paths above.
+- Read the verified contract reference snapshots before reporting missing cross-repository
+  facts. Skill reference restrictions apply to skill resources, not to task code or
+  approved contract inputs. Do not guess mappings or request already supplied references.
 - If something blocks you, stop and report it instead of working around a rule.
 
 Finish with the JSON report requested by the output schema: changed files, focused checks you

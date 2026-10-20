@@ -1,0 +1,3 @@
+# Preserve the exact vendored skill bytes bound by catalog package hashes.
+# Upstream Markdown includes intentional hard breaks and whitespace-only lines.
+omnigent/skills/vendor/** -whitespace
